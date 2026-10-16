@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from smt_adt_tester_rewrite import needs_tester_rewrite, rewrite_smtlib_testers
-from solver_routing import GoalSearchState, VAMPIRE_RACE_PROFILES
+from solver_profiles import VAMPIRE_RACE_PROFILES
 from theory_features import analyze_smt
 from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
@@ -599,7 +599,7 @@ def run_vampire_race(
     """Race several Vampire profiles (first unsat wins).
 
     Used by scheme short-prove and by usefulness / node-goal prove (via
-    ``run_vampire_routed``). Empty / unknown names fall back to
+    ``run_vampire_default``). Empty / unknown names fall back to
     ``VAMPIRE_RACE_PROFILES``.
     """
     names = [p for p in profiles if p in VAMPIRE_PROFILES]
@@ -682,23 +682,20 @@ def run_vampire_probe(
     return out
 
 
-def run_vampire_routed(
+def run_vampire_default(
     smt2_path,
     timeout: int = 60,
     *,
-    state: Optional[GoalSearchState] = None,
     collect_stats: bool = True,
     collect_ucore: bool = False,
     show_induction: bool = False,
 ) -> VampireResult:
     """Prove with serial tip→portfolio (default) or single paper portfolio.
 
-    ``state`` is kept for API compatibility / Mate telemetry. When
-    ``VAMPIRE_SERIAL_DUAL=on`` (default), runs one Vampire at a time:
+    When ``VAMPIRE_SERIAL_DUAL=on`` (default), runs one Vampire at a time:
     tip → portfolio, with Int/LIA problems **pre-reserving** an integer arm.
     Set ``VAMPIRE_SERIAL_DUAL=off`` for the v2 single ``induction_portfolio``.
     """
-    del state
     if vampire_serial_dual_enabled():
         return run_vampire_serial(
             smt2_path,

@@ -247,20 +247,14 @@ if __name__ == "__main__":
                             'v2 用 prompts_v2（lemma_general × 2N）; '
                             'v2_simple 用 prompts_v2_compact（同 lemma_general、精简 system）')
     parser.add_argument(
-        '--cvc-patterns',
-        choices=['on', 'off'],
-        default=None,
-        help='CVC 公理 :pattern 开关（Vampire 忽略；暂弃用，即使 on 也不开 6-way）。默认 off',
-    )
     parser.add_argument('--result-dir', type=str, default=None,
                        help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
                             '未指定时副本在 result_files/，CSV 在 result_csv/')
     add_skip_file_argument(parser)
     args = parser.parse_args()
 
-    from exp_flags import apply_cvc_patterns_cli
-    apply_cvc_patterns_cli(args.cvc_patterns)
-    
+    # CVC_PATTERNS removed (Vampire runner ignores pattern portfolio flags).
+
     # 设置多进程启动方法（在某些系统上需要）
     multiprocessing.set_start_method('spawn', force=True)
     # 使用命令行参数设置原始文件夹路径
