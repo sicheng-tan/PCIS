@@ -45,9 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import (
     _flag_enabled,
-    feedback_llm_hints_enabled,
     prompt_advice_enabled,
-    proof_shape_hint_enabled,
 )
 from obligation_tree import (
     compact_formula,
@@ -1489,18 +1487,9 @@ def _unproved_lemma_formulas(failed_data: Optional[dict]) -> List[str]:
 
 
 def should_append_proof_shape_hint(failed_data: Optional[dict]) -> bool:
-    """True when flag on and either usefulness-fail kept or sublemma unproved.
-
-    - Usefulness fail: same ``last_useless_group`` as LAST ATTEMPT kept.
-    - Sublemma prove fail: non-empty ``unproved_lemmas`` (USEFUL BUT UNPROVED).
-    Lifetime follows those records (not a one-shot after a single attempt).
-    Screen-only / illformed drops alone do not trigger.
-    """
-    if not proof_shape_hint_enabled():
-        return False
-    if _group_lemmas(last_useless_group(failed_data)):
-        return True
-    return bool(_unproved_lemma_formulas(failed_data))
+    """Proof-shape hint feature removed."""
+    del failed_data
+    return False
 
 
 def _group_lemmas(group: Any) -> List[str]:
@@ -1737,7 +1726,10 @@ def format_attempt_feedback_for_prompt(
     are omitted; SOLVER HINTS is nested under LAST ATTEMPT only if the diagnoser
     produced an injectable block. ``suppress_advice`` is kept for callers.
     """
-    from feedback_llm_hints import format_llm_hints_lines, llm_hints_eligible
+    def format_llm_hints_lines(*_a, **_k):
+        return []
+    def llm_hints_eligible(_data):
+        return False
 
     data = failed_data if isinstance(failed_data, dict) else {}
     try:
@@ -1772,7 +1764,7 @@ def format_attempt_feedback_for_prompt(
     want_program = (
         include_stuck
         and not use_llm_hints
-        and not feedback_llm_hints_enabled()
+        and True
     )
     want_advice = (
         want_program and prompt_advice_enabled() and not suppress_advice

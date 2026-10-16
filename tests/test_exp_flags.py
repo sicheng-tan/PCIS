@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ablation switches for PaperMate extras: feedback, prompt retarget, unproved."""
+"""Ablation switches kept for the paper portfolio (no routing / repair hints)."""
 
 from __future__ import annotations
 
@@ -16,22 +16,12 @@ os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from exp_flags import (
-    collect_difficulty_for_feedback,
-    feedback_llm_hints_enabled,
-    feedback_llm_hints_hd_enabled,
-    formula_evidence_enabled,
     normalize_strategy_mode,
     paper_schedule_prompt,
-    progress_feedback_enabled,
     prompt_advice_enabled,
-    prompt_retarget_active,
-    prompt_retarget_enabled,
-    proof_shape_hint_enabled,
     problem_profiler_enabled,
-    repair_hints_enabled,
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
-    vampire_collect_feedback_artifacts,
 )
 from lemma_gates import (
     defined_symbols_enabled,
@@ -44,14 +34,7 @@ from lemma_gates import (
 )
 
 _FLAG_NAMES = (
-    "FEEDBACK_REPAIR_HINTS",
-    "FEEDBACK_FORMULA_EVIDENCE",
-    "FEEDBACK_LLM_HINTS",
-    "FEEDBACK_LLM_HINTS_HD",
-    "FEEDBACK_PROGRESS",
-    "PROOF_SHAPE_HINT",
     "PROBLEM_PROFILER",
-    "PROMPT_RETARGET",
     "PROMPT_ADVICE",
     "UNPROVED_NOT_INVALID",
     "SUBGOAL_SAT_ABORT",
@@ -103,15 +86,7 @@ def _restore_flags(saved):
 def test_flags_default_on() -> None:
     saved = _clear_flags()
     try:
-        assert repair_hints_enabled() is True
-        assert formula_evidence_enabled() is False
-        assert feedback_llm_hints_enabled() is False
-        assert feedback_llm_hints_hd_enabled() is False
-        assert progress_feedback_enabled() is False
-        assert proof_shape_hint_enabled() is False
         assert problem_profiler_enabled() is False
-        assert vampire_collect_feedback_artifacts() is True
-        assert prompt_retarget_enabled() is True
         assert prompt_advice_enabled() is True
         assert unproved_not_invalid_enabled() is True
         assert subgoal_sat_abort_enabled() is True
@@ -124,22 +99,8 @@ def test_flags_default_on() -> None:
     finally:
         _restore_flags(saved)
     for val in ("off", "0", "false", "no"):
-        with patch.dict(os.environ, {"FEEDBACK_REPAIR_HINTS": val}):
-            assert repair_hints_enabled() is False
-        with patch.dict(os.environ, {"FEEDBACK_FORMULA_EVIDENCE": val}):
-            assert formula_evidence_enabled() is False
-        with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": val}):
-            assert feedback_llm_hints_enabled() is False
-        with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": val}):
-            assert feedback_llm_hints_hd_enabled() is False
-        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": val}):
-            assert progress_feedback_enabled() is False
-        with patch.dict(os.environ, {"PROOF_SHAPE_HINT": val}):
-            assert proof_shape_hint_enabled() is False
         with patch.dict(os.environ, {"PROBLEM_PROFILER": val}):
             assert problem_profiler_enabled() is False
-        with patch.dict(os.environ, {"PROMPT_RETARGET": val}):
-            assert prompt_retarget_enabled() is False
         with patch.dict(os.environ, {"PROMPT_ADVICE": val}):
             assert prompt_advice_enabled() is False
         with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": val}):
@@ -164,67 +125,8 @@ def test_flags_default_on() -> None:
         assert llm_invalid_ce_verify_enabled() is True
     with patch.dict(os.environ, {"LLM_INVALID_ONLY_STOP": "off"}):
         assert llm_invalid_only_stop_enabled() is False
-    with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
-        assert progress_feedback_enabled() is True
-    with patch.dict(os.environ, {"PROOF_SHAPE_HINT": "on"}):
-        assert proof_shape_hint_enabled() is True
     with patch.dict(os.environ, {"PROBLEM_PROFILER": "on"}):
         assert problem_profiler_enabled() is True
-    with patch.dict(os.environ, {"FEEDBACK_FORMULA_EVIDENCE": "on"}):
-        assert formula_evidence_enabled() is True
-    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS": "on"}):
-        assert feedback_llm_hints_enabled() is True
-    with patch.dict(os.environ, {"FEEDBACK_LLM_HINTS_HD": "on"}):
-        assert feedback_llm_hints_hd_enabled() is True
-
-
-def test_collect_difficulty_for_feedback_consumers() -> None:
-    # Program HD path: repair on, LLM hints off → collect.
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "on",
-        "FEEDBACK_LLM_HINTS": "off",
-        "FEEDBACK_LLM_HINTS_HD": "off",
-    }):
-        assert collect_difficulty_for_feedback() is True
-    # LLM-hints-only without HD → skip dump (program HD not injected).
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "on",
-        "FEEDBACK_LLM_HINTS": "on",
-        "FEEDBACK_LLM_HINTS_HD": "off",
-    }):
-        assert collect_difficulty_for_feedback() is False
-    # LLM diagnoser wants HD → collect.
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "on",
-        "FEEDBACK_LLM_HINTS": "on",
-        "FEEDBACK_LLM_HINTS_HD": "on",
-    }):
-        assert collect_difficulty_for_feedback() is True
-    # No feedback consumer → skip.
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "off",
-        "FEEDBACK_LLM_HINTS": "off",
-        "FEEDBACK_LLM_HINTS_HD": "on",
-    }):
-        assert collect_difficulty_for_feedback() is False
-
-
-def test_vampire_collect_feedback_artifacts() -> None:
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "on",
-        "FEEDBACK_PROGRESS": "off",
-    }):
-        assert vampire_collect_feedback_artifacts() is True
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "off",
-        "FEEDBACK_PROGRESS": "on",
-    }):
-        assert vampire_collect_feedback_artifacts() is True
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "off",
-        "FEEDBACK_PROGRESS": "off",
-    }):
-        assert vampire_collect_feedback_artifacts() is False
 
 
 def test_resolve_prompt_pack() -> None:
@@ -240,7 +142,6 @@ def test_resolve_prompt_pack() -> None:
     assert naive["folder_path"] == "./prompts_naive"
     assert naive["strategies"] == ["prompt_naive"]
     assert naive["total_attempts"] == 6
-    assert prompt_retarget_active(len(naive["strategies"])) is False
     zero = resolve_prompt_pack("zero_shot", 3)
     assert zero["folder_path"] == "./prompts_ours"
     assert zero["total_attempts"] == 6
@@ -250,7 +151,6 @@ def test_resolve_prompt_pack() -> None:
     assert v2["strategies"] == ["lemma_general"]
     assert v2["total_attempts"] == 6
     assert v2["no_retarget_prompt"] == "lemma_general"
-    assert prompt_retarget_active(len(v2["strategies"])) is False
     assert normalize_strategy_mode("general_ind") == "v2"
     simple = resolve_prompt_pack("default_simple", 3)
     assert simple["mode"] == "default_simple"
@@ -269,7 +169,6 @@ def test_resolve_prompt_pack() -> None:
     assert v2s["strategies"] == ["lemma_general"]
     assert v2s["total_attempts"] == 6
     assert v2s["no_retarget_prompt"] == "lemma_general"
-    assert prompt_retarget_active(len(v2s["strategies"])) is False
     assert normalize_strategy_mode("v2_compact") == "v2_simple"
     assert normalize_strategy_mode("general_ind_simple") == "v2_simple"
 
@@ -287,9 +186,7 @@ def test_naive_strategy_repeats_prompt_naive() -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
-            with patch.dict(os.environ, {"PROMPT_RETARGET": "on"}), patch(
-                "Mate_new.routing_enabled", return_value=False
-            ), patch(
+            with patch(
                 "Mate_new.perform_initial_verification", return_value=False
             ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
                 mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
@@ -303,7 +200,7 @@ def test_naive_strategy_repeats_prompt_naive() -> None:
     assert all(folder == "./prompts_naive" for _name, folder in calls)
 
 
-def test_v2_retarget_off_always_lemma_general() -> None:
+def test_v2_always_lemma_general() -> None:
     import Mate_new as mate
 
     calls: list[str] = []
@@ -316,42 +213,7 @@ def test_v2_retarget_off_always_lemma_general() -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
-            with patch.dict(os.environ, {"PROMPT_RETARGET": "off"}), patch(
-                "Mate_new.routing_enabled", return_value=False
-            ), patch(
-                "Mate_new.perform_initial_verification", return_value=False
-            ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
-                mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
-            ):
-                assert mate.prove_run(tmp, "template", strategy_mode="v2") is False
-    finally:
-        _restore_flags(saved)
-
-    assert len(calls) == 6, calls
-    assert all(name == "lemma_general" for name, _folder in calls)
-    assert all(folder == "./prompts_v2" for _name, folder in calls)
-
-
-def test_v2_retarget_on_always_lemma_general() -> None:
-    import Mate_new as mate
-
-    calls: list[str] = []
-
-    def fake_quick_run(_base, _name, prompt_strategy, folder_path, *_args, **_kwargs):
-        calls.append((prompt_strategy, folder_path))
-        return False, [], []
-
-    saved = _clear_flags()
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
-            mate.add_repair_hints(
-                tmp, "template",
-                [{"kind": "high_difficulty_assertions", "hard_axioms": ["(P x)"]}],
-            )
-            with patch.dict(os.environ, {"PROMPT_RETARGET": "on"}), patch(
-                "Mate_new.routing_enabled", return_value=False
-            ), patch(
+            with patch(
                 "Mate_new.perform_initial_verification", return_value=False
             ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
                 mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
@@ -378,9 +240,7 @@ def test_v2_simple_uses_compact_folder() -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
-            with patch.dict(os.environ, {"PROMPT_RETARGET": "on"}), patch(
-                "Mate_new.routing_enabled", return_value=False
-            ), patch(
+            with patch(
                 "Mate_new.perform_initial_verification", return_value=False
             ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
                 mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
@@ -404,59 +264,34 @@ def test_paper_schedule_prompt() -> None:
     assert paper_schedule_prompt([], 0, 3) == ""
 
 
-def test_prompt_hides_disabled_feedback_sections() -> None:
+def test_prompt_hides_removed_feedback_sections() -> None:
     import Mate_new as mate
 
-    with patch.dict(os.environ, {
-        "FEEDBACK_PROGRESS": "on",
-        "SOLVER_ROUTING": "on",
-        "FEEDBACK_REPAIR_HINTS": "on",
-        "UNPROVED_NOT_INVALID": "on",
-    }):
+    with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": "on"}):
         on_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
-    assert "SOLVER PROGRESS SIGNALS" in on_txt
     assert "USEFUL BUT UNPROVED" in on_txt
     assert "LAST ATTEMPT" in on_txt
-    assert "matching_weak:" not in on_txt
+    assert "SOLVER PROGRESS SIGNALS" not in on_txt
+    assert "SOLVER ROUTING" not in on_txt
     assert "need_rewrite" not in on_txt
-    assert "SOLVER ROUTING" in on_txt
-    assert "Combination" not in on_txt
 
-    with patch.dict(os.environ, {
-        "FEEDBACK_REPAIR_HINTS": "off",
-        "FEEDBACK_PROGRESS": "off",
-        "UNPROVED_NOT_INVALID": "off",
-        "SOLVER_ROUTING": "off",
-    }):
+    with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": "off"}):
         off_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
-    assert "SOLVER PROGRESS SIGNALS" not in off_txt
     assert "USEFUL BUT UNPROVED" not in off_txt
-    assert "matching_weak:" not in off_txt
-    assert "SOLVER ROUTING" not in off_txt
     assert "LAST ATTEMPT" in off_txt
 
 
-def test_add_repair_and_progress_respect_flags() -> None:
+def test_add_repair_hints_disabled() -> None:
     import Mate_new as mate
 
     with tempfile.TemporaryDirectory() as tmp:
-        with patch.dict(os.environ, {"FEEDBACK_REPAIR_HINTS": "off"}):
-            mate.add_repair_hints(tmp, "template", [{"kind": "need_rewrite", "detail": "x"}])
+        mate.add_repair_hints(tmp, "template", [{"kind": "need_rewrite", "detail": "x"}])
         assert mate.load_failed_lemmas(tmp, "template")["repair_hints"] == []
-
-        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "off"}):
-            mate.add_progress_lemma(tmp, "template", "(L)", 1.0, ["sig"])
+        mate.add_progress_lemma(tmp, "template", "(L)", 1.0, ["sig"])
         assert mate.load_failed_lemmas(tmp, "template")["progress_lemmas"] == []
 
-        mate.add_repair_hints(tmp, "template", [{"kind": "need_rewrite", "detail": "x"}])
-        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "on"}):
-            mate.add_progress_lemma(tmp, "template", "(L)", 1.0, ["sig"])
-        data = mate.load_failed_lemmas(tmp, "template")
-        assert data["repair_hints"][0]["kind"] == "need_rewrite"
-        assert data["progress_lemmas"][0]["lemma"] == "(L)"
 
-
-def test_progress_flag_skips_sidecar() -> None:
+def test_progress_sidecar_removed() -> None:
     import Mate_new as mate
     from cvc5_runner import CvcResult
 
@@ -465,9 +300,7 @@ def test_progress_flag_skips_sidecar() -> None:
             tmp, "template", "baseline_diag",
             CvcResult(status="timeout", elapsed=60.0, stats={"CONJ_TOTAL": 8}),
         )
-        with patch.dict(os.environ, {"FEEDBACK_PROGRESS": "off"}), patch(
-            "Mate_new.run_cvc_diagnostic"
-        ) as diag:
+        with patch("Mate_new.run_cvc_diagnostic") as diag:
             ordered, _ = mate.analyze_lemma_progress(
                 ["(forall ((x Int)) (P x))"],
                 _GOAL_SMT,
@@ -523,14 +356,12 @@ def test_unproved_flag_writes_invalid() -> None:
         assert "Subgoal proof failed" in parent["invalid_lemmas"][0]["reason"]
 
 
-def test_repair_hints_off_skips_subgoal_diagnostic() -> None:
+def test_repair_hints_removed_skips_subgoal_diagnostic() -> None:
     import Mate_new as mate
 
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template_1.smt2").write_text(_GOAL_SMT, encoding="utf-8")
-        with patch.dict(os.environ, {"FEEDBACK_REPAIR_HINTS": "off"}), patch(
-            "Mate_new.run_cvc_diagnostic"
-        ) as diag:
+        with patch("Mate_new.run_cvc_diagnostic") as diag:
             mate._record_subgoal_failure_feedback(
                 tmp, "template", "template_1", ["(assert true)"]
             )
@@ -542,7 +373,7 @@ def test_repair_hints_off_skips_subgoal_diagnostic() -> None:
         assert parent["unproved_lemmas"][0]["blocking_subgoal"] == "template_1"
 
 
-def test_prompt_retarget_off_uses_paper_order() -> None:
+def test_paper_order_prompt_schedule() -> None:
     import Mate_new as mate
 
     calls: list[str] = []
@@ -553,13 +384,7 @@ def test_prompt_retarget_off_uses_paper_order() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
-        mate.add_repair_hints(
-            tmp, "template",
-            [{"kind": "need_stronger_lemma", "detail": "strengthen", "context": "goal"}],
-        )
-        with patch.dict(os.environ, {"PROMPT_RETARGET": "off"}), patch(
-            "Mate_new.routing_enabled", return_value=False
-        ), patch(
+        with patch(
             "Mate_new.perform_initial_verification", return_value=False
         ), patch("Mate_new.quick_run", side_effect=fake_quick_run), patch.dict(
             mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
@@ -572,16 +397,13 @@ def test_prompt_retarget_off_uses_paper_order() -> None:
     ), calls
 
 
-def test_vampire_prompt_and_paper_order_respect_flags() -> None:
+def test_vampire_prompt_and_paper_order() -> None:
     import Mate_new_vampire as mate_v
 
     txt = mate_v.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
     assert "LAST ATTEMPT" in txt
     assert "need_rewrite:" not in txt
-    with patch.dict(os.environ, {"FEEDBACK_REPAIR_HINTS": "off", "FEEDBACK_PROGRESS": "off"}):
-        off_txt = mate_v.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
-    assert "need_rewrite:" not in off_txt
-    assert "SOLVER PROGRESS SIGNALS" not in off_txt
+    assert "SOLVER PROGRESS SIGNALS" not in txt
 
     calls: list[str] = []
 
@@ -591,9 +413,7 @@ def test_vampire_prompt_and_paper_order_respect_flags() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL_SMT, encoding="utf-8")
-        with patch.dict(os.environ, {"PROMPT_RETARGET": "off"}), patch(
-            "Mate_new_vampire.routing_enabled", return_value=False
-        ), patch(
+        with patch(
             "Mate_new_vampire.perform_initial_verification", return_value=False
         ), patch("Mate_new_vampire.quick_run", side_effect=fake_quick), patch.dict(
             mate_v.config, {"MAX_ATTEMPTS_PER_PROMPT": 3}
@@ -605,22 +425,19 @@ def test_vampire_prompt_and_paper_order_respect_flags() -> None:
 
 def main() -> int:
     test_flags_default_on()
-    test_collect_difficulty_for_feedback_consumers()
-    test_vampire_collect_feedback_artifacts()
     test_resolve_prompt_pack()
     test_paper_schedule_prompt()
-    test_prompt_hides_disabled_feedback_sections()
-    test_add_repair_and_progress_respect_flags()
-    test_progress_flag_skips_sidecar()
+    test_prompt_hides_removed_feedback_sections()
+    test_add_repair_hints_disabled()
+    test_progress_sidecar_removed()
     test_unproved_flag_writes_unproved()
     test_unproved_flag_writes_invalid()
-    test_repair_hints_off_skips_subgoal_diagnostic()
-    test_prompt_retarget_off_uses_paper_order()
+    test_repair_hints_removed_skips_subgoal_diagnostic()
+    test_paper_order_prompt_schedule()
     test_naive_strategy_repeats_prompt_naive()
-    test_v2_retarget_off_always_lemma_general()
-    test_v2_retarget_on_always_lemma_general()
+    test_v2_always_lemma_general()
     test_v2_simple_uses_compact_folder()
-    test_vampire_prompt_and_paper_order_respect_flags()
+    test_vampire_prompt_and_paper_order()
     print("exp flag tests passed")
     return 0
 

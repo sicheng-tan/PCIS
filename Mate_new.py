@@ -13,12 +13,11 @@ from env_config import setup_environment, setup_model
 from cvc5_runner import (
     run_cvc_solver_with_timeout,
     run_cvc,
+    derive_repair_hints,
     run_cvc_diagnostic,
     run_cvc_probe,
     cvc_probeable_profiles,
-    run_cvc_routed,
     compute_progress_score,
-    derive_repair_hints,
     difficulty_dump_complete,
     cvc_diagnostic_profile,
     hard_axioms_from_difficulty,
@@ -31,30 +30,6 @@ from cvc5_runner import (
     cvc_output_wellformed_failure,
     verify_llm_goal_counterexample,
     CvcResult,
-)
-from solver_routing import (
-    GoalSearchState,
-    build_search_state,
-    fallback_profiles_for,
-    format_routing_for_prompt,
-    select_generation_prompt,
-    retarget_generation_prompt,
-    NO_HELP_PROMPT_SWITCH,
-    probe_profile_count,
-    probe_timeout_s,
-    probes_enabled,
-    profile_utility_from_stats,
-    rank_profiles_for_attempt,
-    recommend_profiles,
-    record_pair_attempt,
-    record_profile_history,
-    collect_feedback_signal_kinds,
-    set_routing_candidates,
-    routing_enabled,
-)
-from profile_selector import (
-    choose_joint_action,
-    llm_selector_enabled,
 )
 from theory_features import analyze_smt
 from obligation_tree import (
@@ -86,16 +61,11 @@ from obligation_tree import (
 )
 from exp_flags import (
     ancestor_prompt_enabled,
-    collect_difficulty_for_feedback,
     induction_scheme_enabled,
     normalize_strategy_mode,
     paper_schedule_prompt,
     problem_profiler_enabled,
     problem_profiler_trigger,
-    progress_feedback_enabled,
-    prompt_retarget_active,
-    repair_hints_enabled,
-    resolve_cvc_patterns_enabled,
     resolve_prompt_pack,
     should_inject_problem_profiler,
     should_run_induction_scheme,
@@ -104,8 +74,8 @@ from exp_flags import (
 from smt_patterns import (
     format_assert_line,
     candidate_lemma_id,
-    pattern_trigger_reasons,
     should_add_cvc_patterns,
+    pattern_trigger_reasons,
 )
 from ancestor_stack import (
     AncestorStack,
@@ -127,9 +97,6 @@ from llm_time_budget import (
     usefulness_timeout_s,
 )
 from prompt_modes import apply_advice_system_instruction
-from feedback_llm_hints import (
-    maybe_refresh_llm_hints,
-)
 from lemma_gates import (
     DIAGNOSIS_PROMPT_SUFFIX,
     FINAL_DIAGNOSIS_PROMPT_SUFFIX,
@@ -167,10 +134,8 @@ from lemma_gates import (
     llm_invalid_ce_verify_enabled,
     llm_invalid_ce_retries,
     format_ce_retry_user,
-    PROOF_SHAPE_HINT_BLOCK,
     should_append_diagnosis_suffix,
     should_accept_in_loop_invalid_goal,
-    should_append_proof_shape_hint,
     should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
     tree_status_from_child_data,
@@ -204,6 +169,146 @@ _DIAGNOSTIC_TIMEOUT = 3
 _MAX_PROGRESS_DIAG_LEMMAS = 3
 
 # 在文件开头添加失败引理管理函数
+
+def _paper_retarget_off(_n_strategies: int) -> bool:
+    """Prompt retarget removed; always use paper schedule."""
+    return False
+
+
+def _patterns_off(_override=None) -> bool:
+    """CVC_PATTERNS portfolio removed."""
+    return False
+
+
+class _NoRoutingState:
+    """Placeholder so leftover telemetry fields do not crash."""
+
+    def __init__(self, **kwargs):
+        self.backend = kwargs.get("backend", "")
+        self.active_profile = kwargs.get("active_profile")
+        self.active_prompt = kwargs.get("active_prompt")
+        self.candidate_profiles = list(kwargs.get("candidate_profiles") or [])
+        self.fallback_profiles = list(kwargs.get("fallback_profiles") or [])
+        self.decision_source = kwargs.get("decision_source")
+        self.decision_mode = kwargs.get("decision_mode")
+        self.theory_features = kwargs.get("theory_features") or {}
+        self.profile_history = list(kwargs.get("profile_history") or [])
+        self.pair_history = list(kwargs.get("pair_history") or [])
+
+    def to_dict(self):
+        return {
+            "backend": self.backend,
+            "active_profile": self.active_profile,
+            "active_prompt": self.active_prompt,
+            "candidate_profiles": list(self.candidate_profiles),
+            "fallback_profiles": list(self.fallback_profiles),
+            "decision_source": self.decision_source,
+            "decision_mode": self.decision_mode,
+            "theory_features": dict(self.theory_features or {}),
+            "profile_history": list(self.profile_history),
+            "pair_history": list(self.pair_history),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict):
+            return cls()
+        return cls(**{k: data.get(k) for k in (
+            "backend", "active_profile", "active_prompt", "candidate_profiles",
+            "fallback_profiles", "decision_source", "decision_mode",
+            "theory_features", "profile_history", "pair_history",
+        )})
+
+
+GoalSearchState = _NoRoutingState
+
+
+def build_search_state(*_a, **_k):
+    return _NoRoutingState()
+
+
+def fallback_profiles_for(_backend: str):
+    return []
+
+
+def format_routing_for_prompt(_state=None) -> str:
+    return ""
+
+
+def select_generation_prompt(strategies, *_a, **_k):
+    pool = [s for s in (strategies or []) if s]
+    return pool[0] if pool else ""
+
+
+def retarget_generation_prompt(strategies, current, consecutive_no_help, kind_signature, *_a, **_k):
+    return current, consecutive_no_help, kind_signature, "retarget_removed"
+
+
+NO_HELP_PROMPT_SWITCH = 2
+
+
+def probe_profile_count() -> int:
+    return 0
+
+
+def probe_timeout_s() -> int:
+    return 2
+
+
+def probes_enabled() -> bool:
+    return False
+
+
+def profile_utility_from_stats(*_a, **_k):
+    return 0.0
+
+
+def rank_profiles_for_attempt(*_a, **_k):
+    return []
+
+
+def recommend_profiles(*_a, **_k):
+    return [], []
+
+
+def record_pair_attempt(state, *_a, **_k):
+    return state
+
+
+def record_profile_history(state, *_a, **_k):
+    return state
+
+
+def collect_feedback_signal_kinds(*_a, **_k):
+    return []
+
+
+def set_routing_candidates(state, profiles, **kwargs):
+    if state is None:
+        state = _NoRoutingState()
+    state.candidate_profiles = list(profiles or [])
+    if "active_profile" in kwargs:
+        state.active_profile = kwargs["active_profile"]
+    if "active_prompt" in kwargs:
+        state.active_prompt = kwargs["active_prompt"]
+    return state
+
+
+def choose_joint_action(*_a, **_k):
+    class _Dec:
+        profile = None
+        prompt = None
+        source = "paper"
+        mode = "paper"
+        confidence = 1.0
+    return _Dec()
+
+
+def llm_selector_enabled() -> bool:
+    return False
+
+
+
 def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
     """获取失败引理记录文件路径，根据目标名称生成对应文件"""
     # 提取目标名称的后缀部分来构建文件名
@@ -414,7 +519,7 @@ def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
 
     暂时弃用 with ``FEEDBACK_PROGRESS`` (default off): no-op.
     """
-    if not progress_feedback_enabled():
+    if not False:
         return
     failed_data = load_failed_lemmas(base_path, goal_name)
     record = {"lemma": lemma, "score": score, "signals": signals}
@@ -452,7 +557,7 @@ def _compact_repair_hints(hints: List[dict]) -> List[dict]:
 
 def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
     """追加 cvc5 solver-guided repair hints"""
-    if not repair_hints_enabled() or not hints:
+    if not False or not hints:
         return
     failed_data = load_failed_lemmas(base_path, goal_name)
     failed_data["repair_hints"] = _compact_repair_hints(
@@ -801,6 +906,8 @@ def load_routing_state(base_path: str, goal_name: str) -> GoalSearchState:
     return GoalSearchState.from_dict(load_failed_lemmas(base_path, goal_name).get("routing"))
 
 def save_routing_state(base_path: str, goal_name: str, state: GoalSearchState) -> None:
+    if state is None:
+        state = GoalSearchState()
     failed_data = load_failed_lemmas(base_path, goal_name)
     failed_data["routing"] = state.to_dict()
     save_failed_lemmas(base_path, goal_name, failed_data)
@@ -1122,13 +1229,13 @@ def format_solver_feedback_for_prompt(
     attempt_txt = format_attempt_feedback_for_prompt(
         failed_data,
         backend="cvc5",
-        include_stuck=repair_hints_enabled(),
+        include_stuck=False,
         current_goal=current_formula,
     )
     if attempt_txt:
         parts.append(attempt_txt)
 
-    if progress_feedback_enabled() and failed_data.get("progress_lemmas"):
+    if False and failed_data.get("progress_lemmas"):
         parts.append(
             "\nSOLVER PROGRESS SIGNALS (cvc5 stats/difficulty): singleton search "
             "changes vs control. This is NOT proof of usefulness; a lemma here can "
@@ -1163,10 +1270,8 @@ def format_solver_feedback_for_prompt(
                 f"  Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
             )
 
-    if should_append_proof_shape_hint(failed_data):
-        parts.append(PROOF_SHAPE_HINT_BLOCK)
 
-    if routing_enabled():
+    if False:
         routing_txt = format_routing_for_prompt(
             GoalSearchState.from_dict(failed_data.get("routing"))
         )
@@ -1374,7 +1479,7 @@ def _resolve_cvc_add_patterns(
     if not base_path or not goal_name:
         return False
     failed_data = load_failed_lemmas(base_path, goal_name)
-    enabled = resolve_cvc_patterns_enabled(
+    enabled = _patterns_off(
         cvc_patterns
         if cvc_patterns is not None
         else (
@@ -1528,7 +1633,7 @@ def analyze_lemma_progress(
 
     暂时弃用 with ``FEEDBACK_PROGRESS`` (default off): no extra diagnostics.
     """
-    if not progress_feedback_enabled():
+    if not False:
         return [], CvcResult(status="unknown")
     profile = _diag_profile(base_path, goal_name)
     want = cvc_diagnostic_profile(profile)
@@ -1670,12 +1775,11 @@ def verify_combined_lemmas(
         state.decision_source = decision_source or state.decision_source
         if base_path:
             save_routing_state(base_path, gname, state)
-    full = run_cvc_routed(
+    full = run_cvc(
         output_path,
         timeout=combined_timeout,
-        state=state,
         collect_stats=True,
-        collect_difficulty=collect_difficulty_for_feedback(),
+        collect_difficulty=False,
         **extra,
     )
     record_solver_attempt(
@@ -1735,7 +1839,7 @@ def verify_combined_lemmas(
             meta["goal_difficulty_baseline"] = _goal_difficulty_score(
                 pick_advice_witness(baseline_mix),
             )
-        if progress_feedback_enabled():
+        if False:
             progressive, _baseline = analyze_lemma_progress(
                 asserts, original_content, work_dir, gname, base_path
             )
@@ -1816,15 +1920,14 @@ def perform_initial_verification(
     extra = {}
     if pattern_smt is not None:
         extra["pattern_smt2_path"] = pattern_smt
-    result = run_cvc_routed(
+    result = run_cvc(
         smt_path,
         default_timeout,
-        state=routing_state,
         collect_stats=True,
         collect_difficulty=True,
         **extra,
     )
-    if log_event == "initial_prove" and routing_enabled() and base_path and goal_name:
+    if log_event == "initial_prove" and False and base_path and goal_name:
         record_solver_attempt(
             base_path,
             goal_name,
@@ -1967,7 +2070,7 @@ def seed_baseline_repair_hints(
         parent_profile=parent_profile,
     )
 
-    if routing_enabled() and probes_enabled() and not llm_selector_enabled():
+    if False and probes_enabled() and not llm_selector_enabled():
         ranked = recommend_profiles(
             "cvc5",
             features,
@@ -2103,7 +2206,7 @@ def select_attempt_action(
         for item in state.profile_history
         if item.get("profile") and item.get("utility") is not None
     }
-    sidecar = progress_feedback_enabled()
+    sidecar = False
     ranked, candidates, reasons = rank_profiles_for_attempt(
         "cvc5",
         features,
@@ -2213,19 +2316,6 @@ def generate_lemmas_with_llm(
             _assert, formula = extract_original_goal(smt_content)
         except Exception:
             formula = None
-    if not diagnosis_only and not skip_hint_refresh:
-        maybe_refresh_llm_hints(
-            base_path,
-            goal_name,
-            llm=llm,
-            config=config,
-            load_failed_lemmas=load_failed_lemmas,
-            save_failed_lemmas=save_failed_lemmas,
-            backend="cvc5",
-            current_goal=formula,
-            smt_content=smt_content,
-            ancestor_stack=ancestor_stack,
-        )
     messages, feedback = create_prompt(
         smt_content, prompt_strategy, base_path, goal_name, folder_path,
         depth=depth, diagnosis_only=diagnosis_only,
@@ -2891,7 +2981,7 @@ def quick_run(
 
     # 步骤2.5: 首次 LLM 前写入 cvc5 诊断反馈
     failed_data = load_failed_lemmas(base_path, goal_smt_name)
-    if routing_enabled() and not failed_data.get("routing"):
+    if False and not failed_data.get("routing"):
         seed_baseline_repair_hints(base_path, goal_smt_name, goal_smt_file)
     if solver_profile:
         state = load_routing_state(base_path, goal_smt_name)
@@ -3481,7 +3571,7 @@ def _prove_run_body(
         return _done(False, "max_depth")
 
     arm_task_deadline(depth, config.get("TASK_TIMEOUT"))
-    patterns_enabled = resolve_cvc_patterns_enabled(cvc_patterns)
+    patterns_enabled = _patterns_off(cvc_patterns)
     
     if depth == 0:
         log_run_config(
@@ -3522,7 +3612,7 @@ def _prove_run_body(
         )
     except Exception:
         current_formula = None
-    if routing_enabled() and not load_failed_lemmas(base_path, base_name).get("routing"):
+    if False and not load_failed_lemmas(base_path, base_name).get("routing"):
         seed_baseline_repair_hints(
             base_path, base_name, goal_smt_file, parent_goal_name=parent_goal_name
         )
@@ -3619,20 +3709,12 @@ def _prove_run_body(
     pack = resolve_prompt_pack(strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"])
     strategies = pack["strategies"]
     total_attempts, max_attempts_per_prompt = node_attempt_plan(depth, pack)
-    retarget = prompt_retarget_active(len(strategies))
+    retarget = False
     fixed_no_retarget = pack.get("no_retarget_prompt")
-    if retarget:
-        # CVC5: consecutive-only retarget; ignore repair-hint / HD families.
-        hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
-        current_prompt = select_generation_prompt(
-            strategies, hint_list, hint_guided=False
-        )
-        kind_signature = "none"
-    else:
-        current_prompt = fixed_no_retarget or paper_schedule_prompt(
-            strategies, 0, max_attempts_per_prompt
-        )
-        kind_signature = "none"
+    current_prompt = fixed_no_retarget or paper_schedule_prompt(
+        strategies, 0, max_attempts_per_prompt
+    )
+    kind_signature = "none"
     consecutive_no_help = 0
     log_exp(
         "prompt_schedule",
@@ -3659,7 +3741,7 @@ def _prove_run_body(
         prompt_strategy = current_prompt
         solver_profile = None
         decision_source = None
-        if routing_enabled():
+        if False:
             state, decision = select_attempt_action(
                 base_path,
                 base_name,
@@ -3999,7 +4081,7 @@ def _obligation_tree_has_proved_child(node) -> bool:
 #     goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
 #     retry_timeout = config["RETRY_CVC_TIMEOUT"]
 #     logging.info("全部 LLM attempt 失败，加时一次再证原目标 timeout=%s", retry_timeout)
-#     retry = run_cvc_routed(
+#     retry = run_cvc(
 #         goal_smt_file,
 #         retry_timeout,
 #         state=load_routing_state(base_path, goal_name),

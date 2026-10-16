@@ -25,15 +25,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from llm_time_budget import remaining_task_s
-from solver_routing import (
-    CVC5_FALLBACK_PROFILES,
-    GoalSearchState,
-    fallback_enabled,
-    fallback_fraction,
-    fallback_min_timeout,
-    routing_enabled,
-)
-from exp_flags import formula_evidence_enabled
+from solver_profiles import CVC5_FALLBACK_PROFILES
 from solver_relative_metrics import (
     EXPLOSION_LOG_GAIN,
     INST_OF_MATCHING_MAX,
@@ -549,70 +541,6 @@ def run_cvc_probe(
     return out
 
 
-def run_cvc_routed(
-    smt2_path,
-    timeout: int = 60,
-    *,
-    state: Optional[GoalSearchState] = None,
-    collect_stats: bool = False,
-    collect_difficulty: bool = False,
-    pattern_smt2_path=None,
-) -> CvcResult:
-    """Prove with recommended profiles first, then the paper 4-way portfolio."""
-    extra = {}
-    if pattern_smt2_path:
-        extra["pattern_smt2_path"] = pattern_smt2_path
-    if not routing_enabled() or state is None or not state.candidate_profiles:
-        return run_cvc(
-            smt2_path,
-            timeout,
-            collect_stats=collect_stats,
-            collect_difficulty=collect_difficulty,
-            **extra,
-        )
-
-    start = time.time()
-    specs = cvc_profile_specs()
-    primary = [p for p in state.candidate_profiles if p in specs]
-    fallback = [
-        p for p in (state.fallback_profiles or CVC5_FALLBACK_PROFILES)
-        if p in specs and p not in primary
-    ]
-    reserve = 0
-    if fallback_enabled() and fallback:
-        reserve = max(fallback_min_timeout(), int(timeout * fallback_fraction()))
-        reserve = min(reserve, max(0, timeout - 1))
-    primary_timeout = max(1, timeout - reserve)
-    result = _run_cvc_parallel(
-        smt2_path,
-        primary_timeout,
-        primary,
-        collect_stats=collect_stats,
-        collect_difficulty=collect_difficulty,
-        **extra,
-    )
-    summaries = dict(result.portfolio_results)
-    if result.proved:
-        result.portfolio_results = summaries
-        return result
-
-    remaining = timeout - (time.time() - start)
-    if fallback_enabled() and fallback and remaining >= 0.5:
-        fb = _run_cvc_parallel(
-            smt2_path,
-            max(1, min(timeout, math.ceil(remaining))),
-            fallback,
-            collect_stats=collect_stats,
-            collect_difficulty=collect_difficulty,
-            **extra,
-        )
-        summaries.update(fb.portfolio_results)
-        fb.portfolio_results = summaries
-        return fb
-    result.portfolio_results = summaries
-    return result
-
-
 def _cvc_prove_cmd(
     cfg: dict,
     input_path: Path,
@@ -636,7 +564,7 @@ def _cvc_prove_cmd(
             cmd.append("--dump-difficulty")
             cmd.append("--difficulty-mode=lemma-literal-all")
         # Same query as difficulty: process-time lemmas, not a post-timeout dump.
-        if collect_difficulty and formula_evidence_enabled():
+        if False:
             cmd.append("-o")
             cmd.append("lemmas")
     elif cfg.get("type") == "CVC4" and tlimit_s is not None:
@@ -689,7 +617,7 @@ def _run_named_cvc_profile(
         result.difficulty = parse_cvc_difficulty(
             result.stdout + "\n" + result.stderr
         )
-    if collect_difficulty and formula_evidence_enabled() and not result.lemmas:
+    if False and not result.lemmas:
         result.lemmas = parse_cvc_lemmas(result.stdout + "\n" + result.stderr)
     return result
 
@@ -810,7 +738,7 @@ def _run_cvc_parallel(
     if not jobs:
         return CvcResult(status="error", error="no known cvc profiles requested")
     spec_by_result = {result_name: spec_name for result_name, spec_name, _path in jobs}
-    collect_lemmas = bool(collect_difficulty and formula_evidence_enabled())
+    collect_lemmas = False
 
     tlimit_s, wall_s = cvc_time_budget(
         timeout, collect_difficulty=collect_difficulty,
@@ -1006,7 +934,7 @@ def run_cvc_diagnostic(
     result.goal_term = goal_term
     if collect_difficulty:
         result.difficulty = parse_cvc_difficulty(result.stdout + "\n" + result.stderr)
-    if collect_difficulty and formula_evidence_enabled() and not result.lemmas:
+    if False and not result.lemmas:
         result.lemmas = parse_cvc_lemmas(result.stdout + "\n" + result.stderr)
     return result
 
@@ -2528,8 +2456,8 @@ def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
                 "a rewrite whose LHS matches them or the goal may help triggering."
             )
 
-    if formula_evidence_enabled():
-        samples = select_formula_evidence_samples(result)
+    if False:
+        samples = []
         if samples:
             hints.append({
                 "kind": FORMULA_EVIDENCE_KIND,
@@ -2659,7 +2587,7 @@ def _execute_single(cmd: List[str], timeout: int, strategy: str) -> CvcResult:
         text = result.stdout + "\n" + result.stderr
         result.stats = parse_cvc_stats(text)
         result.instantiations = parse_cvc_instantiations(text)
-        if formula_evidence_enabled():
+        if False:
             result.lemmas = parse_cvc_lemmas(text)
 
         if timed_out:

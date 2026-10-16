@@ -1,12 +1,8 @@
-"""CVC5 ``:pattern`` helpers for axiom injection.
+"""CVC5 ``:pattern`` syntax helpers for axiom formatting.
 
-Syntax helpers (``infer_trigger_pattern`` / ``format_assert_line``) stay.
-The feedback-gated 6-way ±pattern portfolio is **temporarily deprecated**:
-last-round ``rare_inst`` must not change the next CVC run. LAST ATTEMPT
-``advice: TRIGGER`` consumes that evidence instead.
-
-``CVC_PATTERNS`` / ``--cvc-patterns`` default **off**. Even when set on,
-``should_add_cvc_patterns`` stays false until ``PATTERN_FEEDBACK_GATE_ENABLED``.
+``infer_trigger_pattern`` / ``format_assert_line`` remain. The old
+feedback-gated ±pattern portfolio (``CVC_PATTERNS``) has been removed;
+``should_add_cvc_patterns`` always returns false.
 """
 
 from __future__ import annotations
@@ -14,7 +10,6 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from exp_flags import resolve_cvc_patterns_enabled
 from solver_relative_metrics import (
     EMATCHING_PER_CONJ_MAX,
     EMATCHING_PER_CONJ_SOFT,
@@ -298,27 +293,14 @@ PATTERN_FEEDBACK_GATE_ENABLED = False
 
 
 def should_add_cvc_patterns(
-    *,
     failed_data: Optional[dict] = None,
-    formulas: Sequence[str] = (),
+    *,
+    formulas: Optional[Sequence[str]] = None,
     enabled: Optional[bool] = None,
 ) -> bool:
-    """Whether to wrap directed equalities with ``:pattern`` on CVC axiom inject.
-
-    Currently always false (``PATTERN_FEEDBACK_GATE_ENABLED``). Historical
-    ``pattern_on`` was ``patterns_enabled ∧ rare_inst ∧ has_directed_eq``.
-    """
-    if not PATTERN_FEEDBACK_GATE_ENABLED:
-        return False
-    data = failed_data if isinstance(failed_data, dict) else {}
-    if enabled is None and "cvc_patterns" in data:
-        enabled = bool(data.get("cvc_patterns"))
-    if not resolve_cvc_patterns_enabled(enabled):
-        return False
-    feats = v2_pattern_features(data)
-    if not feats["trigger"]:
-        return False
-    return formulas_have_directed_equality(formulas)
+    """Always false: CVC_PATTERNS portfolio removed."""
+    del failed_data, formulas, enabled
+    return False
 
 
 def v2_should_add_cvc_patterns(

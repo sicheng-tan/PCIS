@@ -1,33 +1,10 @@
 """Ablation switches for features added on top of the original PaperMate loop.
 
-Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
-``FEEDBACK_FORMULA_EVIDENCE`` defaults off (no ``-o lemmas`` samples).
-``FEEDBACK_LLM_HINTS`` defaults off (extra LLM call that proposes hints from
-solver observations before lemma generation). ``FEEDBACK_LLM_HINTS_HD``
-defaults off (diagnoser omits HD hotspots; usefulness skips difficulty dump
-unless another consumer needs it).
-Vampire main prove paths collect ``--statistics full`` / ``--show_induction``
-only when ``vampire_collect_feedback_artifacts()`` is true (repair hints or
-progress sidecar).
-Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
-
-These flags are independent of ``SOLVER_ROUTING`` and Module-2 memory
-(``LEMMA_LIBRARY``, ``LEMMA_LIBRARY_LOCAL``, ``INVALID_LEMMAS`` modes
-``off``/``on``/``paper``, ``OBLIGATION_TREE``, ``ANCESTOR_*``).
-
-暂时弃用 (default **off**; set ``on`` to re-enable — do not turn this on
-by accident):
-- ``FEEDBACK_PROGRESS``: 3s usefulness sidecar, progress lemmas in the prompt,
-  and sidecar-driven profile rerank (``no_progress`` / ``partial_progress``).
-  Mix / HD hints still come from the failed 60s A∧C→P prove.
-  Do not turn this on unless you are deliberately ablating the sidecar.
-
-``PROMPT_ADVICE`` / ``OBLIGATION_TREE`` default on: LAST ATTEMPT advice
-labels and the last well-formed split tree in the prompt / json. Independent
-of ``--strategy-mode``.
-
-``ANCESTOR_CYCLE_FILTER`` / ``ANCESTOR_PROMPT`` default on: path-local
-ancestor α-cycle screening and PROOF PATH GOALS in the user prompt.
+Kept for the paper portfolio: ``PROMPT_ADVICE``, ``PROBLEM_PROFILER``,
+``INDUCTION_SCHEME``, ancestor / obligation-tree related knobs (PCR), and
+strategy-mode prompt packs. Experimental routing / repair-hint / formula-
+evidence / progress-sidecar / pattern-portfolio / proof-shape / prompt-retarget
+switches have been removed.
 """
 
 from __future__ import annotations
@@ -42,8 +19,7 @@ OURS_PROMPT_STRATEGIES = (
     "prove_prompt_term_rewrite",
 )
 NAIVE_PROMPT_STRATEGIES = ("prompt_naive",)
-# v2: one generic template (lemma_general). Structural repair is LAST ATTEMPT
-# GENERALIZE hint directions, not a second system prompt. Budget stays 2N.
+# v2: one generic template (lemma_general). Budget stays 2N.
 V2_PROMPT_STRATEGIES = ("lemma_general",)
 V2_LEMMA_GENERAL = "lemma_general"
 
@@ -52,97 +28,10 @@ def _flag_enabled(name: str, default: str = "on") -> bool:
     return os.getenv(name, default).strip().lower() not in _OFF_VALUES
 
 
-def repair_hints_enabled() -> bool:
-    """Write solver-derived repair hints into failed_lemmas / the LLM prompt."""
-    return _flag_enabled("FEEDBACK_REPAIR_HINTS")
-
-
-def formula_evidence_enabled() -> bool:
-    """Collect ``-o lemmas`` and show concrete solver formulas next to difficulty.
-
-    Default **off**. Enable with ``FEEDBACK_FORMULA_EVIDENCE=on`` for the
-    difficulty + instantiation-sample ablation. Does not emit new advice
-    labels (TRIGGER/BRIDGE/GENERALIZE); samples stay evidence, not diagnoses.
-    """
-    return _flag_enabled("FEEDBACK_FORMULA_EVIDENCE", default="off")
-
-
-def feedback_llm_hints_enabled() -> bool:
-    """Extra LLM call: select unproved revival candidates after a useless group.
-
-    Default **off**. Requires ≥1 useless group (skips first lemma generation)
-    and an opportunity (unproved pool **and** library growth vs the last
-    baseline; the first call compares against an empty library). Difficulty is
-    optional (see ``FEEDBACK_LLM_HINTS_HD``). Injects under LAST ATTEMPT only
-    when the diagnoser produced a block (new_direction / revise_candidate).
-    Program HD / repair hints stay out of the generation prompt while this
-    flag is on.
-    """
-    return _flag_enabled("FEEDBACK_LLM_HINTS", default="off")
-
-
-def feedback_llm_hints_hd_enabled() -> bool:
-    """Put usefulness HD hotspots into the LLM diagnoser observation pack.
-
-    Default **off**. When off, the diagnoser omits HARD AXIOMS. Use with
-    ``collect_difficulty_for_feedback`` so usefulness skips
-    ``--dump-difficulty`` unless another consumer needs HD.
-    """
-    return _flag_enabled("FEEDBACK_LLM_HINTS_HD", default="off")
-
-
-def collect_difficulty_for_feedback() -> bool:
-    """True when a feedback consumer needs CVC ``--dump-difficulty``.
-
-    Who consumes HD decides collection:
-    - ``FEEDBACK_LLM_HINTS=on``: only if ``FEEDBACK_LLM_HINTS_HD=on``
-      (program HD is not injected while LLM hints are on).
-    - otherwise: ``FEEDBACK_REPAIR_HINTS`` (program LAST ATTEMPT HD path).
-    """
-    if feedback_llm_hints_enabled():
-        return feedback_llm_hints_hd_enabled()
-    return repair_hints_enabled()
-
-
-def vampire_collect_feedback_artifacts() -> bool:
-    """True when Vampire prove runs should collect stats / induction traces.
-
-    Gates ``--statistics full`` and ``--show_induction`` on main prove paths
-    (usefulness, initial prove, harvest direct prove). Independent of
-    ``SOLVER_ROUTING`` probes, which always collect their own short-run stats.
-
-    Consumers:
-    - ``FEEDBACK_REPAIR_HINTS``: mix / induction_stuck from the failed prove
-    - ``FEEDBACK_PROGRESS``: 3s sidecar scoring (sidecar still forces these on)
-    """
-    return repair_hints_enabled() or progress_feedback_enabled()
-
-
-def progress_feedback_enabled() -> bool:
-    """Run the 3s usefulness sidecar and inject progress lemmas into the prompt.
-
-    暂时弃用: default **off**. Do not enable casually — the sidecar is extra
-    solver work and leftover ``progress_lemmas`` / ``no_progress`` hints can
-    rerank profiles. Mix / HD still come from the failed 60s A∧C→P prove.
-    ``FEEDBACK_PROGRESS=on`` restores the sidecar.
-    """
-    return _flag_enabled("FEEDBACK_PROGRESS", default="off")
-
-
-def proof_shape_hint_enabled() -> bool:
-    """Append PROOF-SHAPE HINT after usefulness fail or unproved sublemma (default off).
-
-    Runtime lemma-generation feedback only; not produced by the LLM diagnoser
-    and not part of static prompt templates. Enable with ``PROOF_SHAPE_HINT=on``.
-    """
-    return _flag_enabled("PROOF_SHAPE_HINT", default="off")
-
-
 def problem_profiler_enabled() -> bool:
     """Inject deterministic SMT structure facts into lemma-generation prompts.
 
-    Parse / gate / render only. Default **off**. Does not call an LLM and does
-    not replace ``FEEDBACK_LLM_HINTS`` or ``PROOF_SHAPE_HINT``.
+    Parse / gate / render only. Default **off**. Does not call an LLM.
     Enable with ``PROBLEM_PROFILER=on``.
     """
     return _flag_enabled("PROBLEM_PROFILER", default="off")
@@ -291,11 +180,6 @@ def should_run_induction_scheme(
     return str(last.get("kind") or "") == "useless"
 
 
-def prompt_retarget_enabled() -> bool:
-    """Pick / switch generation templates from hint families and consecutive no-help."""
-    return _flag_enabled("PROMPT_RETARGET")
-
-
 def prompt_advice_enabled() -> bool:
     """Emit LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...).
 
@@ -323,32 +207,6 @@ def ancestor_cycle_filter_enabled() -> bool:
 def ancestor_prompt_enabled() -> bool:
     """Inject PROOF PATH GOALS (CURRENT + strict ancestors) into the user prompt."""
     return _flag_enabled("ANCESTOR_PROMPT")
-
-
-def cvc_patterns_enabled() -> bool:
-    """CVC ``:pattern`` CLI/env flag. Default **off** (temporarily unused).
-
-    Feedback-gated 6-way ±pattern is deprecated: ``should_add_cvc_patterns``
-    stays false even if this returns true. Re-enable only with
-    ``PATTERN_FEEDBACK_GATE_ENABLED`` in ``smt_patterns.py``.
-    """
-    return _flag_enabled("CVC_PATTERNS", default="off")
-
-
-def resolve_cvc_patterns_enabled(override: Optional[bool] = None) -> bool:
-    """CLI/prove_run override, else ``CVC_PATTERNS`` env (default off)."""
-    if override is not None:
-        return bool(override)
-    return cvc_patterns_enabled()
-
-
-def apply_cvc_patterns_cli(value: Optional[str]) -> None:
-    """Set ``CVC_PATTERNS`` from ``--cvc-patterns on|off`` (None = leave env)."""
-    if value is None:
-        return
-    os.environ["CVC_PATTERNS"] = "on" if str(value).strip().lower() in (
-        "on", "1", "true", "yes",
-    ) else "off"
 
 
 # Fail-fast / child-budget switches live in lemma_gates.py (same default-on
@@ -393,8 +251,7 @@ def resolve_prompt_pack(
 
     ``v2`` uses ``prompts_v2`` with only ``lemma_general`` (budget 2N).
     ``v2_simple`` uses the same template name and budget from
-    ``prompts_v2_compact``. Retarget on/off does not change the template:
-    the pool is a singleton, so ``prompt_retarget_active`` is false either way.
+    ``prompts_v2_compact``.
     """
     n = max(1, int(max_attempts_per_prompt) or 1)
     mode = normalize_strategy_mode(strategy_mode)
@@ -447,11 +304,6 @@ def resolve_prompt_pack(
         "total_attempts": n * len(strategies),
         "no_retarget_prompt": None,
     }
-
-
-def prompt_retarget_active(n_strategies: int) -> bool:
-    """Retarget needs at least two templates; naive therefore stays on paper order."""
-    return prompt_retarget_enabled() and int(n_strategies) > 1
 
 
 def paper_schedule_prompt(

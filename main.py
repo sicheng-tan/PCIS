@@ -26,28 +26,19 @@ if __name__ == "__main__":
         "v2_simple: prompts_v2_compact lemma_general × 2N",
     )
     parser.add_argument(
-        "--cvc-patterns",
-        choices=["on", "off"],
-        default=None,
-        help="CVC :pattern flag (temporarily unused: even on does not open 6-way). "
-        "Default: off",
-    )
-    parser.add_argument(
         "--baseline",
         action="store_true",
         help="仅求解器初始验证，不调用 LLM",
     )
     args = parser.parse_args()
 
-    from exp_flags import apply_cvc_patterns_cli, resolve_cvc_patterns_enabled
-    apply_cvc_patterns_cli(args.cvc_patterns)
+    # CVC_PATTERNS removed
 
     final_status = prove_run(
         args.base_path,
         args.base_name,
         strategy_mode=args.strategy_mode,
         baseline_only=args.baseline,
-        cvc_patterns=resolve_cvc_patterns_enabled(),
     )
 
     logging.info("最终验证结论: %s", "成功" if final_status else "Fail")

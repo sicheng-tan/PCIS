@@ -22,7 +22,7 @@ from obligation_tree import (
     lemma_library_role,
     load_lemma_library,
 )
-from solver_routing import VAMPIRE_RACE_PROFILES
+from solver_profiles import VAMPIRE_RACE_PROFILES
 from vampire_runner import VampireResult
 
 _GOAL = """(set-logic ALL)
@@ -37,8 +37,7 @@ _LEMMA = "(forall ((y Int)) (=> (P y) (P y)))"
 _HARVEST_ENV = {
     "LEMMA_LIBRARY": "on",
     "LEMMA_LIBRARY_LOCAL": "on",
-    "SOLVER_ROUTING": "off",
-    "LEMMA_DEFINED_SYMBOLS": "off",
+        "LEMMA_DEFINED_SYMBOLS": "off",
 }
 
 
@@ -220,8 +219,7 @@ def test_skip_initial_prove_run_does_not_call_initial() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "LLM_LEMMA_DIAGNOSIS": "off",
+                        "LLM_LEMMA_DIAGNOSIS": "off",
             "CHILD_LLM_ATTEMPTS": "1",
         }), patch("Mate_new.perform_initial_verification", initial), patch(
             "Mate_new.quick_run", return_value=(False, [], [])
@@ -249,8 +247,8 @@ def test_harvest_retry_refreshes_goal_only_baseline() -> None:
         mate._set_goal_only_baseline(
             tmp, "template", first, context="initial_goal", replace=False,
         )
-        with patch("Mate_new.run_cvc_routed", return_value=retry), patch.dict(
-            os.environ, {"SOLVER_ROUTING": "off"},
+        with patch("Mate_new.run_cvc", return_value=retry), patch.dict(
+            os.environ, {},
         ):
             ok = mate.perform_initial_verification(
                 smt, base_path=tmp, goal_name="template", log_event="harvest_retry",
@@ -275,8 +273,7 @@ def test_library_off_disables_harvest() -> None:
         with patch.dict(os.environ, {
             "LEMMA_LIBRARY": "off",
             "LEMMA_LIBRARY_LOCAL": "on",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_DEFINED_SYMBOLS": "off",
+                        "LEMMA_DEFINED_SYMBOLS": "off",
             "USEFULNESS_HARVEST_DELAY_S": "0.03",
         }), patch("Mate_new.generate_lemmas_with_llm", return_value=[_LEMMA]), patch(
             "Mate_new.validate_lemmas_parallel",
@@ -320,7 +317,7 @@ def _run_quick_vampire(tmp: str, *, delay: str, usefulness, harvest, retry=None)
             side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas),
         ),
         patch("Mate_new_vampire.verify_combined_lemmas", side_effect=usefulness),
-        patch("Mate_new_vampire.run_vampire_routed", side_effect=harvest),
+        patch("Mate_new_vampire.run_vampire_default", side_effect=harvest),
     ]
     if retry is not None:
         patches.append(
@@ -361,7 +358,7 @@ def test_vampire_exhausted_harvest_sets_skip_initial_diag() -> None:
         assert diag.get("induction_focus") == ["(P x)"]
         # Harvest uses the same paper schedule as usefulness / node prove.
         assert harvest.call_count >= 1
-        # Harvest now goes through run_vampire_routed (serial dual / paper portfolio).
+        # Harvest now goes through run_vampire_default (serial dual / paper portfolio).
         assert harvest.call_args[0][0]  # smt path
         assert int(harvest.call_args[0][1]) > 0  # timeout
 
@@ -380,8 +377,7 @@ def test_vampire_skip_initial_seeds_baseline() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "LLM_LEMMA_DIAGNOSIS": "off",
+                        "LLM_LEMMA_DIAGNOSIS": "off",
             "CHILD_LLM_ATTEMPTS": "1",
         }), patch("Mate_new_vampire.perform_initial_verification", initial), patch(
             "Mate_new_vampire.quick_run", return_value=(False, [], [])
@@ -409,8 +405,8 @@ def test_vampire_harvest_retry_refreshes_baseline() -> None:
         mate._set_goal_only_baseline(
             tmp, "template", first, context="initial_goal", replace=False,
         )
-        with patch("Mate_new_vampire.run_vampire_routed", return_value=retry), patch.dict(
-            os.environ, {"SOLVER_ROUTING": "off"},
+        with patch("Mate_new_vampire.run_vampire_default", return_value=retry), patch.dict(
+            os.environ, {},
         ):
             ok = mate.perform_initial_verification(
                 smt, base_path=tmp, goal_name="template", log_event="harvest_retry",

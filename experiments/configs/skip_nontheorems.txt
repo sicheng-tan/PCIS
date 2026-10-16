@@ -3,7 +3,7 @@
 # Paths are matched as suffixes, so these still apply after the experiment
 # runner copies a dataset to result_dir/<timestamp>_<dataset>/.
 #
-# Source: docs/root-invalid-goal-counterexamples.md
+# Source: docs/excluded_instances.md (paper Appendix A)
 # Usage:
 #   python3 run_exp_folder.py --root-path ... --skip-file experiments/configs/skip_nontheorems.txt
 #   SKIP_PROBLEMS_FILE=experiments/configs/skip_nontheorems.txt python3 run_exp_folder.py ...
@@ -24,3 +24,7 @@ benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal14
 benchmarks/preprocessed/dtt/dtt-leon/bsearch-tree-goal17
 benchmarks/preprocessed/vmcai15-dt/leon/heap-goal11
 benchmarks/preprocessed/vmcai15-dt/isa/goal75
+benchmarks/preprocessed/dtt/dtt-isa/goal74
+benchmarks/preprocessed/dtt/dtt-isa/goal76
+benchmarks/preprocessed/dtt/dtt-isa/goal79
+benchmarks/preprocessed/dtt/dtt-isa/goal80
