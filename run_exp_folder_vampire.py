@@ -238,14 +238,12 @@ if __name__ == "__main__":
                        default="/home/ssdllm/ProofMate/preprocessed/all-int",
                        help='原始文件夹路径')
     parser.add_argument('--strategy-mode', type=str, 
-                       choices=['default', 'default_simple', 'zero_shot', 'naive', 'v2', 'v2_simple'],
+                       choices=['default', 'default_simple', 'zero_shot', 'naive'],
                        default='default',
                        help='提示词包: default 用 prompts_ours（等式+重写各 N 次）; '
                             'default_simple 用 prompts_ours_compact（同两模板、精简 system）; '
                             'zero_shot 同 default; '
-                            'naive 只用 prompt_naive 重复 2N 次; '
-                            'v2 用 prompts_v2（lemma_general × 2N）; '
-                            'v2_simple 用 prompts_v2_compact（同 lemma_general、精简 system）')
+                            'naive 只用 prompt_naive 重复 2N 次')
     parser.add_argument(
         '--cvc-patterns',
         choices=['on', 'off'],
@@ -302,10 +300,6 @@ if __name__ == "__main__":
             print("   naive: 只用 prompt_naive，重复 2×MAX_ATTEMPTS_PER_PROMPT 次（关闭模板选择）")
         elif args.strategy_mode == "default_simple":
             print("   default_simple: 与 default 相同两模板，system 用 prompts_ours_compact")
-        elif args.strategy_mode == "v2":
-            print("   v2: lemma_general × 2N，system 用 prompts_v2")
-        elif args.strategy_mode == "v2_simple":
-            print("   v2_simple: 与 v2 相同模板，system 用 prompts_v2_compact")
     
     # 存储所有结果
     results = []

@@ -65,8 +65,6 @@ def test_advice_works_across_strategy_modes() -> None:
         "default_simple",
         "naive",
         "zero_shot",
-        "v2",
-        "v2_simple",
         "",
     )
     for mode in modes:
@@ -83,7 +81,7 @@ def test_advice_works_across_strategy_modes() -> None:
 
 def test_trigger_from_rare_inst() -> None:
     data = {
-        "strategy_mode": "v2",
+        "strategy_mode": "default",
         "repair_hints": [_hd(rarely_instantiated=[AX])],
     }
     with _advice_on():
@@ -130,7 +128,7 @@ def test_prompt_advice_flag_off_skips_advice() -> None:
 
 def test_vampire_backend_skips_advice() -> None:
     data = {
-        "strategy_mode": "v2",
+        "strategy_mode": "default",
         "repair_hints": [_hd(rarely_instantiated=[AX])],
     }
     assert advice_from_failed_data(data, backend="vampire") is None
@@ -268,7 +266,7 @@ def test_local_vs_parent_contrast_in_last_attempt() -> None:
     )
     parent = "(forall ((t Tree)) (= (flatten3 t) (flatten0 t)))"
     data = {
-        "strategy_mode": "v2_simple",
+        "strategy_mode": "default_simple",
         "baseline_diag": {"goal_term": parent},
         "obligation": {
             "attempts": [{
@@ -368,7 +366,7 @@ def test_localize_and_bridge() -> None:
 
 def test_initial_solve_skips_prune_and_bridge() -> None:
     data = {
-        "strategy_mode": "v2",
+        "strategy_mode": "default",
         "repair_hints": [_hd()],
         "baseline_diag": {
             "difficulty": [[GOAL, 3]],
@@ -382,9 +380,9 @@ def test_initial_solve_skips_prune_and_bridge() -> None:
     assert "advice: BRIDGE" not in txt
 
 
-def test_last_attempt_v2_trigger_keeps_lemmas_only() -> None:
+def test_last_attempt_trigger_keeps_lemmas_only() -> None:
     data = {
-        "strategy_mode": "v2",
+        "strategy_mode": "default",
         "useless_lemma_groups": [{
             "lemmas": [KEPT],
             "status": "timeout",
@@ -403,7 +401,7 @@ def test_last_attempt_v2_trigger_keeps_lemmas_only() -> None:
 
 def test_missing_dump_skips_prune_bridge() -> None:
     data = {
-        "strategy_mode": "v2",
+        "strategy_mode": "default",
         "useless_lemma_groups": [{
             "lemmas": [KEPT],
             "status": "timeout",
@@ -427,7 +425,7 @@ def test_missing_dump_skips_prune_bridge() -> None:
 def test_per_profile_attribution_not_prune_advice() -> None:
     """Inductive CONJ boom + simple named hit → BRIDGE, not PRUNE advice."""
     data = {
-        "strategy_mode": "v2",
+        "strategy_mode": "default",
         "useless_lemma_groups": [{
             "lemmas": [KEPT],
             "status": "timeout",
@@ -476,74 +474,6 @@ def test_per_profile_attribution_not_prune_advice() -> None:
     assert "advice: BRIDGE" in txt
 
 
-def test_v2_lemma_general_covers_both_default_modes() -> None:
-    """lemma_general merges both default modes and keeps paper examples."""
-    folder = ROOT / "prompts_v2" / "lemma_general"
-    system = (folder / "system_prompt.txt").read_text(encoding="utf-8")
-    user = (folder / "user_prompt.txt").read_text(encoding="utf-8")
-    ours_eq = (
-        ROOT / "prompts_ours" / "prove_prompt_equational_reasoning" / "system_prompt.txt"
-    ).read_text(encoding="utf-8")
-    ours_rw = (
-        ROOT / "prompts_ours" / "prove_prompt_term_rewrite" / "system_prompt.txt"
-    ).read_text(encoding="utf-8")
-
-    assert "<output>" in system and "<lemma>" in system
-    assert "<input>" in user and "</input>" in user
-    assert "induction scheme" in system
-    assert "P (succ n)" in system
-    assert "qreva" in system
-    assert "(declare-datatypes ((Lst 0))" in system
-    assert "Example1:" in system
-    assert "Example2:" in system
-    assert "Example3:" in system
-    assert "(= (plus zero n) n)" in system
-    assert "(= (plus m n) (plus n m))" in system
-    assert "Pow2 (- i 1)" in system
-    assert "restored to the original form" in system
-    assert "unfolds on its first argument" in system
-    assert "bridges the original premise" in system
-    assert "inessential" in system
-    assert "PROOF PATH GOALS" in system
-    assert "INVALID_GOAL" in system
-    assert "possible directions" in system or "not a closed menu" in system
-    assert "CASE_SPLIT" not in system
-    assert "action:" not in system
-    assert ":pattern" not in system
-    assert len(system) < len(ours_eq) + len(ours_rw)
-
-
-def test_v2_simple_lemma_general_is_compact() -> None:
-    full = (
-        ROOT / "prompts_v2" / "lemma_general" / "system_prompt.txt"
-    ).read_text(encoding="utf-8")
-    compact = (
-        ROOT / "prompts_v2_compact" / "lemma_general" / "system_prompt.txt"
-    ).read_text(encoding="utf-8")
-    user = (
-        ROOT / "prompts_v2_compact" / "lemma_general" / "user_prompt.txt"
-    ).read_text(encoding="utf-8")
-    assert len(compact) < len(full)
-    assert "<output>" in compact and "<lemma>" in compact
-    assert "<input>" in user and "</input>" in user
-    assert "induction scheme" in compact
-    assert "P (succ n)" in compact
-    assert "qreva" in compact
-    assert "(= (plus zero n) n)" in compact
-    assert "(= (plus m n) (plus n m))" in compact
-    assert "Pow2 (- i 1)" in compact
-    assert "restored to the original form" in compact
-    assert "LAST ATTEMPT" in compact
-    assert "not a closed menu" in compact
-    assert "CASE_SPLIT" not in compact
-    assert "action:" not in compact
-    assert "pick one" not in compact.lower()
-    assert "PROOF PATH GOALS" in compact
-    assert "INVALID_GOAL" in compact
-    assert "Example1:" not in compact
-    assert ":pattern" not in compact
-
-
 def main() -> int:
     test_advice_works_across_strategy_modes()
     test_trigger_from_rare_inst()
@@ -556,11 +486,9 @@ def main() -> int:
     test_local_vs_parent_contrast_in_last_attempt()
     test_localize_and_bridge()
     test_initial_solve_skips_prune_and_bridge()
-    test_last_attempt_v2_trigger_keeps_lemmas_only()
+    test_last_attempt_trigger_keeps_lemmas_only()
     test_missing_dump_skips_prune_bridge()
     test_per_profile_attribution_not_prune_advice()
-    test_v2_lemma_general_covers_both_default_modes()
-    test_v2_simple_lemma_general_is_compact()
     print("prompt mode tests passed")
     return 0
 

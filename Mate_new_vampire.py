@@ -2678,8 +2678,7 @@ def _prove_run_body(
     pack = resolve_prompt_pack(strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"])
     strategies = pack["strategies"]
     total_attempts, max_attempts_per_prompt = node_attempt_plan(depth, pack)
-    fixed_no_retarget = pack.get("no_retarget_prompt")
-    current_prompt = fixed_no_retarget or paper_schedule_prompt(
+    current_prompt = paper_schedule_prompt(
         strategies, 0, max_attempts_per_prompt
     )
     log_exp(
@@ -2693,7 +2692,7 @@ def _prove_run_body(
     )
 
     for attempt in range(total_attempts):
-        current_prompt = fixed_no_retarget or paper_schedule_prompt(
+        current_prompt = paper_schedule_prompt(
             strategies, attempt, max_attempts_per_prompt
         )
         prompt_strategy = current_prompt

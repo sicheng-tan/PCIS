@@ -1,6 +1,6 @@
 """LAST ATTEMPT advice: last-round diagnosis → next lemma bias.
 
-Works for every ``--strategy-mode`` (default / naive / v2 / …). Gated only by
+Works for every ``--strategy-mode`` (default / naive / …). Gated only by
 ``PROMPT_ADVICE`` (and CVC backend). ``advice_from_failed_data`` returns None
 when the flag is off.
 

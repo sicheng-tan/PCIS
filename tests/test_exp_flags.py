@@ -108,10 +108,10 @@ def test_resolve_prompt_pack() -> None:
     naive = resolve_prompt_pack("naive", 3)
     assert naive["folder_path"] == "./prompts_naive"
     assert naive["total_attempts"] == 6
-    v2 = resolve_prompt_pack("v2", 3)
-    assert v2["mode"] == "v2"
-    assert v2["no_retarget_prompt"] == "lemma_general"
-    assert normalize_strategy_mode("general_ind") == "v2"
+    assert normalize_strategy_mode("v2") == "default"
+    assert normalize_strategy_mode("general_ind") == "default"
+    compact = resolve_prompt_pack("default_simple", 3)
+    assert compact["folder_path"] == "./prompts_ours_compact"
 
 
 def test_paper_schedule_prompt() -> None:

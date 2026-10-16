@@ -22,10 +22,6 @@ OURS_PROMPT_STRATEGIES = (
     "prove_prompt_term_rewrite",
 )
 NAIVE_PROMPT_STRATEGIES = ("prompt_naive",)
-# v2: one generic template (lemma_general). Structural repair is LAST ATTEMPT
-# GENERALIZE hint directions, not a second system prompt. Budget stays 2N.
-V2_PROMPT_STRATEGIES = ("lemma_general",)
-V2_LEMMA_GENERAL = "lemma_general"
 
 
 def _flag_enabled(name: str, default: str = "on") -> bool:
@@ -191,20 +187,11 @@ def normalize_strategy_mode(strategy_mode: str) -> str:
         return "naive"
     if mode in ("zero_shot", "zeroshot"):
         return "zero_shot"
-    if mode in ("v2_simple", "v2_compact", "general_ind_simple"):
-        return "v2_simple"
-    if mode in ("v2", "general_ind", "general_induction"):
-        return "v2"
     if mode in ("default_simple", "ours_simple", "simple"):
         return "default_simple"
     if mode in ("default", "ours", ""):
         return "default"
     return "default"
-
-
-def is_v2_strategy_mode(strategy_mode: str) -> bool:
-    """True for ``v2`` and ``v2_simple`` (lemma_general pack)."""
-    return normalize_strategy_mode(strategy_mode) in ("v2", "v2_simple")
 
 
 def resolve_prompt_pack(
@@ -227,27 +214,6 @@ def resolve_prompt_pack(
             "strategies": strategies,
             "max_attempts_per_prompt": n,
             "total_attempts": n * 2,
-            "no_retarget_prompt": None,
-        }
-    if mode == "v2":
-        strategies = list(V2_PROMPT_STRATEGIES)
-        return {
-            "mode": mode,
-            "folder_path": "./prompts_v2",
-            "strategies": strategies,
-            "max_attempts_per_prompt": n,
-            "total_attempts": n * 2,
-            "no_retarget_prompt": V2_LEMMA_GENERAL,
-        }
-    if mode == "v2_simple":
-        strategies = list(V2_PROMPT_STRATEGIES)
-        return {
-            "mode": mode,
-            "folder_path": "./prompts_v2_compact",
-            "strategies": strategies,
-            "max_attempts_per_prompt": n,
-            "total_attempts": n * 2,
-            "no_retarget_prompt": V2_LEMMA_GENERAL,
         }
     if mode == "default_simple":
         strategies = list(OURS_PROMPT_STRATEGIES)
@@ -257,7 +223,6 @@ def resolve_prompt_pack(
             "strategies": strategies,
             "max_attempts_per_prompt": n,
             "total_attempts": n * len(strategies),
-            "no_retarget_prompt": None,
         }
     strategies = list(OURS_PROMPT_STRATEGIES)
     return {
@@ -266,7 +231,6 @@ def resolve_prompt_pack(
         "strategies": strategies,
         "max_attempts_per_prompt": n,
         "total_attempts": n * len(strategies),
-        "no_retarget_prompt": None,
     }
 
 
