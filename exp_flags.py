@@ -1,30 +1,10 @@
-"""Ablation switches for features added on top of the original PaperMate loop.
+"""Ablation switches for PCIS features (PCR / GSE / prompt advice).
 
-Most flags default on. ``FEEDBACK_PROGRESS`` defaults off (no 3s sidecar).
-``FEEDBACK_FORMULA_EVIDENCE`` defaults off (no ``-o lemmas`` samples).
-``FEEDBACK_LLM_HINTS`` defaults off (extra LLM call that proposes hints from
-solver observations before lemma generation). ``FEEDBACK_LLM_HINTS_HD``
-defaults off (diagnoser omits HD hotspots; usefulness skips difficulty dump
-unless another consumer needs it).
-Vampire main prove paths collect ``--statistics full`` / ``--show_induction``
-only when ``vampire_collect_feedback_artifacts()`` is true (repair hints or
-progress sidecar).
+PCR memory: ``LEMMA_LIBRARY``, ``LEMMA_LIBRARY_LOCAL``, ``INVALID_LEMMAS``
+(``off``/``on``/``paper``), ``OBLIGATION_TREE``, ``ANCESTOR_*``.
+GSE: ``PROBLEM_PROFILER``, ``INDUCTION_SCHEME*``.
+``PROMPT_ADVICE`` defaults on (LAST ATTEMPT advice labels).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
-
-These flags are independent of ``SOLVER_ROUTING`` and Module-2 memory
-(``LEMMA_LIBRARY``, ``LEMMA_LIBRARY_LOCAL``, ``INVALID_LEMMAS`` modes
-``off``/``on``/``paper``, ``OBLIGATION_TREE``, ``ANCESTOR_*``).
-
-暂时弃用 (default **off**; set ``on`` to re-enable — do not turn this on
-by accident):
-- ``FEEDBACK_PROGRESS``: 3s usefulness sidecar, progress lemmas in the prompt,
-  and sidecar-driven profile rerank (``no_progress`` / ``partial_progress``).
-  Mix / HD hints still come from the failed 60s A∧C→P prove.
-  Do not turn this on unless you are deliberately ablating the sidecar.
-
-``PROMPT_ADVICE`` / ``OBLIGATION_TREE`` default on: LAST ATTEMPT advice
-labels and the last well-formed split tree in the prompt / json. Independent
-of ``--strategy-mode``.
 
 ``ANCESTOR_CYCLE_FILTER`` / ``ANCESTOR_PROMPT`` default on: path-local
 ancestor α-cycle screening and PROOF PATH GOALS in the user prompt.
@@ -52,97 +32,15 @@ def _flag_enabled(name: str, default: str = "on") -> bool:
     return os.getenv(name, default).strip().lower() not in _OFF_VALUES
 
 
-def repair_hints_enabled() -> bool:
-    """Write solver-derived repair hints into failed_lemmas / the LLM prompt."""
-    return _flag_enabled("FEEDBACK_REPAIR_HINTS")
-
-
-def formula_evidence_enabled() -> bool:
-    """Collect ``-o lemmas`` and show concrete solver formulas next to difficulty.
-
-    Default **off**. Enable with ``FEEDBACK_FORMULA_EVIDENCE=on`` for the
-    difficulty + instantiation-sample ablation. Does not emit new advice
-    labels (TRIGGER/BRIDGE/GENERALIZE); samples stay evidence, not diagnoses.
-    """
-    return _flag_enabled("FEEDBACK_FORMULA_EVIDENCE", default="off")
-
-
-def feedback_llm_hints_enabled() -> bool:
-    """Extra LLM call: select unproved revival candidates after a useless group.
-
-    Default **off**. Requires ≥1 useless group (skips first lemma generation)
-    and an opportunity (unproved pool **and** library growth vs the last
-    baseline; the first call compares against an empty library). Difficulty is
-    optional (see ``FEEDBACK_LLM_HINTS_HD``). Injects under LAST ATTEMPT only
-    when the diagnoser produced a block (new_direction / revise_candidate).
-    Program HD / repair hints stay out of the generation prompt while this
-    flag is on.
-    """
-    return _flag_enabled("FEEDBACK_LLM_HINTS", default="off")
-
-
-def feedback_llm_hints_hd_enabled() -> bool:
-    """Put usefulness HD hotspots into the LLM diagnoser observation pack.
-
-    Default **off**. When off, the diagnoser omits HARD AXIOMS. Use with
-    ``collect_difficulty_for_feedback`` so usefulness skips
-    ``--dump-difficulty`` unless another consumer needs HD.
-    """
-    return _flag_enabled("FEEDBACK_LLM_HINTS_HD", default="off")
-
-
 def collect_difficulty_for_feedback() -> bool:
-    """True when a feedback consumer needs CVC ``--dump-difficulty``.
-
-    Who consumes HD decides collection:
-    - ``FEEDBACK_LLM_HINTS=on``: only if ``FEEDBACK_LLM_HINTS_HD=on``
-      (program HD is not injected while LLM hints are on).
-    - otherwise: ``FEEDBACK_REPAIR_HINTS`` (program LAST ATTEMPT HD path).
-    """
-    if feedback_llm_hints_enabled():
-        return feedback_llm_hints_hd_enabled()
-    return repair_hints_enabled()
-
-
-def vampire_collect_feedback_artifacts() -> bool:
-    """True when Vampire prove runs should collect stats / induction traces.
-
-    Gates ``--statistics full`` and ``--show_induction`` on main prove paths
-    (usefulness, initial prove, harvest direct prove). Independent of
-    ``SOLVER_ROUTING`` probes, which always collect their own short-run stats.
-
-    Consumers:
-    - ``FEEDBACK_REPAIR_HINTS``: mix / induction_stuck from the failed prove
-    - ``FEEDBACK_PROGRESS``: 3s sidecar scoring (sidecar still forces these on)
-    """
-    return repair_hints_enabled() or progress_feedback_enabled()
-
-
-def progress_feedback_enabled() -> bool:
-    """Run the 3s usefulness sidecar and inject progress lemmas into the prompt.
-
-    暂时弃用: default **off**. Do not enable casually — the sidecar is extra
-    solver work and leftover ``progress_lemmas`` / ``no_progress`` hints can
-    rerank profiles. Mix / HD still come from the failed 60s A∧C→P prove.
-    ``FEEDBACK_PROGRESS=on`` restores the sidecar.
-    """
-    return _flag_enabled("FEEDBACK_PROGRESS", default="off")
-
-
-def proof_shape_hint_enabled() -> bool:
-    """Append PROOF-SHAPE HINT after usefulness fail or unproved sublemma (default off).
-
-    Runtime lemma-generation feedback only; not produced by the LLM diagnoser
-    and not part of static prompt templates. Enable with ``PROOF_SHAPE_HINT=on``.
-    """
-    return _flag_enabled("PROOF_SHAPE_HINT", default="off")
+    """True when CVC ``--dump-difficulty`` is needed for PROMPT_ADVICE."""
+    return prompt_advice_enabled()
 
 
 def problem_profiler_enabled() -> bool:
     """Inject deterministic SMT structure facts into lemma-generation prompts.
 
-    Parse / gate / render only. Default **off**. Does not call an LLM and does
-    not replace ``FEEDBACK_LLM_HINTS`` or ``PROOF_SHAPE_HINT``.
+    Parse / gate / render only. Default **off**.
     Enable with ``PROBLEM_PROFILER=on``.
     """
     return _flag_enabled("PROBLEM_PROFILER", default="off")
@@ -151,8 +49,7 @@ def problem_profiler_enabled() -> bool:
 def problem_profiler_min_attempt() -> int:
     """Earliest 1-based attempt index that may receive the profiler block.
 
-    Default **1** (old behaviour). Set ``PROBLEM_PROFILER_MIN_ATTEMPT=2`` to
-    skip the first generation attempt.
+    Default **1**. Set ``PROBLEM_PROFILER_MIN_ATTEMPT=2`` to skip attempt 1.
     """
     raw = (os.getenv("PROBLEM_PROFILER_MIN_ATTEMPT") or "1").strip()
     try:
@@ -166,7 +63,7 @@ def problem_profiler_trigger() -> str:
 
     ``always`` (default): inject whenever attempt ≥ MIN_ATTEMPT.
     ``after_useless``: also require the last finished ``exp_attempts`` entry to
-    have ``kind == "useless"`` (strict previous attempt).
+    have ``kind == "useless"``.
     """
     raw = (os.getenv("PROBLEM_PROFILER_TRIGGER") or "always").strip().lower()
     if raw in ("after_useless", "useless", "last_useless"):
@@ -197,18 +94,13 @@ def should_inject_problem_profiler(failed_data: Optional[dict] = None) -> bool:
 def induction_scheme_enabled() -> bool:
     """Generate / short-prove structural (later measure) induction obligations.
 
-    Default **off**. Enable with ``INDUCTION_SCHEME=on``. Does not put scheme
-    formulas into usefulness C. Child nodes never call an LLM (v1).
+    Default **off**. Enable with ``INDUCTION_SCHEME=on``.
     """
     return _flag_enabled("INDUCTION_SCHEME", default="off")
 
 
 def induction_scheme_mode() -> str:
-    """``structural`` | ``measure`` | ``both``. Unknown → structural.
-
-    ``both``: short-prove all viable axes and merge nest/harvest (not
-    winner-take-all by gate).
-    """
+    """``structural`` | ``measure`` | ``both``. Unknown → structural."""
     raw = (os.getenv("INDUCTION_SCHEME_MODE") or "structural").strip().lower()
     if raw in ("measure", "wellfounded", "wf"):
         return "measure"
@@ -226,35 +118,17 @@ def induction_scheme_trigger() -> str:
 
 
 def induction_scheme_goal_gate_enabled() -> bool:
-    """Optional ``axioms ∧ library ∧ base/step ⊢ G`` check before structural prove.
-
-    Default **on**. Hard fail (sat) drops that axis; timeout still allows
-    obligation short-prove / NEST. Bridge-primary measure soft-skips the gate.
-    ``INDUCTION_SCHEME_GOAL_GATE=off`` disables the check.
-    """
+    """Optional ``axioms ∧ library ∧ base/step ⊢ G`` check before structural prove."""
     return _flag_enabled("INDUCTION_SCHEME_GOAL_GATE", default="on")
 
 
 def induction_scheme_prompt_enabled() -> bool:
-    """Inject the INDUCTION SCHEME ledger block into lemma prompts.
-
-    Default **on** whenever scheme may run. Set ``INDUCTION_SCHEME_PROMPT=off``
-    to keep generate/prove/NEST/harvest but omit the ledger from the LLM prompt
-    (profiler PROBLEM STRUCTURE is unaffected).
-    """
+    """Inject the INDUCTION SCHEME ledger block into lemma prompts."""
     return _flag_enabled("INDUCTION_SCHEME_PROMPT", default="on")
 
 
 def induction_scheme_nest_policy() -> str:
-    """Scheme→child nest policy: ``cross_sort`` | ``on`` | ``off``.
-
-    Default **``cross_sort``**: nest only when a peek of ``select_induct_var`` on
-    the child obligation would pick a **different** ADT/sort than the current
-    scheme round (keeps Queue→Lst amortize paths; cuts Bin/Nat same-sort fanout).
-
-    ``on``: previous behavior (any unproved structural base/step may nest).
-    ``off``: never nest (frontier only).
-    """
+    """Scheme→child nest policy: ``cross_sort`` | ``on`` | ``off``."""
     raw = (os.getenv("INDUCTION_SCHEME_NEST") or "cross_sort").strip().lower()
     if raw in _OFF_VALUES:
         return "off"
@@ -270,11 +144,7 @@ def should_run_induction_scheme(
     *,
     scheme_only: bool = False,
 ) -> bool:
-    """Whether this node/attempt should start a scheme generate+prove round.
-
-    ``scheme_only`` nodes (NEST children) always run when the flag is on.
-    Otherwise follows ``INDUCTION_SCHEME_TRIGGER`` against ``exp_attempts``.
-    """
+    """Whether this node/attempt should start a scheme generate+prove round."""
     if not induction_scheme_enabled():
         return False
     if scheme_only:
@@ -291,27 +161,13 @@ def should_run_induction_scheme(
     return str(last.get("kind") or "") == "useless"
 
 
-def prompt_retarget_enabled() -> bool:
-    """Pick / switch generation templates from hint families and consecutive no-help."""
-    return _flag_enabled("PROMPT_RETARGET")
-
-
 def prompt_advice_enabled() -> bool:
-    """Emit LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...).
-
-    Independent of ``--strategy-mode``. Off keeps HD / library / INVALID
-    without those labels.
-    """
+    """Emit LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...)."""
     return _flag_enabled("PROMPT_ADVICE")
 
 
 def unproved_not_invalid_enabled() -> bool:
-    """Situation A: useful-but-unproved stays off invalid_lemmas (default on).
-
-    When on, blocking subgoals are recorded in ``unproved_lemmas``
-    (USEFUL BUT UNPROVED) and copied to ``revival_lemmas`` for the diagnoser.
-    When off, they are written to ``invalid_lemmas`` instead.
-    """
+    """Situation A: useful-but-unproved stays off invalid_lemmas (default on)."""
     return _flag_enabled("UNPROVED_NOT_INVALID")
 
 
@@ -323,32 +179,6 @@ def ancestor_cycle_filter_enabled() -> bool:
 def ancestor_prompt_enabled() -> bool:
     """Inject PROOF PATH GOALS (CURRENT + strict ancestors) into the user prompt."""
     return _flag_enabled("ANCESTOR_PROMPT")
-
-
-def cvc_patterns_enabled() -> bool:
-    """CVC ``:pattern`` CLI/env flag. Default **off** (temporarily unused).
-
-    Feedback-gated 6-way ±pattern is deprecated: ``should_add_cvc_patterns``
-    stays false even if this returns true. Re-enable only with
-    ``PATTERN_FEEDBACK_GATE_ENABLED`` in ``smt_patterns.py``.
-    """
-    return _flag_enabled("CVC_PATTERNS", default="off")
-
-
-def resolve_cvc_patterns_enabled(override: Optional[bool] = None) -> bool:
-    """CLI/prove_run override, else ``CVC_PATTERNS`` env (default off)."""
-    if override is not None:
-        return bool(override)
-    return cvc_patterns_enabled()
-
-
-def apply_cvc_patterns_cli(value: Optional[str]) -> None:
-    """Set ``CVC_PATTERNS`` from ``--cvc-patterns on|off`` (None = leave env)."""
-    if value is None:
-        return
-    os.environ["CVC_PATTERNS"] = "on" if str(value).strip().lower() in (
-        "on", "1", "true", "yes",
-    ) else "off"
 
 
 # Fail-fast / child-budget switches live in lemma_gates.py (same default-on
@@ -385,16 +215,7 @@ def resolve_prompt_pack(
 
     ``MAX_ATTEMPTS_PER_PROMPT`` is N (default 3). Paper / ours uses N attempts
     on each of two templates (2N total). Naive uses the single ``prompt_naive``
-    template 2N times so the LLM-call budget matches. ``zero_shot`` currently
-    uses the same ours pack as ``default`` (no separate prompt folder).
-
-    ``default_simple`` uses the same two template *names* as ``default``, but
-    loads shortened system prompts from ``prompts_ours_compact``.
-
-    ``v2`` uses ``prompts_v2`` with only ``lemma_general`` (budget 2N).
-    ``v2_simple`` uses the same template name and budget from
-    ``prompts_v2_compact``. Retarget on/off does not change the template:
-    the pool is a singleton, so ``prompt_retarget_active`` is false either way.
+    template 2N times so the LLM-call budget matches.
     """
     n = max(1, int(max_attempts_per_prompt) or 1)
     mode = normalize_strategy_mode(strategy_mode)
@@ -447,11 +268,6 @@ def resolve_prompt_pack(
         "total_attempts": n * len(strategies),
         "no_retarget_prompt": None,
     }
-
-
-def prompt_retarget_active(n_strategies: int) -> bool:
-    """Retarget needs at least two templates; naive therefore stays on paper order."""
-    return prompt_retarget_enabled() and int(n_strategies) > 1
 
 
 def paper_schedule_prompt(

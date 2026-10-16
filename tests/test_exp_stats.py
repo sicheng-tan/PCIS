@@ -145,14 +145,11 @@ def test_write_task_summary_and_csv(tmp_path: Path) -> None:
 
 def test_flags_compact_includes_ablation_keys() -> None:
     compact = flags_compact()
-    assert "SOLVER_ROUTING=" in compact
     assert "LEMMA_LIBRARY=" in compact
     assert "LEMMA_LIBRARY_LOCAL=" in compact
     assert "USEFULNESS_HARVEST_DELAY_S=" in compact
     assert "HARVEST_RETRY_TIMEOUT=" in compact
-    assert "FEEDBACK_REPAIR_HINTS=" in compact
-    assert "FEEDBACK_FORMULA_EVIDENCE=" in compact
-    assert "PROMPT_RETARGET=" in compact
+    assert "PROMPT_ADVICE=" in compact
     assert "MODEL_TYPE=" in compact
     assert "OPENAI_MODEL=" in compact
     assert "ENABLE_THINKING=" in compact
@@ -160,7 +157,6 @@ def test_flags_compact_includes_ablation_keys() -> None:
     assert "MAX_TOKENS=" in compact
     assert "LLM_PARSE_RETRIES=" in compact
     assert "LLM_SCREEN_RETRIES=" in compact
-    assert "PROOF_SHAPE_HINT=" in compact
     assert "PROBLEM_PROFILER=" in compact
     assert "PROBLEM_PROFILER_MIN_ATTEMPT=" in compact
     assert "PROBLEM_PROFILER_TRIGGER=" in compact

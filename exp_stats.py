@@ -85,21 +85,12 @@ _COUNTER_KEYS = (
 )
 
 _FLAG_ENV = (
-    "SOLVER_ROUTING",
-    "SOLVER_ROUTING_DECIDER",
-    "SOLVER_ROUTING_PROBES",
     "LEMMA_LIBRARY",
     "OBLIGATION_TREE",
     "LEMMA_LIBRARY_LOCAL",
     "USEFULNESS_HARVEST_DELAY_S",
     "HARVEST_RETRY_TIMEOUT",
     "ROOT_FINISH_PROVE_TIMEOUT",
-    "FEEDBACK_REPAIR_HINTS",
-    "FEEDBACK_FORMULA_EVIDENCE",
-    "FEEDBACK_LLM_HINTS",
-    "FEEDBACK_LLM_HINTS_HD",
-    "FEEDBACK_PROGRESS",
-    "PROOF_SHAPE_HINT",
     "PROBLEM_PROFILER",
     "PROBLEM_PROFILER_MIN_ATTEMPT",
     "PROBLEM_PROFILER_TRIGGER",
@@ -108,9 +99,7 @@ _FLAG_ENV = (
     "INDUCTION_SCHEME_TRIGGER",
     "INDUCTION_SCHEME_GOAL_GATE",
     "INDUCTION_SCHEME_PROMPT",
-    "PROMPT_RETARGET",
     "PROMPT_ADVICE",
-    "CVC_PATTERNS",
     "UNPROVED_NOT_INVALID",
     "SUBGOAL_SAT_ABORT",
     "LEMMA_DEFINED_SYMBOLS",
@@ -433,21 +422,12 @@ def log_subgoal_split(folder: Optional[str], goal: Optional[str], children: Sequ
 def ablation_flag_snapshot() -> Dict[str, str]:
     """Current ablation / model flags (defaults match env_config / exp_flags)."""
     defaults = {
-        "SOLVER_ROUTING": "on",
-        "SOLVER_ROUTING_DECIDER": "relative",
-        "SOLVER_ROUTING_PROBES": "on",
         "LEMMA_LIBRARY": "on",
         "OBLIGATION_TREE": "on",
         "LEMMA_LIBRARY_LOCAL": "on",
         "USEFULNESS_HARVEST_DELAY_S": "2",
         "HARVEST_RETRY_TIMEOUT": "2",
         "ROOT_FINISH_PROVE_TIMEOUT": "120",
-        "FEEDBACK_REPAIR_HINTS": "on",
-        "FEEDBACK_FORMULA_EVIDENCE": "off",
-        "FEEDBACK_LLM_HINTS": "off",
-        "FEEDBACK_LLM_HINTS_HD": "off",
-        "FEEDBACK_PROGRESS": "off",
-        "PROOF_SHAPE_HINT": "off",
         "PROBLEM_PROFILER": "off",
         "PROBLEM_PROFILER_MIN_ATTEMPT": "1",
         "PROBLEM_PROFILER_TRIGGER": "always",
@@ -456,9 +436,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "INDUCTION_SCHEME_TRIGGER": "after_useless",
         "INDUCTION_SCHEME_GOAL_GATE": "on",
         "INDUCTION_SCHEME_PROMPT": "on",
-        "PROMPT_RETARGET": "on",
         "PROMPT_ADVICE": "on",
-        "CVC_PATTERNS": "off",
         "UNPROVED_NOT_INVALID": "on",
         "SUBGOAL_SAT_ABORT": "on",
         "LEMMA_DEFINED_SYMBOLS": "on",
@@ -547,14 +525,8 @@ def _depth_from_goal_name(goal_name: str) -> int:
 
 
 def _hint_kinds(failed_data: dict) -> List[str]:
-    kinds: List[str] = []
-    seen = set()
-    for hint in failed_data.get("repair_hints") or []:
-        kind = str(hint.get("kind") or "")
-        if kind and kind not in seen:
-            seen.add(kind)
-            kinds.append(kind)
-    return kinds
+    del failed_data
+    return []
 
 
 def _attempt_kinds(failed_data: dict) -> List[str]:
@@ -677,16 +649,8 @@ def _all_attempt_kinds(records: Dict[str, dict]) -> List[str]:
 
 
 def _all_pair_history(records: Dict[str, dict]) -> List[dict]:
-    items: List[dict] = []
-    root = records.get("template") or {}
-    routing = root.get("routing") if isinstance(root.get("routing"), dict) else {}
-    items.extend(routing.get("pair_history") or [])
-    for goal, data in records.items():
-        if goal == "template":
-            continue
-        routing = data.get("routing") if isinstance(data.get("routing"), dict) else {}
-        items.extend(routing.get("pair_history") or [])
-    return items
+    del records
+    return []
 
 
 def _split_child_counts(records: Dict[str, dict]) -> Counter:
@@ -741,8 +705,6 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
     records = collect_goal_records(folder)
     library = _load_library(folder)
     goal_names = _collect_goal_names(folder, records, library)
-    root = records.get("template") or {}
-    routing = root.get("routing") if isinstance(root.get("routing"), dict) else {}
     pair_history = _all_pair_history(records)
     kinds = _all_attempt_kinds(records)
     kind_counts = Counter(kinds)
@@ -754,10 +716,6 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
             seen_prompts.add(prompt)
             prompts.append(prompt)
     winner = ""
-    for item in reversed(routing.get("pair_history") or []):
-        if item.get("proved") and item.get("winner_profile"):
-            winner = str(item.get("winner_profile"))
-            break
     n_progress = 0
     n_invalid_lemmas = 0
     n_useless_groups = 0
@@ -766,7 +724,6 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
     all_hints: List[str] = []
     hint_seen = set()
     for data in records.values():
-        n_progress += len(data.get("progress_lemmas") or [])
         n_invalid_lemmas += len(data.get("invalid_lemmas") or [])
         n_useless_groups += len(data.get("useless_lemma_groups") or [])
         n_unproved += len(data.get("unproved_lemmas") or [])
@@ -792,15 +749,15 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
         "n_unproved": n_unproved,
         "hint_kinds": all_hints,
         "prompts_used": prompts,
-        "active_profile": routing.get("active_profile") or "",
+        "active_profile": "",
         "winner_profile": winner,
-        "decision_mode": routing.get("decision_mode") or "",
-        "decision_source": routing.get("decision_source") or "",
-        "theory": _theory_label(routing.get("theory_features")),
+        "decision_mode": "",
+        "decision_source": "",
+        "theory": "",
         "max_goal_depth": _max_goal_depth(goal_names, library),
         "n_pair_history": len(pair_history),
         "n_goals_touched": len(goal_names),
-        "routing_reasons": list(routing.get("routing_reasons") or [])[-6:],
+        "routing_reasons": [],
         "n_cancelled": int(split_counts.get("cancelled", 0)),
         "n_subgoals_proved": int(split_counts.get("proved", 0)),
         "n_subgoals_failed": int(split_counts.get("failed", 0)),

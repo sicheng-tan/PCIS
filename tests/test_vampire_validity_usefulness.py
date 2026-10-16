@@ -170,7 +170,7 @@ def test_usefulness_records_vampire_status_not_cvc_parser() -> None:
             "FEEDBACK_PROGRESS": "off",
             "FEEDBACK_REPAIR_HINTS": "off",
         }), patch(
-            "Mate_new_vampire.run_vampire_routed", return_value=failed
+            "Mate_new_vampire.run_vampire_default", return_value=failed
         ) as routed:
             ok, progressive, vres = mate.verify_combined_lemmas(
                 original_assert,

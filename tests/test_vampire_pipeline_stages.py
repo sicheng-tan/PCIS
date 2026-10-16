@@ -115,7 +115,7 @@ def test_vampire_perform_initial_caches_baseline() -> None:
         smt = Path(tmp) / "template.smt2"
         smt.write_text(TINY_SMT, encoding="utf-8")
         with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}, clear=False), patch(
-            "Mate_new_vampire.run_vampire_routed", return_value=failed
+            "Mate_new_vampire.run_vampire_default", return_value=failed
         ) as routed, patch("Mate_new_vampire.run_vampire_diagnostic") as diag:
             ok = mate.perform_initial_verification(
                 smt, base_path=tmp, goal_name="template"
@@ -144,7 +144,7 @@ def test_vampire_perform_initial_skips_artifacts_when_feedback_off() -> None:
             "FEEDBACK_REPAIR_HINTS": "off",
             "FEEDBACK_PROGRESS": "off",
         }, clear=False), patch(
-            "Mate_new_vampire.run_vampire_routed", return_value=failed
+            "Mate_new_vampire.run_vampire_default", return_value=failed
         ) as routed:
             ok = mate.perform_initial_verification(
                 smt, base_path=tmp, goal_name="template"
@@ -171,7 +171,7 @@ def test_vampire_perform_initial_materializes_library() -> None:
         }), patch(
             "Mate_new_vampire.materialize_smt_with_library", return_value=mat
         ) as materialize, patch(
-            "Mate_new_vampire.run_vampire_routed", return_value=failed
+            "Mate_new_vampire.run_vampire_default", return_value=failed
         ) as routed:
             mate.perform_initial_verification(
                 smt, base_path=tmp, goal_name="template"
@@ -344,7 +344,7 @@ def test_vampire_fast_unsat_does_not_start_harvest() -> None:
         ), patch(
             "Mate_new_vampire.verify_combined_lemmas", side_effect=usefulness
         ), patch(
-            "Mate_new_vampire.run_vampire_routed", harvest
+            "Mate_new_vampire.run_vampire_default", harvest
         ):
             proved, subgoals, lemmas = mate.quick_run(
                 tmp, "template", "p", "./prompts_ours"

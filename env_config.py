@@ -56,12 +56,6 @@ def setup_environment():
     max_recursion_depth = int(os.getenv('MAX_RECURSION_DEPTH', '3'))  # 最大递归深度限制
     task_timeout = int(os.getenv('TASK_TIMEOUT', '1200'))  # 单个任务的超时时间（秒）
     max_parallel_tasks = int(os.getenv('MAX_PARALLEL_TASKS', '20'))  # 最大并行任务数
-    solver_routing = os.getenv('SOLVER_ROUTING', 'on')
-    solver_routing_decider = os.getenv('SOLVER_ROUTING_DECIDER', 'relative')
-    solver_routing_probes = os.getenv('SOLVER_ROUTING_PROBES', 'on')
-    solver_routing_llm_min_confidence = float(
-        os.getenv('SOLVER_ROUTING_LLM_MIN_CONFIDENCE', '0.55')
-    )
     lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
     obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
     # off | on (hard+soft) | paper (LLM4Ind hard invalid + all useless groups).
@@ -71,16 +65,6 @@ def setup_environment():
     harvest_retry_timeout = os.getenv('HARVEST_RETRY_TIMEOUT', '2')
     # Root finish re-prove after LLM attempts (default 120s); 0/off disables.
     root_finish_prove_timeout = os.getenv('ROOT_FINISH_PROVE_TIMEOUT', '120')
-    feedback_repair_hints = os.getenv('FEEDBACK_REPAIR_HINTS', 'on')
-    # Default off: -o lemmas samples next to difficulty (opt-in ablation).
-    feedback_formula_evidence = os.getenv('FEEDBACK_FORMULA_EVIDENCE', 'off')
-    # Default off: LLM interprets difficulty observations before lemma generation.
-    feedback_llm_hints = os.getenv('FEEDBACK_LLM_HINTS', 'off')
-    # Default off: HD hotspots in the LLM diagnoser pack (+ usefulness dump).
-    feedback_llm_hints_hd = os.getenv('FEEDBACK_LLM_HINTS_HD', 'off')
-    # 暂时弃用 (default off): 3s sidecar + progress lemmas; do not enable casually.
-    feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
-    proof_shape_hint = os.getenv('PROOF_SHAPE_HINT', 'off')
     problem_profiler = os.getenv('PROBLEM_PROFILER', 'off')
     problem_profiler_min_attempt = os.getenv('PROBLEM_PROFILER_MIN_ATTEMPT', '1')
     problem_profiler_trigger = os.getenv('PROBLEM_PROFILER_TRIGGER', 'always')
@@ -90,7 +74,6 @@ def setup_environment():
     induction_scheme_goal_gate = os.getenv('INDUCTION_SCHEME_GOAL_GATE', 'on')
     induction_scheme_prompt = os.getenv('INDUCTION_SCHEME_PROMPT', 'on')
     induction_scheme_nest = os.getenv('INDUCTION_SCHEME_NEST', 'cross_sort')
-    prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
     prompt_advice = os.getenv('PROMPT_ADVICE', 'on')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
     subgoal_sat_abort = os.getenv('SUBGOAL_SAT_ABORT', 'on')
@@ -151,10 +134,6 @@ def setup_environment():
         'MAX_RECURSION_DEPTH': max_recursion_depth,
         'TASK_TIMEOUT': task_timeout,
         'MAX_PARALLEL_TASKS': max_parallel_tasks,
-        'SOLVER_ROUTING': solver_routing,
-        'SOLVER_ROUTING_DECIDER': solver_routing_decider,
-        'SOLVER_ROUTING_PROBES': solver_routing_probes,
-        'SOLVER_ROUTING_LLM_MIN_CONFIDENCE': solver_routing_llm_min_confidence,
         'LEMMA_LIBRARY': lemma_library,
         'OBLIGATION_TREE': obligation_tree,
         'INVALID_LEMMAS': invalid_lemmas,
@@ -162,12 +141,6 @@ def setup_environment():
         'USEFULNESS_HARVEST_DELAY_S': usefulness_harvest_delay_s,
         'HARVEST_RETRY_TIMEOUT': harvest_retry_timeout,
         'ROOT_FINISH_PROVE_TIMEOUT': root_finish_prove_timeout,
-        'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
-        'FEEDBACK_FORMULA_EVIDENCE': feedback_formula_evidence,
-        'FEEDBACK_LLM_HINTS': feedback_llm_hints,
-        'FEEDBACK_LLM_HINTS_HD': feedback_llm_hints_hd,
-        'FEEDBACK_PROGRESS': feedback_progress,
-        'PROOF_SHAPE_HINT': proof_shape_hint,
         'PROBLEM_PROFILER': problem_profiler,
         'PROBLEM_PROFILER_MIN_ATTEMPT': problem_profiler_min_attempt,
         'PROBLEM_PROFILER_TRIGGER': problem_profiler_trigger,
@@ -177,7 +150,6 @@ def setup_environment():
         'INDUCTION_SCHEME_GOAL_GATE': induction_scheme_goal_gate,
         'INDUCTION_SCHEME_PROMPT': induction_scheme_prompt,
         'INDUCTION_SCHEME_NEST': induction_scheme_nest,
-        'PROMPT_RETARGET': prompt_retarget,
         'PROMPT_ADVICE': prompt_advice,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,
         'SUBGOAL_SAT_ABORT': subgoal_sat_abort,

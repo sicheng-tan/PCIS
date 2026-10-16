@@ -86,10 +86,12 @@ def test_filter_reads_file(tmp_path: Path) -> None:
 def test_bundled_skip_file_parses() -> None:
     bundled = ROOT / "experiments" / "configs" / "skip_nontheorems.txt"
     patterns = load_skip_patterns(str(bundled))
-    assert len(patterns) == 16
+    assert len(patterns) == 20
     assert ("ind-ben", "list", "crafted_assorted", "2") in patterns
     assert ("ind-ben", "tree", "crafted_rotate", "10") in patterns
     assert ("dtt", "dtt-leon", "bsearch-tree-goal11") in patterns
+    assert ("dtt", "dtt-isa", "goal74") in patterns
+    assert ("dtt", "dtt-isa", "goal80") in patterns
     assert ("vmcai15-dt", "leon", "heap-goal11") in patterns
     assert ("vmcai15-dt", "isa", "goal75") in patterns
 

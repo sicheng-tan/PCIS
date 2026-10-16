@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 # Same Vampire schedule as usefulness / node-goal prove (paper default).
-from solver_routing import VAMPIRE_RACE_PROFILES as VAMPIRE_PROVE_PROFILES
+from solver_profiles import VAMPIRE_RACE_PROFILES as VAMPIRE_PROVE_PROFILES
 
 # Short prove budget per obligation (seconds).
 # Vampire serial scheme adds ``VAMPIRE_SERIAL_SCHEME_EXTRA_S`` (default +5 → 15).

@@ -22,7 +22,7 @@ from obligation_tree import (
     lemma_library_role,
     load_lemma_library,
 )
-from solver_routing import VAMPIRE_RACE_PROFILES
+from solver_profiles import VAMPIRE_RACE_PROFILES
 from vampire_runner import VampireResult
 
 _GOAL = """(set-logic ALL)
@@ -320,7 +320,7 @@ def _run_quick_vampire(tmp: str, *, delay: str, usefulness, harvest, retry=None)
             side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas),
         ),
         patch("Mate_new_vampire.verify_combined_lemmas", side_effect=usefulness),
-        patch("Mate_new_vampire.run_vampire_routed", side_effect=harvest),
+        patch("Mate_new_vampire.run_vampire_default", side_effect=harvest),
     ]
     if retry is not None:
         patches.append(
@@ -361,7 +361,7 @@ def test_vampire_exhausted_harvest_sets_skip_initial_diag() -> None:
         assert diag.get("induction_focus") == ["(P x)"]
         # Harvest uses the same paper schedule as usefulness / node prove.
         assert harvest.call_count >= 1
-        # Harvest now goes through run_vampire_routed (serial dual / paper portfolio).
+        # Harvest now goes through run_vampire_default (serial dual / paper portfolio).
         assert harvest.call_args[0][0]  # smt path
         assert int(harvest.call_args[0][1]) > 0  # timeout
 
@@ -409,7 +409,7 @@ def test_vampire_harvest_retry_refreshes_baseline() -> None:
         mate._set_goal_only_baseline(
             tmp, "template", first, context="initial_goal", replace=False,
         )
-        with patch("Mate_new_vampire.run_vampire_routed", return_value=retry), patch.dict(
+        with patch("Mate_new_vampire.run_vampire_default", return_value=retry), patch.dict(
             os.environ, {"SOLVER_ROUTING": "off"},
         ):
             ok = mate.perform_initial_verification(

@@ -17,10 +17,6 @@ INVALID list is empty.
 ``INVALID_LEMMAS`` modes: ``off`` | ``on`` (default, hard+soft) | ``paper``
 (hard only + all useless groups; Situation A → invalid). Soft
 ``soft_rejected_lemmas`` only in ``on``.
-``FEEDBACK_PROGRESS`` remains default off.
-``PROOF_SHAPE_HINT`` (default off) appends a short observer/recursion hint after
-LAST ATTEMPT usefulness-fail kept and/or USEFUL BUT UNPROVED (sublemma proof
-fail); not the diagnoser.
 ``LLM_INVALID_ONLY_STOP`` (default on) lets LLM INVALID_GOAL early-stop a child
 without writing hard ``node_outcome.invalid`` (parent keeps unproved/failed).
 LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
@@ -45,9 +41,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import (
     _flag_enabled,
-    feedback_llm_hints_enabled,
     prompt_advice_enabled,
-    proof_shape_hint_enabled,
 )
 from obligation_tree import (
     compact_formula,
@@ -183,22 +177,6 @@ SCREEN_RETRY_USER = (
     "For parse_error/type_error, fix syntax or sorts "
     "(e.g. no undeclared plus; rename binder as→xs)."
 )
-PROOF_SHAPE_HINT_BLOCK = (
-    "\nPROOF-SHAPE HINT:\n"
-    "\n"
-    "- Preserve the observer in the goal. Equal observed results do not imply that\n"
-    "  the underlying structures are equal. For example,\n"
-    "  length(reverse(xs)) = length(xs) does not justify reverse(xs) = xs.\n"
-    "\n"
-    "- If the relevant function is recursive, inspect its supplied definition and\n"
-    "  propose at most one helper matching a constructor case. Generalize any\n"
-    "  parameters needed by the recursive call.\n"
-    "\n"
-    "- Use induction only when the definition gives a smaller recursive argument.\n"
-    "  Do not output an induction hypothesis as an unconditional lemma. Skip this\n"
-    "  hint if the supplied theory does not support the reasoning."
-)
-
 
 def subgoal_sat_abort_enabled() -> bool:
     return _flag_enabled("SUBGOAL_SAT_ABORT")
@@ -1488,21 +1466,6 @@ def _unproved_lemma_formulas(failed_data: Optional[dict]) -> List[str]:
     return out
 
 
-def should_append_proof_shape_hint(failed_data: Optional[dict]) -> bool:
-    """True when flag on and either usefulness-fail kept or sublemma unproved.
-
-    - Usefulness fail: same ``last_useless_group`` as LAST ATTEMPT kept.
-    - Sublemma prove fail: non-empty ``unproved_lemmas`` (USEFUL BUT UNPROVED).
-    Lifetime follows those records (not a one-shot after a single attempt).
-    Screen-only / illformed drops alone do not trigger.
-    """
-    if not proof_shape_hint_enabled():
-        return False
-    if _group_lemmas(last_useless_group(failed_data)):
-        return True
-    return bool(_unproved_lemma_formulas(failed_data))
-
-
 def _group_lemmas(group: Any) -> List[str]:
     if isinstance(group, list):
         return [str(item) for item in group if item]
@@ -1733,12 +1696,8 @@ def format_attempt_feedback_for_prompt(
 
     History of older useless groups stays in json; only the last group is shown
     unless ``INVALID_LEMMAS=paper`` (then all useless groups, LLM4Ind style).
-    When ``FEEDBACK_LLM_HINTS`` is on, program HD / repair / advice / local-vs-parent
-    are omitted; SOLVER HINTS is nested under LAST ATTEMPT only if the diagnoser
-    produced an injectable block. ``suppress_advice`` is kept for callers.
+    ``suppress_advice`` is kept for callers.
     """
-    from feedback_llm_hints import format_llm_hints_lines, llm_hints_eligible
-
     data = failed_data if isinstance(failed_data, dict) else {}
     try:
         from obligation_tree import invalid_lemmas_paper_mode
@@ -1753,27 +1712,10 @@ def format_attempt_feedback_for_prompt(
         if isinstance(item, dict)
     ]
     status = ""
-    group_hints: Optional[Sequence[dict]] = None
     if isinstance(group, dict):
         status = str(group.get("status") or "").strip()
-        if "repair_hints" in group:
-            group_hints = group.get("repair_hints") or []
-    hints: Sequence[dict] = (
-        group_hints if group_hints is not None else (data.get("repair_hints") or [])
-    )
-    llm_rec = data.get("llm_hints") if isinstance(data.get("llm_hints"), dict) else {}
-    llm_lines = (
-        format_llm_hints_lines(llm_rec, indent="    ", current_goal=current_goal)
-        if llm_hints_eligible(data) else []
-    )
-    use_llm_hints = bool(llm_lines)
-    # Diagnoser owns HD/repair text. Do not fall back to the program block
-    # when the flag is on (including NO_ACTION / skipped diagnoser).
-    want_program = (
-        include_stuck
-        and not use_llm_hints
-        and not feedback_llm_hints_enabled()
-    )
+    hints: Sequence[dict] = ()
+    want_program = include_stuck
     want_advice = (
         want_program and prompt_advice_enabled() and not suppress_advice
     )
@@ -1794,7 +1736,6 @@ def format_attempt_feedback_for_prompt(
         and not stuck_lines
         and not local_lines
         and not advice_lines
-        and not llm_lines
     ):
         return ""
 
@@ -1811,9 +1752,7 @@ def format_attempt_feedback_for_prompt(
         if drop_lines:
             parts.append("  dropped:")
             parts.extend(drop_lines)
-        if llm_lines:
-            parts.extend(llm_lines)
-        elif stuck_lines or local_lines or advice_lines:
+        if stuck_lines or local_lines or advice_lines:
             parts.append("  repair hints:")
             parts.extend(stuck_lines)
             parts.extend(local_lines)
@@ -1824,13 +1763,10 @@ def format_attempt_feedback_for_prompt(
     parts.append(
         "\nINITIAL SOLVE (no candidate lemmas yet; did not prove CURRENT goal):"
     )
-    if llm_lines:
-        parts.extend(llm_lines)
-    else:
-        parts.append("  repair hints:")
-        parts.extend(stuck_lines)
-        parts.extend(local_lines)
-        parts.extend(advice_lines)
+    parts.append("  repair hints:")
+    parts.extend(stuck_lines)
+    parts.extend(local_lines)
+    parts.extend(advice_lines)
     parts.append("  Propose auxiliary lemmas that help the solver prove the goal.")
     return "\n".join(parts)
 

@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from vampire_runner import (
     VampireResult,
-    run_vampire_routed,
+    run_vampire_default,
     run_vampire_serial,
     should_integer_boost,
     vampire_integer_boost_s,
@@ -407,7 +407,7 @@ def test_routed_uses_serial_when_enabled() -> None:
         "vampire_runner.run_vampire_serial",
         return_value=_res("struct_induction_tip", proved=True),
     ) as serial, patch("vampire_runner._run_vampire_parallel") as parallel:
-        out = run_vampire_routed("unused.smt2", timeout=60)
+        out = run_vampire_default("unused.smt2", timeout=60)
     assert out.proved
     serial.assert_called_once()
     parallel.assert_not_called()
@@ -423,6 +423,6 @@ def test_routed_falls_back_to_single_portfolio_when_serial_off() -> None:
     with patch.dict(os.environ, {"VAMPIRE_SERIAL_DUAL": "off"}), patch(
         "vampire_runner._run_vampire_parallel", side_effect=fake_parallel
     ):
-        out = run_vampire_routed("unused.smt2", timeout=60)
+        out = run_vampire_default("unused.smt2", timeout=60)
     assert out.proved
     assert calls == [["induction_portfolio"]]

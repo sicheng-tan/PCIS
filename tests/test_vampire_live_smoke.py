@@ -25,8 +25,8 @@ os.environ.setdefault("VAMPIRE_BINARY", str(ROOT / "vampire" / "vampire"))
 
 from unittest.mock import patch
 
-from solver_routing import VAMPIRE_RACE_PROFILES
-from vampire_runner import run_vampire, run_vampire_race, run_vampire_routed
+from solver_profiles import VAMPIRE_RACE_PROFILES
+from vampire_runner import run_vampire, run_vampire_race, run_vampire_default
 
 _TRIVIAL_UNSAT = """(set-logic ALL)
 (assert false)
@@ -83,7 +83,7 @@ def test_live_vampire_race_profiles_unsat() -> None:
 
 
 def test_live_vampire_routed_matches_race() -> None:
-    """``run_vampire_routed`` proves trivial unsat (serial dual or single portfolio)."""
+    """``run_vampire_default`` proves trivial unsat (serial dual or single portfolio)."""
     _require_vampire()
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "false.smt2"
@@ -93,7 +93,7 @@ def test_live_vampire_routed_matches_race() -> None:
             {"SOLVER_ROUTING": "off", "VAMPIRE_SERIAL_DUAL": "on"},
             clear=False,
         ):
-            result = run_vampire_routed(
+            result = run_vampire_default(
                 path,
                 timeout=3,
                 collect_stats=False,

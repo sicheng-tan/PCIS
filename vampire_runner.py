@@ -12,23 +12,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from smt_adt_tester_rewrite import needs_tester_rewrite, rewrite_smtlib_testers
-from solver_routing import GoalSearchState, VAMPIRE_RACE_PROFILES
+from solver_profiles import VAMPIRE_RACE_PROFILES
 from theory_features import analyze_smt
-from solver_relative_metrics import (
-    EXPLOSION_LOG_GAIN,
-    INDUCTION_SHARE_MAX,
-    INTEGER_INDUCTION_SHARE_MIN,
-    MAX_INDUCTION_DEPTH_HINT,
-    REWRITE_PER_INDUCTION_MAX,
-    SUPERPOSITION_PER_REWRITE_MIN,
-    gate_overshoot,
-    activity_rate,
-    gain_score,
-    is_relative_gain,
-    log_gain,
-    pct_label,
-)
-
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -598,9 +583,8 @@ def run_vampire_race(
 ) -> VampireResult:
     """Race several Vampire profiles (first unsat wins).
 
-    Used by scheme short-prove and by usefulness / node-goal prove (via
-    ``run_vampire_routed``). Empty / unknown names fall back to
-    ``VAMPIRE_RACE_PROFILES``.
+    Used by scheme short-prove and by usefulness / node-goal prove.
+    Empty / unknown names fall back to ``VAMPIRE_RACE_PROFILES``.
     """
     names = [p for p in profiles if p in VAMPIRE_PROFILES]
     if not names:
@@ -609,6 +593,39 @@ def run_vampire_race(
         smt2_path,
         timeout,
         names,
+        collect_stats=collect_stats,
+        collect_ucore=collect_ucore,
+        show_induction=show_induction,
+    )
+
+
+def run_vampire_default(
+    smt2_path,
+    timeout: int = 60,
+    *,
+    collect_stats: bool = True,
+    collect_ucore: bool = False,
+    show_induction: bool = False,
+) -> VampireResult:
+    """Prove with serial tip→portfolio (default) or single paper portfolio.
+
+    When ``VAMPIRE_SERIAL_DUAL=on`` (default), runs one Vampire at a time:
+    tip → portfolio, with Int/LIA problems **pre-reserving** an integer arm.
+    Set ``VAMPIRE_SERIAL_DUAL=off`` for the v2 single ``induction_portfolio``.
+    """
+    if vampire_serial_dual_enabled():
+        return run_vampire_serial(
+            smt2_path,
+            timeout,
+            kind="main",
+            collect_stats=collect_stats,
+            collect_ucore=collect_ucore,
+            show_induction=show_induction,
+        )
+    return run_vampire_race(
+        smt2_path,
+        timeout,
+        list(VAMPIRE_RACE_PROFILES),
         collect_stats=collect_stats,
         collect_ucore=collect_ucore,
         show_induction=show_induction,
@@ -660,62 +677,6 @@ def run_vampire_diagnostic(
                 tmp_path.unlink()
             except OSError:
                 pass
-
-
-def run_vampire_probe(
-    smt2_path,
-    profiles: List[str],
-    timeout: int = 2,
-) -> Dict[str, VampireResult]:
-    """Short sequential probe of named profiles for routing (Phase 1 observability)."""
-    out: Dict[str, VampireResult] = {}
-    for name in profiles:
-        if name not in VAMPIRE_PROFILES:
-            continue
-        out[name] = run_vampire(
-            smt2_path,
-            timeout=timeout,
-            collect_stats=True,
-            collect_ucore=False,
-            profile=name,
-        )
-    return out
-
-
-def run_vampire_routed(
-    smt2_path,
-    timeout: int = 60,
-    *,
-    state: Optional[GoalSearchState] = None,
-    collect_stats: bool = True,
-    collect_ucore: bool = False,
-    show_induction: bool = False,
-) -> VampireResult:
-    """Prove with serial tip→portfolio (default) or single paper portfolio.
-
-    ``state`` is kept for API compatibility / Mate telemetry. When
-    ``VAMPIRE_SERIAL_DUAL=on`` (default), runs one Vampire at a time:
-    tip → portfolio, with Int/LIA problems **pre-reserving** an integer arm.
-    Set ``VAMPIRE_SERIAL_DUAL=off`` for the v2 single ``induction_portfolio``.
-    """
-    del state
-    if vampire_serial_dual_enabled():
-        return run_vampire_serial(
-            smt2_path,
-            timeout,
-            kind="main",
-            collect_stats=collect_stats,
-            collect_ucore=collect_ucore,
-            show_induction=show_induction,
-        )
-    return run_vampire_race(
-        smt2_path,
-        timeout,
-        list(VAMPIRE_RACE_PROFILES),
-        collect_stats=collect_stats,
-        collect_ucore=collect_ucore,
-        show_induction=show_induction,
-    )
 
 
 def _vampire_command(
@@ -1381,22 +1342,6 @@ def extract_vampire_error_message(stdout: str, stderr: str) -> Optional[str]:
     return None
 
 
-def _vampire_stat_rate(
-    stats: Dict[str, int],
-    elapsed: float,
-    *keys: str,
-) -> float:
-    total = sum(int(stats.get(k, 0)) for k in keys)
-    return activity_rate(total, elapsed)
-
-
-def _vampire_induction_counts(stats: Dict[str, int]) -> Tuple[int, int, int]:
-    """Return (structural-like, integer-interval, total) induction counts."""
-    struct_like = sum(int(stats.get(k, 0) or 0) for k in _VAMPIRE_STRUCT_INDUCTION_KEYS)
-    int_ind = sum(int(stats.get(k, 0) or 0) for k in _VAMPIRE_INTEGER_INDUCTION_KEYS)
-    return struct_like, int_ind, struct_like + int_ind
-
-
 def compress_induction_formula(formula: str, limit: int = _INDUCTION_SCHEMA_CHARS) -> str:
     """Shorten Vampire TPTP-like induction formulas for LLM prompts."""
     s = re.sub(r"\s+", " ", formula or "").strip()
@@ -1484,295 +1429,6 @@ def select_induction_schemas(
         limit=limit,
     )
     return [format_induction_schema_summary(rec) for rec in records if format_induction_schema_summary(rec)]
-
-
-def compute_progress_score(
-    baseline: VampireResult,
-    candidate: VampireResult,
-    *,
-    control: Optional[VampireResult] = None,
-) -> Tuple[float, List[str]]:
-    """
-    Score whether adding lemmas made Vampire 'less stuck'.
-    Returns (score, human-readable signals). Higher is better; >0 means progress.
-
-    Comparisons use log1p relative gain of per-second rates vs the control
-    (or baseline) run, so small Nat tasks and large ADT searches share one gate.
-    """
-    if candidate.proved:
-        return 100.0, ["proved_goal"]
-    if candidate.status == "error":
-        return -10.0, ["solver_error"]
-
-    signals: List[str] = []
-    score = 0.0
-    b, c = baseline.stats, candidate.stats
-    ref_stats = control.stats if control is not None else b
-    ref_elapsed = control.elapsed if control is not None else baseline.elapsed
-    cand_elapsed = candidate.elapsed
-
-    dem_c = _vampire_stat_rate(c, cand_elapsed, "Fw demodulations", "Bw demodulations")
-    dem_r = _vampire_stat_rate(ref_stats, ref_elapsed, "Fw demodulations", "Bw demodulations")
-    taut_c = _vampire_stat_rate(c, cand_elapsed, "Fw demodulations to eq. taut.")
-    taut_r = _vampire_stat_rate(ref_stats, ref_elapsed, "Fw demodulations to eq. taut.")
-    rewrite_c = dem_c + taut_c
-    rewrite_r = dem_r + taut_r
-    ind_c = _vampire_stat_rate(c, cand_elapsed, *_VAMPIRE_INDUCTION_KEYS)
-    ind_r = _vampire_stat_rate(ref_stats, ref_elapsed, *_VAMPIRE_INDUCTION_KEYS)
-
-    strong = 0
-    if is_relative_gain(rewrite_c, rewrite_r):
-        score += gain_score(rewrite_c, rewrite_r, 2.5)
-        signals.append(f"more_demodulations(+{pct_label(rewrite_c, rewrite_r)}%)")
-        strong += 1
-    if is_relative_gain(ind_c, ind_r, rare=True):
-        score += gain_score(ind_c, ind_r, 2.0)
-        signals.append(f"more_induction_activity(+{pct_label(ind_c, ind_r)}%)")
-        strong += 1
-
-    # Fewer leftover passive clauses under similar generation can mean better focus.
-    gen_b = b.get("Generated clauses", 0)
-    gen_c = c.get("Generated clauses", 0)
-    pas_b = b.get("Final passive clauses", 0)
-    pas_c = c.get("Final passive clauses", 0)
-    if gen_b >= 1 and gen_c >= 1 and pas_b > 0:
-        ratio_b = pas_b / max(gen_b, 1)
-        ratio_c = pas_c / max(gen_c, 1)
-        better_than_control = True
-        if control is not None:
-            gen_k = ref_stats.get("Generated clauses", 0)
-            pas_k = ref_stats.get("Final passive clauses", 0)
-            if gen_k >= 1 and pas_k > 0:
-                ratio_k = pas_k / max(gen_k, 1)
-                better_than_control = ratio_c + 1e-9 < 0.9 * ratio_k
-        if better_than_control and ratio_c + 1e-9 < 0.7 * ratio_b:
-            score += 1.0
-            signals.append("lower_passive_ratio")
-            strong += 1
-
-    # Volume-up without product (rewrite family / induction / focus) ≈ explosion.
-    gen_c_rate = activity_rate(gen_c, cand_elapsed)
-    gen_r_rate = activity_rate(ref_stats.get("Generated clauses", 0), ref_elapsed)
-    sup_c = _vampire_stat_rate(c, cand_elapsed, *_VAMPIRE_SUPERPOSITION_KEYS)
-    sup_r = _vampire_stat_rate(ref_stats, ref_elapsed, *_VAMPIRE_SUPERPOSITION_KEYS)
-    volume_c = max(gen_c_rate, sup_c)
-    volume_r = max(gen_r_rate, sup_r)
-    productive = any(
-        s.startswith("more_demodulations")
-        or s.startswith("more_induction")
-        or s == "lower_passive_ratio"
-        for s in signals
-    )
-    if log_gain(volume_c, volume_r) >= EXPLOSION_LOG_GAIN and not productive:
-        penalty = min(gain_score(volume_c, volume_r, 1.5), 1.5)
-        score -= penalty
-        signals.append(f"search_explosion(+{pct_label(volume_c, volume_r)}%)")
-
-    # Require two independent channels, or one induction signal.
-    if strong < 2 and "more_induction" not in "".join(signals):
-        if score > 0:
-            score *= 0.35
-            signals.append("weak_single_signal")
-
-    if not signals and candidate.status in ("timeout", "incomplete", "unknown"):
-        signals.append("no_measurable_progress")
-
-    return score, signals
-
-
-def derive_repair_hints(result: VampireResult, context: str = "goal") -> List[dict]:
-    """
-    Turn Vampire failure signals into structured repair hints for the next LLM prompt.
-
-    Keeps induction_stuck (focus/schemas), need_rewrite, need_arithmetic_lemma,
-    and need_directed_rewrite. need_induction_lemma, induction_depth_limit, and
-    generic timeout are intentionally disabled (commented) as misleading/noisy.
-    """
-    hints: List[dict] = []
-    stats = result.stats
-
-    dem = stats.get("Fw demodulations", 0) + stats.get("Bw demodulations", 0)
-    taut = stats.get("Fw demodulations to eq. taut.", 0)
-    sup = sum(int(stats.get(k, 0) or 0) for k in _VAMPIRE_SUPERPOSITION_KEYS)
-    _struct_like, int_ind, ind = _vampire_induction_counts(stats)
-    mix = ind + dem
-    arithmetic_dominant = ind > 0 and int_ind / ind >= INTEGER_INDUCTION_SHARE_MIN
-    schema_records = list(result.induction_schemas or [])
-    if not schema_records and result.induction_formulas:
-        schema_records = [
-            structure_induction_formula(raw) for raw in result.induction_formulas
-        ]
-    schema_records = select_induction_schema_records(
-        schema_records,
-        list(result.induction_focus or []),
-        limit=_INDUCTION_SCHEMA_MAX,
-    )
-    schemas = [format_induction_schema_summary(rec) for rec in schema_records]
-    schemas = [s for s in schemas if s]
-    obligations = list(result.induction_obligations or [])[:_INDUCTION_OBLIGATION_MAX]
-    induct_vars = _dedup_preserve(
-        [
-            f"{rec.get('induct_var')}:{rec.get('induct_sort')}"
-            if rec.get("induct_sort")
-            else str(rec.get("induct_var") or "")
-            for rec in schema_records
-            if rec.get("induct_var")
-        ]
-    )
-    induct_kinds = _dedup_preserve(
-        [str(rec.get("kind") or "") for rec in schema_records if rec.get("kind")]
-    )
-
-    if result.induction_focus or schemas or obligations:
-        hint = {
-            "kind": "induction_stuck",
-            "context": context,
-            "detail": (
-                "Vampire attempted induction on these goal-related literals/terms but "
-                "could not finish the proof. Prefer lemmas that discharge the inductive "
-                "step (often commutativity/associativity or rewrite bridges)."
-            ),
-            "induction_focus": result.induction_focus[:6],
-            "induction_formulas": schemas,
-            "induction_schemas": schema_records,
-            "induction_vars": induct_vars,
-            "induction_kinds": induct_kinds,
-            "induction_obligations": obligations,
-            # Binary signal: moderate vote so it does not drown mix overshoot.
-            "strength": 0.5,
-            "suggested_actions": [
-                "Generate equational lemmas about constructors appearing in the focus terms",
-                "If a recursive function appears on both sides, try a generalized form",
-                "Avoid repeating lemmas already marked invalid or useless",
-            ],
-        }
-        if schemas:
-            hint["suggested_actions"] = [
-                "Prefer a lemma that discharges the inductive step in the schema (RHS after unfolding)",
-                "If the schema IH does not match the conclusion, generalize the inductive lemma",
-            ] + hint["suggested_actions"][:1]
-        if obligations:
-            hint["suggested_actions"] = [
-                "Target open induction obligations (base/step clauses) listed below",
-            ] + hint["suggested_actions"]
-        hints.append(hint)
-
-    # Disabled: need_rewrite — demod/induction mix mainly asks for equational
-    # lemmas; keep high-difficulty / induction_stuck as the LLM-facing signal.
-    # if mix > 0:
-    #     rewrite_per_ind = dem / max(ind, 1)
-    #     if ind > 0 and rewrite_per_ind < REWRITE_PER_INDUCTION_MAX:
-    #         hints.append({
-    #             "kind": "need_rewrite",
-    #             "priority": 1,
-    #             "context": context,
-    #             "detail": (
-    #                 "Rewriting is scarce relative to induction (demod/induction < 8). "
-    #                 "Likely missing equational lemmas that enable rewriting under the IH."
-    #             ),
-    #             "strength": round(
-    #                 gate_overshoot(rewrite_per_ind, REWRITE_PER_INDUCTION_MAX), 4
-    #             ),
-    #             "suggested_actions": [
-    #                 "Propose rewrite-oriented lemmas (distributivity, fold/unfold identities)",
-    #                 "Prefer lemmas whose LHS matches a subterm of the proof goal",
-    #             ],
-    #         })
-        # Disabled: need_induction_lemma — same "strengthen/generalize the goal"
-        # narrative as CVC need_stronger_lemma.
-        # ind_share = ind / mix
-        # if ind_share < INDUCTION_SHARE_MAX and not arithmetic_dominant:
-        #     hints.append({
-        #         "kind": "need_induction_lemma",
-        #         "priority": 2,
-        #         "context": context,
-        #         "detail": (
-        #             "Induction (structural and integer-interval) is a small share of "
-        #             f"Vampire activity (<{int(INDUCTION_SHARE_MAX * 100)}%). Try a "
-        #             "stronger inductive lemma (generalization / strengthen conclusion)."
-        #         ),
-        #         "strength": round(gate_overshoot(ind_share, INDUCTION_SHARE_MAX), 4),
-        #         "suggested_actions": [
-        #             "Strengthen or generalize the goal into an inductive lemma",
-        #             "Introduce an accumulator / helper-function identity if applicable",
-        #         ],
-        #     })
-
-    if arithmetic_dominant:
-        int_share = int_ind / ind
-        hints.append({
-            "kind": "need_arithmetic_lemma",
-            "context": context,
-            "detail": (
-                "Integer-interval induction dominates Vampire induction activity. "
-                "Prefer arithmetic bridge / monotonicity / recurrence lemmas "
-                "rather than ADT constructor facts."
-            ),
-            "strength": round(
-                gate_overshoot(int_share, INTEGER_INDUCTION_SHARE_MIN, higher=True), 4
-            ),
-            "suggested_actions": [
-                "Generate arithmetic bridge or monotonicity lemmas",
-                "Strengthen recurrences rather than adding constructor equalities",
-            ],
-        })
-
-    rewrite_product = dem + taut
-    if sup > 0 and sup / max(rewrite_product, 1) >= SUPERPOSITION_PER_REWRITE_MIN:
-        ratio = sup / max(rewrite_product, 1)
-        hints.append({
-            "kind": "need_directed_rewrite",
-            "context": context,
-            "detail": (
-                "Vampire superposition is high relative to productive rewriting "
-                "(demodulation / equality tautologies). Equality is combining "
-                "without simplifying; prefer LHS-directed rewrite lemmas."
-            ),
-            "strength": round(
-                min(1.0, max(0.0, (ratio / SUPERPOSITION_PER_REWRITE_MIN) - 1.0)),
-                4,
-            ),
-            "suggested_actions": [
-                "Propose rewrite lemmas whose LHS matches a goal subterm",
-                "Avoid overly general quantified equalities that explode superposition",
-            ],
-        })
-
-    # Disabled: induction_depth_limit — depth signal can later drive scheduling
-    # (stop deepening / invariant), but prompt text again says strengthen/generalize.
-    # depth = int(stats.get("MaxInductionDepth", 0) or 0)
-    # if (
-    #     depth >= MAX_INDUCTION_DEPTH_HINT
-    #     and result.status in ("timeout", "incomplete", "unknown")
-    #     and ind > 0
-    # ):
-    #     hints.append({
-    #         "kind": "induction_depth_limit",
-    #         "context": context,
-    #         "detail": (
-    #             f"Vampire repeatedly reached induction depth {depth} without finishing. "
-    #             "Strengthen or generalize the inductive lemma rather than searching deeper."
-    #         ),
-    #         "strength": round(min(1.0, depth / 4.0), 4),
-    #         "suggested_actions": [
-    #             "Generate a stronger generalized lemma or an auxiliary invariant",
-    #             "Introduce an accumulator / helper-function identity if applicable",
-    #         ],
-    #     })
-
-    # Disabled: generic timeout hint — low information noise.
-    # if result.status == "timeout" and not hints:
-    #     hints.append({
-    #         "kind": "timeout",
-    #         "context": context,
-    #         "detail": "Vampire timed out without a clear induction/rewrite signal.",
-    #         "suggested_actions": [
-    #             "Generate simpler lemmas closer to the recursive definitions",
-    #             "Split the goal into smaller equational facts",
-    #         ],
-    #     })
-
-    return hints
 
 
 def _dedup_preserve(items: List[str]) -> List[str]:

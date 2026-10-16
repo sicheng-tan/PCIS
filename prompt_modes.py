@@ -321,9 +321,9 @@ def _group_lemmas(group: Any) -> List[str]:
 
 
 def _attempt_hints(data: dict, group: Any) -> Sequence[dict]:
-    if isinstance(group, dict) and "repair_hints" in group:
-        return group.get("repair_hints") or []
-    return data.get("repair_hints") or []
+    """Legacy repair_hints removed; HD TRIGGER advice uses empty hints."""
+    del data, group
+    return []
 
 
 def _hint_terms(

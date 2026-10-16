@@ -14,7 +14,7 @@ from vampire_runner import VAMPIRE_PROFILES
 def test_scheme_prove_profile_sets_are_four_way() -> None:
     assert len(PROVE_PROFILES) == 4
     # Vampire: paper single schedule (not a multi-arm race).
-    from solver_routing import VAMPIRE_RACE_PROFILES
+    from solver_profiles import VAMPIRE_RACE_PROFILES
 
     assert tuple(VAMPIRE_PROVE_PROFILES) == tuple(VAMPIRE_RACE_PROFILES)
     assert VAMPIRE_PROVE_PROFILES == ("induction_portfolio",)

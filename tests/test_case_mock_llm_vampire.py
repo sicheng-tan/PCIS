@@ -28,8 +28,6 @@ sys.path.insert(0, str(ROOT))
 
 os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY") or "unit-test-placeholder"
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
-os.environ["SOLVER_ROUTING"] = "off"
-os.environ["SOLVER_ROUTING_PROBES"] = "off"
 os.environ["VAMPIRE_BINARY"] = str(ROOT / "vampire" / "vampire")
 os.environ.setdefault("MAX_PARALLEL_TASKS", "1")
 
@@ -154,12 +152,8 @@ def _assert_updated_pipeline(name: str, proved: bool, summary: dict, mock_calls:
         "llm_no_subgoals",
     ), f"{name} exit={summary.get('exit_reason')} solved_by={summary.get('solved_by')}")
     _ok(mock_calls >= 1, f"{name} never called the mock LLM")
-    flags = str(summary.get("flags") or "")
-    _ok("SOLVER_ROUTING=off" in flags, f"{name} routing not off: {flags}")
     solver_s = float(summary.get("solver_s") or 0)
     _ok(solver_s > 0, f"{name} did not record Vampire time")
-    hints = summary.get("hint_kinds") or []
-    _ok(bool(hints), f"{name} missing repair hints from the failed initial prove")
     _ok(
         int(summary.get("n_library_lemmas") or 0) >= 1
         or int(summary.get("n_subgoals_proved") or 0) >= 1
@@ -181,7 +175,7 @@ def test_mock_llm_case_experiments(result_parent: Path | None = None) -> Path:
     run_dir = (result_parent or RESULTS) / f"{stamp}_mock_llm_cases"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "SOURCES.txt").write_text(
-        "mock LLM + real Vampire; SOLVER_ROUTING=off\n"
+        "mock LLM + real Vampire (PCR/GSE)\n"
         "p1_rev_rev: experiments/cases/p1_rev_rev\n"
         "p2_len_rev: experiments/cases/p2_len_rev\n",
         encoding="utf-8",
@@ -189,14 +183,10 @@ def test_mock_llm_case_experiments(result_parent: Path | None = None) -> Path:
 
     fake = ScriptedLLM()
     env = {
-        "SOLVER_ROUTING": "off",
-        "SOLVER_ROUTING_PROBES": "off",
         "VAMPIRE_BINARY": str(VAMPIRE_BIN),
         "LEMMA_LIBRARY": "on",
         "OBLIGATION_TREE": "on",
-        "FEEDBACK_REPAIR_HINTS": "on",
-        "FEEDBACK_PROGRESS": "on",
-        "PROMPT_RETARGET": "on",
+        "PROMPT_ADVICE": "on",
         "UNPROVED_NOT_INVALID": "on",
         "SUBGOAL_SAT_ABORT": "on",
         "LEMMA_DEFINED_SYMBOLS": "on",

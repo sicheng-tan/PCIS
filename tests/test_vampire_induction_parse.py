@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from vampire_runner import (
-    derive_repair_hints,
     parse_induction_trace_rich,
     structure_induction_formula,
-    VampireResult,
 )
 
 
@@ -62,22 +60,3 @@ def test_multiline_formula_and_obligations() -> None:
     assert trace.obligations
     assert any("mul(sK0,s(sK5))" in o or "mul(sK0,zero)" in o for o in trace.obligations)
 
-
-def test_repair_hint_exposes_structured_fields() -> None:
-    trace = parse_induction_trace_rich(SAMPLE_TRACE)
-    result = VampireResult(
-        status="timeout",
-        elapsed=2.0,
-        induction_focus=trace.focus,
-        induction_formulas=trace.formulas,
-        induction_schemas=trace.schemas,
-        induction_obligations=trace.obligations,
-        stats={"InductionApplications": 4, "Fw demodulations": 10},
-    )
-    hints = derive_repair_hints(result, context="initial_goal")
-    stuck = next(h for h in hints if h["kind"] == "induction_stuck")
-    assert stuck.get("induction_schemas")
-    assert stuck.get("induction_vars")
-    assert any(v.startswith("X0:") for v in stuck["induction_vars"])
-    assert stuck.get("induction_obligations")
-    assert all("[structural induction" not in s for s in stuck["induction_formulas"])
