@@ -1,0 +1,2865 @@
+"""
+CVC5/CVC4 runner with rich feedback for solver-guided lemma repair.
+
+Design notes vs Vampire:
+- Main prove path: multi-strategy portfolio. Optional --stats / difficulty
+  hang on that same process (no extra 3s diagnostic before the 60s prove).
+- Diagnostic path: short single-strategy run for usefulness-failure sidecars.
+- Difficulty: CVC5 ``--produce-difficulty --dump-difficulty`` dumps scores after
+  check-sat (no SMT ``(get-difficulty)``). Still needs ``--tlimit-per`` to end
+  check-sat cleanly, plus a short wall-clock grace before hard-kill.
+- Unsat cores on inductive problems are unreliable; we do NOT depend on them
+  for lemma pruning (unlike Vampire, which also no longer prunes via ucore).
+"""
+
+import subprocess
+import logging
+import time
+import os
+import re
+import signal
+import math
+import tempfile
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+from llm_time_budget import remaining_task_s
+from solver_routing import (
+    CVC5_FALLBACK_PROFILES,
+    GoalSearchState,
+    fallback_enabled,
+    fallback_fraction,
+    fallback_min_timeout,
+    routing_enabled,
+)
+from exp_flags import formula_evidence_enabled
+from solver_relative_metrics import (
+    EXPLOSION_LOG_GAIN,
+    INST_OF_MATCHING_MAX,
+    LOG_GAIN_MIN,
+    SKOLEM_PER_CONJ_MAX,
+    gate_overshoot,
+    activity_rate,
+    gain_score,
+    in_problem_hard_cutoff,
+    is_relative_drop,
+    is_relative_gain,
+    log_gain,
+    pct_label,
+    relative_drop,
+)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+def _cvc5_binary() -> str:
+    return os.getenv("CVC5_BINARY", "./cvc/cvc5-Linux-x86_64-static/bin/cvc5")
+
+
+def _cvc4_binary() -> str:
+    return os.getenv("CVC4_BINARY", "./cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt")
+
+
+# Extra ±pattern arms: only E-matching profiles. no_ematching / cvc4 stay bare.
+PATTERN_CONTRAST_PROFILES = ("cvc5_simple", "cvc5_inductive")
+
+
+def cvc_portfolio_jobs(
+    names: Sequence[str],
+    smt2_path,
+    pattern_smt2_path=None,
+) -> List[Tuple[str, str, Path]]:
+    """Bare portfolio jobs, plus ``simple``/``inductive`` +pattern when gated.
+
+    Each item is ``(result_name, spec_name, smt_path)``. Pattern arms are
+    added only when ``pattern_smt2_path`` is set *and* that spec is already
+    in this wave (default 4-way → 6-way).
+    """
+    smt2_path = Path(smt2_path)
+    specs = cvc_profile_specs()
+    jobs: List[Tuple[str, str, Path]] = []
+    seen_specs = set()
+    for name in names:
+        if name not in specs:
+            continue
+        jobs.append((name, name, smt2_path))
+        seen_specs.add(name)
+    if pattern_smt2_path:
+        pat = Path(pattern_smt2_path)
+        for spec_name in PATTERN_CONTRAST_PROFILES:
+            if spec_name in seen_specs:
+                jobs.append((f"{spec_name}+pattern", spec_name, pat))
+    return jobs
+
+
+# After --tlimit-per ends check-sat, allow this many seconds for --dump-difficulty
+# / stats flush before the portfolio wall-clock kill. Override with CVC_DIFFICULTY_GRACE_S.
+# Empirically: 2s still loses dumps on some 20–60s portfolio timeouts; 5s is safer.
+_DEFAULT_DIFFICULTY_GRACE_S = 5.0
+_MIN_DIFFICULTY_GRACE_S = 0.5
+
+
+def _difficulty_grace_cap_s() -> float:
+    raw = os.getenv("CVC_DIFFICULTY_GRACE_S", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_DIFFICULTY_GRACE_S
+
+
+def cvc_time_budget(
+    prove_timeout_s: float,
+    *,
+    collect_difficulty: bool,
+) -> Tuple[float, float]:
+    """Return ``(tlimit_s, wall_s)`` for one CVC prove.
+
+    ``tlimit_s`` drives ``--tlimit-per`` (ends check-sat). ``wall_s`` is the
+    process wait before hard-kill. When collecting difficulty, ``wall_s`` is
+    ``tlimit_s + grace`` so ``--dump-difficulty`` can flush; grace shrinks near
+    the task deadline (``remaining_task_s``).
+    """
+    prove = max(0.5, float(prove_timeout_s))
+    if not collect_difficulty:
+        return prove, prove
+
+    grace_cap = _difficulty_grace_cap_s()
+    rem = remaining_task_s()
+    if rem is None:
+        return prove, prove + grace_cap
+
+    wall_cap = max(0.5, float(rem))
+    if prove + grace_cap <= wall_cap:
+        return prove, prove + grace_cap
+    if prove + _MIN_DIFFICULTY_GRACE_S <= wall_cap:
+        return prove, wall_cap
+    if prove <= wall_cap:
+        # No room for grace: prefer keeping the prove slice; may lose difficulty.
+        return prove, wall_cap
+    # Task nearly exhausted: shrink both.
+    return wall_cap, wall_cap
+
+
+@dataclass
+class CvcResult:
+    """Rich CVC5/CVC4 outcome for usefulness scoring and repair feedback."""
+    proved: bool = False
+    status: str = "unknown"  # unsat | timeout | unknown | error | sat
+    elapsed: float = 0.0
+    strategy: str = ""
+    stats: Dict[str, int] = field(default_factory=dict)
+    # List of (assertion_snippet, difficulty_score), sorted desc by score.
+    difficulty: List[Tuple[str, int]] = field(default_factory=list)
+    used_lemma_names: List[str] = field(default_factory=list)  # usually empty for cvc5
+    stdout: str = ""
+    stderr: str = ""
+    error: Optional[str] = None
+    portfolio_results: Dict[str, dict] = field(default_factory=dict)
+    # Proof-goal assertion body from the SMT script, when known.
+    goal_term: Optional[str] = None
+    # (-o inst) per-quantifier instantiation counts: (term_or_qid, count).
+    instantiations: List[Tuple[str, int]] = field(default_factory=list)
+    # Parsed ``-o lemmas`` records: {formula, source}. Capped; not a full trace.
+    lemmas: List[dict] = field(default_factory=list)
+    # Compact ``(get-model)`` text when status is sat (optional).
+    model_text: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# Prompt / invalid-reason budget for solver counterexamples (longer than LLM tag).
+MAX_CEX_REASON_CHARS = 400
+_CEX_TIMEOUT_S = 2
+# ``-o lemmas`` storage / selection caps (not a complete solver trace).
+MAX_PARSE_LEMMAS = 400
+MAX_STORED_LEMMAS = 80
+MAX_FORMULA_SAMPLES = 4
+MAX_HOTSPOT_SAMPLES = 2
+MAX_SKOLEM_SAMPLES = 1
+# Display-priority weights (not usefulness / success probability).
+SCORE_W_RELEVANCE = 0.6
+SCORE_W_HOTNESS = 0.3
+SCORE_W_COMPACT = 0.1
+_LEMMA_INSTANCE_SOURCES = frozenset({
+    "QUANTIFIERS_INST_E_MATCHING",
+    "QUANTIFIERS_INST_E_MATCHING_SIMPLE",
+    "QUANTIFIERS_INST_CBQI_PROP",
+    "QUANTIFIERS_INST_CBQI_CONFLICT",
+    "DATATYPES_INST",
+})
+_SORT_LIKE_SYMBOLS = frozenset({
+    "Int", "Real", "Bool", "Nat", "Lst", "Tree", "Pair", "ZLst",
+})
+_LEMMA_SKIP_SOURCES = frozenset({
+    "COMBINATION_SPLIT",
+})
+_LEMMA_PREFERRED_SOURCES = frozenset({
+    "QUANTIFIERS_INST_E_MATCHING",
+    "QUANTIFIERS_INST_E_MATCHING_SIMPLE",
+    "QUANTIFIERS_INST_CBQI_PROP",
+    "QUANTIFIERS_INST_CBQI_CONFLICT",
+    "QUANTIFIERS_SKOLEMIZE",
+    "DATATYPES_INST",
+})
+_SMT_CORE_SYMBOLS = frozenset({
+    "forall", "exists", "let", "and", "or", "not", "xor", "ite", "=>", "=",
+    "distinct", "true", "false", "as", "par", "match", "case", "lambda", "!",
+    "+", "-", "*", "/", "div", "mod", "abs", ">", "<", ">=", "<=",
+    "to_real", "to_int", "is_int",
+})
+FORMULA_EVIDENCE_KIND = "solver_formula_evidence"
+
+
+def run_cvc_solver_with_timeout(smt2_path, timeout=60) -> bool:
+    """Backward-compatible boolean wrapper (True iff unsat)."""
+    return run_cvc(smt2_path, timeout=timeout).proved
+
+
+def cvc_profile_specs() -> Dict[str, dict]:
+    cvc5 = _cvc5_binary()
+    cvc4 = _cvc4_binary()
+    return {
+        "cvc5_simple": {
+            "binary": cvc5,
+            "options": ["--lang=smt2", "--full-saturate-quant"],
+            "type": "CVC5",
+        },
+        "cvc5_inductive": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--conjecture-gen",
+            ],
+            "type": "CVC5",
+        },
+        "cvc5_inductive_no_ematching": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--conjecture-gen",
+                "--no-e-matching",
+            ],
+            "type": "CVC5",
+        },
+        "cvc4_default": {
+            "binary": cvc4,
+            "options": [
+                "--quant-ind",
+                "--quant-cf",
+                "--conjecture-gen",
+                "--full-saturate-quant",
+                "--lang=smt2.6",
+            ],
+            "type": "CVC4",
+        },
+        "adt_structural": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--dt-stc-ind",
+            ],
+            "type": "CVC5",
+        },
+        "integer_recursive": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--int-wf-ind",
+            ],
+            "type": "CVC5",
+        },
+        "controlled_conjecture": {
+            "binary": cvc5,
+            "options": [
+                "--lang=smt2",
+                "--full-saturate-quant",
+                "--quant-ind",
+                "--conjecture-gen",
+                "--conjecture-gen-max-depth=2",
+                "--conjecture-gen-per-round=5",
+            ],
+            "type": "CVC5",
+        },
+    }
+
+
+def named_difficulty_hits(
+    difficulty: Optional[List[Tuple[str, int]]],
+) -> List[str]:
+    """Assertion names with positive difficulty (``C1`` or ``(! … :named C1)``)."""
+    out: List[str] = []
+    seen = set()
+    for term, score in difficulty or []:
+        if int(score or 0) <= 0:
+            continue
+        tok = str(term or "").strip()
+        label = tok if tok and not tok.startswith("(") else (named_attr_id(tok) or "")
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        out.append(label)
+    return out
+
+
+def expand_named_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    name_map: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, int]]:
+    """Replace dump names / bang-named terms with the original candidate formula."""
+    mapping = {
+        str(k).strip(): str(v).strip()
+        for k, v in (name_map or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    out: List[Tuple[str, int]] = []
+    for term, score in difficulty or []:
+        tok = str(term or "").strip()
+        label = tok if tok and not tok.startswith("(") else (named_attr_id(tok) or "")
+        formula = mapping.get(label) if label else None
+        if formula:
+            out.append((formula, int(score)))
+            continue
+        inner = strip_named_annotation(tok) if tok.startswith("(") else tok
+        out.append((inner or tok, int(score)))
+    return out
+
+
+def attributed_candidate_ids(
+    difficulty: Optional[List[Tuple[str, int]]],
+    name_map: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Exact ``:named`` hits, else canonical/α match of dump term to a candidate."""
+    mapping = {
+        str(k).strip(): str(v).strip()
+        for k, v in (name_map or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    found: List[str] = []
+    seen = set()
+
+    def _add(cid: str) -> None:
+        if cid and cid not in seen:
+            seen.add(cid)
+            found.append(cid)
+
+    for cid in named_difficulty_hits(difficulty):
+        if not mapping or cid in mapping:
+            _add(cid)
+    if not mapping:
+        return found
+    cans = {cid: canonical_smt_term(formula) for cid, formula in mapping.items()}
+    for term, score in difficulty or []:
+        if int(score or 0) <= 0:
+            continue
+        tok = str(term or "").strip()
+        if not tok.startswith("("):
+            continue
+        can = canonical_smt_term(strip_named_annotation(tok))
+        for cid, want in cans.items():
+            if can == want:
+                _add(cid)
+    return found
+
+
+def attributed_ids_from_portfolio(
+    result: Optional[CvcResult],
+    name_map: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Exists-attribution across CVC5 portfolio dumps (not CVC4)."""
+    if result is None:
+        return []
+    found: List[str] = []
+    seen = set()
+    blobs: List[Optional[List[Tuple[str, int]]]] = [list(result.difficulty or [])]
+    for name, blob in (result.portfolio_results or {}).items():
+        if name == "cvc4_default" or not isinstance(blob, dict):
+            continue
+        diff: List[Tuple[str, int]] = []
+        for item in blob.get("difficulty") or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                diff.append((str(item[0]), int(item[1])))
+        blobs.append(diff)
+    for diff in blobs:
+        for cid in attributed_candidate_ids(diff, name_map):
+            if cid not in seen:
+                seen.add(cid)
+                found.append(cid)
+    return found
+
+
+def _goal_score_from_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str] = None,
+) -> Optional[int]:
+    for term, score in difficulty or []:
+        if int(score or 0) > 0 and classify_difficulty_term(str(term), goal_term) == "goal":
+            return int(score)
+    return None
+
+
+def _compact_cvc(result: CvcResult) -> dict:
+    stats = result.stats or {}
+    slim_stats = {
+        "CONJ_TOTAL": int(stats.get("CONJ_TOTAL") or 0),
+        "INST_TOTAL": int(stats.get("INST_TOTAL") or 0),
+        "QUANTIFIERS_SKOLEMIZE": int(stats.get("QUANTIFIERS_SKOLEMIZE") or 0),
+    } if stats else {}
+    return {
+        "proved": result.proved,
+        "status": result.status,
+        "elapsed": round(result.elapsed, 3),
+        "strategy": result.strategy,
+        "stats": slim_stats or result.stats,
+        "error": result.error,
+        "dump_complete": difficulty_dump_complete(result.difficulty),
+        "goal_difficulty": _goal_score_from_difficulty(
+            result.difficulty, result.goal_term,
+        ),
+        "attributed_ids": named_difficulty_hits(result.difficulty),
+        "difficulty": [[t, s] for t, s in (result.difficulty or [])],
+        "instantiations": [[t, n] for t, n in (result.instantiations or [])],
+        "lemmas": [
+            {"formula": rec.get("formula"), "source": rec.get("source")}
+            for rec in (result.lemmas or [])[:MAX_STORED_LEMMAS]
+            if rec.get("formula")
+        ],
+        "goal_term": result.goal_term,
+    }
+
+
+def profile_as_result(parent: CvcResult, name: str) -> Optional[CvcResult]:
+    """Rebuild one portfolio arm as a ``CvcResult`` from compact summaries."""
+    blob = (parent.portfolio_results or {}).get(name)
+    if not isinstance(blob, dict):
+        if parent.strategy == name:
+            return parent
+        return None
+    difficulty: List[Tuple[str, int]] = []
+    for item in blob.get("difficulty") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            difficulty.append((str(item[0]), int(item[1])))
+    instantiations: List[Tuple[str, int]] = []
+    for item in blob.get("instantiations") or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            instantiations.append((str(item[0]), int(item[1])))
+    lemmas: List[dict] = []
+    for rec in blob.get("lemmas") or []:
+        if isinstance(rec, dict) and rec.get("formula"):
+            lemmas.append({
+                "formula": str(rec.get("formula") or ""),
+                "source": str(rec.get("source") or ""),
+            })
+    stats = blob.get("stats") if isinstance(blob.get("stats"), dict) else {}
+    return CvcResult(
+        proved=bool(blob.get("proved", False)),
+        status=str(blob.get("status") or parent.status),
+        elapsed=float(blob.get("elapsed") or parent.elapsed or 0.0),
+        strategy=name,
+        stats=dict(stats or {}),
+        difficulty=difficulty,
+        instantiations=instantiations,
+        lemmas=lemmas,
+        goal_term=blob.get("goal_term") or parent.goal_term,
+        portfolio_results=parent.portfolio_results,
+    )
+
+
+def pick_advice_witness(result: CvcResult) -> CvcResult:
+    """HD / TRIGGER shape: prefer a complete ``cvc5_simple`` dump, not richest CONJ."""
+    for name in ("cvc5_simple", "cvc5_inductive", "cvc5_inductive_no_ematching"):
+        sub = profile_as_result(result, name)
+        if sub is not None and difficulty_dump_complete(sub.difficulty):
+            return sub
+    return result
+
+
+def run_cvc(
+    smt2_path,
+    timeout: int = 60,
+    *,
+    collect_stats: bool = False,
+    collect_difficulty: bool = False,
+    profiles: Optional[List[str]] = None,
+    pattern_smt2_path=None,
+) -> CvcResult:
+    """
+    Portfolio prove: named CVC5/CVC4 strategies in parallel.
+    Default profiles match the paper (simple / inductive / no-ematching / cvc4).
+    First unsat wins.
+
+    ``pattern_smt2_path``: when set, also race ``cvc5_simple+pattern`` and
+    ``cvc5_inductive+pattern`` on that SMT (6-way if the default 4 names run).
+    """
+    names = profiles or list(CVC5_FALLBACK_PROFILES)
+    extra = {}
+    if pattern_smt2_path:
+        extra["pattern_smt2_path"] = pattern_smt2_path
+    return _run_cvc_parallel(
+        smt2_path,
+        timeout,
+        names,
+        collect_stats=collect_stats,
+        collect_difficulty=collect_difficulty,
+        **extra,
+    )
+
+
+def cvc_probeable_profiles(names: List[str]) -> List[str]:
+    """Keep CVC5 names only. CVC4 has no --stats / produce-difficulty."""
+    specs = cvc_profile_specs()
+    return [n for n in names if specs.get(n, {}).get("type") == "CVC5"]
+
+
+def run_cvc_probe(
+    smt2_path,
+    profiles: List[str],
+    timeout: int = 2,
+) -> Dict[str, CvcResult]:
+    """Short sequential diagnostic probes for routing (CVC5 only)."""
+    out: Dict[str, CvcResult] = {}
+    for name in cvc_probeable_profiles(list(profiles)):
+        out[name] = _run_named_cvc_profile(
+            smt2_path,
+            timeout,
+            name,
+            collect_stats=True,
+            collect_difficulty=False,
+        )
+    return out
+
+
+def run_cvc_routed(
+    smt2_path,
+    timeout: int = 60,
+    *,
+    state: Optional[GoalSearchState] = None,
+    collect_stats: bool = False,
+    collect_difficulty: bool = False,
+    pattern_smt2_path=None,
+) -> CvcResult:
+    """Prove with recommended profiles first, then the paper 4-way portfolio."""
+    extra = {}
+    if pattern_smt2_path:
+        extra["pattern_smt2_path"] = pattern_smt2_path
+    if not routing_enabled() or state is None or not state.candidate_profiles:
+        return run_cvc(
+            smt2_path,
+            timeout,
+            collect_stats=collect_stats,
+            collect_difficulty=collect_difficulty,
+            **extra,
+        )
+
+    start = time.time()
+    specs = cvc_profile_specs()
+    primary = [p for p in state.candidate_profiles if p in specs]
+    fallback = [
+        p for p in (state.fallback_profiles or CVC5_FALLBACK_PROFILES)
+        if p in specs and p not in primary
+    ]
+    reserve = 0
+    if fallback_enabled() and fallback:
+        reserve = max(fallback_min_timeout(), int(timeout * fallback_fraction()))
+        reserve = min(reserve, max(0, timeout - 1))
+    primary_timeout = max(1, timeout - reserve)
+    result = _run_cvc_parallel(
+        smt2_path,
+        primary_timeout,
+        primary,
+        collect_stats=collect_stats,
+        collect_difficulty=collect_difficulty,
+        **extra,
+    )
+    summaries = dict(result.portfolio_results)
+    if result.proved:
+        result.portfolio_results = summaries
+        return result
+
+    remaining = timeout - (time.time() - start)
+    if fallback_enabled() and fallback and remaining >= 0.5:
+        fb = _run_cvc_parallel(
+            smt2_path,
+            max(1, min(timeout, math.ceil(remaining))),
+            fallback,
+            collect_stats=collect_stats,
+            collect_difficulty=collect_difficulty,
+            **extra,
+        )
+        summaries.update(fb.portfolio_results)
+        fb.portfolio_results = summaries
+        return fb
+    result.portfolio_results = summaries
+    return result
+
+
+def _cvc_prove_cmd(
+    cfg: dict,
+    input_path: Path,
+    timeout: int,
+    *,
+    collect_stats: bool,
+    collect_difficulty: bool,
+    tlimit_s: Optional[float] = None,
+) -> List[str]:
+    """Build a CVC command. ``tlimit_s`` overrides ``timeout`` for ``--tlimit-per``."""
+    cmd = [cfg["binary"]] + list(cfg["options"])
+    limit = float(timeout if tlimit_s is None else tlimit_s)
+    tlimit_ms = max(1, int(round(limit * 1000)))
+    if cfg.get("type") == "CVC5" and (collect_stats or collect_difficulty):
+        cmd.append("--stats")
+        cmd.append("-o")
+        cmd.append("inst")
+        cmd.append(f"--tlimit-per={tlimit_ms}")
+        if collect_difficulty:
+            cmd.append("--produce-difficulty")
+            cmd.append("--dump-difficulty")
+            cmd.append("--difficulty-mode=lemma-literal-all")
+        # Same query as difficulty: process-time lemmas, not a post-timeout dump.
+        if collect_difficulty and formula_evidence_enabled():
+            cmd.append("-o")
+            cmd.append("lemmas")
+    elif cfg.get("type") == "CVC4" and tlimit_s is not None:
+        # Stop CVC4 at the prove slice so portfolio grace is reserved for CVC5
+        # difficulty dump (CVC4 has no difficulty output).
+        cmd.append(f"--tlimit-per={tlimit_ms}")
+    cmd.append(str(input_path))
+    return cmd
+
+
+def _run_named_cvc_profile(
+    smt2_path,
+    timeout: int,
+    profile: str,
+    *,
+    collect_stats: bool = True,
+    collect_difficulty: bool = False,
+) -> CvcResult:
+    """Run one named CVC5/CVC4 profile as-is (no sidecar remapping)."""
+    smt2_path = Path(smt2_path)
+    specs = cvc_profile_specs()
+    if profile not in specs:
+        return CvcResult(
+            status="error",
+            strategy=profile,
+            error=f"unknown profile: {profile}",
+        )
+    cfg = specs[profile]
+    if collect_difficulty and cfg.get("type") != "CVC5":
+        collect_difficulty = False
+    tlimit_s, wall_s = cvc_time_budget(
+        timeout, collect_difficulty=collect_difficulty,
+    )
+    try:
+        content = smt2_path.read_text(encoding="utf-8")
+    except OSError:
+        content = ""
+    goal_term = extract_proof_goal_term(content) if content else None
+    cmd = _cvc_prove_cmd(
+        cfg,
+        smt2_path,
+        timeout,
+        collect_stats=collect_stats,
+        collect_difficulty=collect_difficulty,
+        tlimit_s=tlimit_s,
+    )
+    result = _execute_single(cmd, int(math.ceil(wall_s)), strategy=profile)
+    result.goal_term = goal_term
+    if collect_difficulty:
+        result.difficulty = parse_cvc_difficulty(
+            result.stdout + "\n" + result.stderr
+        )
+    if collect_difficulty and formula_evidence_enabled() and not result.lemmas:
+        result.lemmas = parse_cvc_lemmas(result.stdout + "\n" + result.stderr)
+    return result
+
+
+def _cvc_result_from_output(
+    name: str,
+    stdout: str,
+    stderr: str,
+    elapsed: float,
+    *,
+    collect_stats: bool,
+    collect_difficulty: bool,
+    timed_out: bool = False,
+    goal_term: Optional[str] = None,
+    collect_lemmas: bool = False,
+) -> CvcResult:
+    stdout = stdout or ""
+    stderr = stderr or ""
+    text = stdout + "\n" + stderr
+    if timed_out:
+        status = "timeout"
+        proved = False
+    elif _stdout_is_unsat(stdout):
+        status = "unsat"
+        proved = True
+    elif re.search(r"(?m)^sat\s*$", stdout.lower()):
+        status = "sat"
+        proved = False
+    else:
+        status = "unknown"
+        proved = False
+    result = CvcResult(
+        proved=proved,
+        status=status,
+        elapsed=elapsed,
+        strategy=name,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    if collect_stats:
+        result.stats = parse_cvc_stats(text)
+        result.instantiations = parse_cvc_instantiations(text)
+    if collect_difficulty:
+        result.difficulty = parse_cvc_difficulty(text)
+    if collect_lemmas:
+        result.lemmas = parse_cvc_lemmas(text)
+    if goal_term:
+        result.goal_term = goal_term
+    return result
+
+
+def _richest_cvc(results: List[CvcResult]) -> Optional[CvcResult]:
+    if not results:
+        return None
+    return max(
+        results,
+        key=lambda r: (
+            len(r.stats or {}),
+            len(r.difficulty or []),
+            len(r.instantiations or []),
+            len(r.lemmas or []),
+            len(r.stdout or ""),
+        ),
+    )
+
+
+def _harvest_proc_output(proc) -> Tuple[str, str]:
+    if proc.poll() is None:
+        _kill_proc(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=1)
+    except Exception:
+        return "", ""
+    return stdout or "", stderr or ""
+
+
+def _open_capture_files() -> Tuple:
+    """Unnamed temp files so CVC can keep writing without filling a PIPE."""
+    stdout_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    stderr_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    return stdout_f, stderr_f
+
+
+def _read_capture_files(stdout_f, stderr_f) -> Tuple[str, str]:
+    if stdout_f is None or stderr_f is None:
+        return "", ""
+    try:
+        stdout_f.flush()
+        stderr_f.flush()
+        stdout_f.seek(0)
+        stderr_f.seek(0)
+        return stdout_f.read() or "", stderr_f.read() or ""
+    except Exception:
+        return "", ""
+
+
+def _close_capture_files(captures: dict) -> None:
+    for pair in (captures or {}).values():
+        for handle in pair:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def _run_cvc_parallel(
+    smt2_path,
+    timeout: int,
+    names: List[str],
+    *,
+    collect_stats: bool,
+    collect_difficulty: bool = False,
+    pattern_smt2_path=None,
+) -> CvcResult:
+    smt2_path = Path(smt2_path)
+    specs = cvc_profile_specs()
+    jobs = cvc_portfolio_jobs(names, smt2_path, pattern_smt2_path)
+    if not jobs:
+        return CvcResult(status="error", error="no known cvc profiles requested")
+    spec_by_result = {result_name: spec_name for result_name, spec_name, _path in jobs}
+    collect_lemmas = bool(collect_difficulty and formula_evidence_enabled())
+
+    tlimit_s, wall_s = cvc_time_budget(
+        timeout, collect_difficulty=collect_difficulty,
+    )
+    processes = {}
+    captures: Dict[str, Tuple] = {}
+    start = time.time()
+    summaries: Dict[str, dict] = {}
+    full_results: Dict[str, CvcResult] = {}
+    try:
+        try:
+            smt_content = smt2_path.read_text(encoding="utf-8")
+        except OSError:
+            smt_content = ""
+        goal_term = extract_proof_goal_term(smt_content) if smt_content else None
+
+        for result_name, spec_name, job_path in jobs:
+            cfg = specs[spec_name]
+            cmd = _cvc_prove_cmd(
+                cfg,
+                job_path,
+                timeout,
+                collect_stats=collect_stats,
+                collect_difficulty=collect_difficulty,
+                tlimit_s=tlimit_s,
+            )
+            try:
+                stdout_f, stderr_f = _open_capture_files()
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=stdout_f,
+                    stderr=stderr_f,
+                    text=True,
+                    preexec_fn=os.setsid,
+                )
+                processes[result_name] = proc
+                captures[result_name] = (stdout_f, stderr_f)
+            except FileNotFoundError:
+                logging.error("%s binary not found: %s", cfg["type"], cfg["binary"])
+                summaries[result_name] = {
+                    "status": "error",
+                    "error": "binary not found",
+                    "strategy": result_name,
+                }
+            except Exception as e:
+                logging.error("Failed to start %s: %s", result_name, e)
+                summaries[result_name] = {
+                    "status": "error",
+                    "error": str(e),
+                    "strategy": result_name,
+                }
+
+        if not processes:
+            return CvcResult(status="error", error="no solver process started", portfolio_results=summaries)
+
+        completed = set()
+        while time.time() - start < wall_s:
+            for name, proc in processes.items():
+                if name in completed:
+                    continue
+                if proc.poll() is None:
+                    continue
+                completed.add(name)
+                stdout, stderr = _read_capture_files(*captures.get(name, (None, None)))
+                elapsed = time.time() - start
+                result = _cvc_result_from_output(
+                    name,
+                    stdout or "",
+                    stderr or "",
+                    elapsed,
+                    collect_stats=collect_stats,
+                    collect_difficulty=collect_difficulty,
+                    collect_lemmas=collect_lemmas,
+                    goal_term=goal_term,
+                )
+                full_results[name] = result
+                if result.proved:
+                    _cleanup_processes(processes, exclude=name)
+                    logging.info(
+                        "%s验证成功: unsat (策略: %s, %.2fs)",
+                        specs[spec_by_result[name]]["type"], name, elapsed,
+                    )
+                    summaries[name] = _compact_cvc(result)
+                    result.portfolio_results = summaries
+                    return result
+                summaries[name] = _compact_cvc(result)
+
+            if len(completed) == len(processes):
+                break
+            time.sleep(0.05)
+
+        elapsed = time.time() - start
+        timed_out = len(completed) < len(processes)
+        for name, proc in processes.items():
+            if name in summaries:
+                continue
+            if proc.poll() is None:
+                _kill_proc(proc)
+            stdout, stderr = _read_capture_files(*captures.get(name, (None, None)))
+            result = _cvc_result_from_output(
+                name,
+                stdout,
+                stderr,
+                elapsed,
+                collect_stats=collect_stats,
+                collect_difficulty=collect_difficulty,
+                collect_lemmas=collect_lemmas,
+                timed_out=True,
+                goal_term=goal_term,
+            )
+            full_results[name] = result
+            summaries[name] = _compact_cvc(result)
+        for result_name, _spec_name, _path in jobs:
+            if result_name not in summaries:
+                summaries[result_name] = {
+                    "status": "timeout",
+                    "elapsed": round(elapsed, 3),
+                    "strategy": result_name,
+                }
+        logging.warning("CVC5/CVC4验证超时或失败 (耗时: %.2f秒)", elapsed)
+        statuses = [item.get("status") for item in summaries.values()]
+        if timed_out:
+            final_status = "timeout"
+        elif statuses and all(status == "error" for status in statuses):
+            final_status = "error"
+        elif "unknown" in statuses:
+            final_status = "unknown"
+        elif "sat" in statuses:
+            final_status = "sat"
+        else:
+            final_status = "unknown"
+        richest = _richest_cvc(list(full_results.values()))
+        return CvcResult(
+            proved=False,
+            status=final_status,
+            elapsed=elapsed,
+            strategy=richest.strategy if richest else jobs[0][0],
+            stats=dict(richest.stats) if richest else {},
+            difficulty=list(richest.difficulty) if richest else [],
+            stdout=richest.stdout if richest else "",
+            stderr=richest.stderr if richest else "",
+            portfolio_results=summaries,
+            goal_term=goal_term or (richest.goal_term if richest else None),
+            instantiations=list(richest.instantiations) if richest else [],
+            lemmas=list(richest.lemmas) if richest else [],
+        )
+
+    finally:
+        _cleanup_processes(processes)
+        _close_capture_files(captures)
+
+
+def cvc_diagnostic_profile(profile: Optional[str]) -> str:
+    """Sidecar 3s strategy. CVC4 cannot produce-difficulty, so it maps to cvc5_inductive.
+
+    Probes use `_run_named_cvc_profile` and do not go through this remap.
+    """
+    specs = cvc_profile_specs()
+    if profile in specs and specs[profile]["type"] == "CVC5":
+        return profile
+    return "cvc5_inductive"
+
+
+def run_cvc_diagnostic(
+    smt2_path,
+    timeout: int = 3,
+    *,
+    collect_difficulty: bool = True,
+    profile: Optional[str] = None,
+) -> CvcResult:
+    """
+    Single-strategy cvc5 run with --stats (+ optional difficulty on the same process).
+    Used for progress comparison / repair hints, not as portfolio prover.
+    """
+    smt2_path = Path(smt2_path)
+    name = cvc_diagnostic_profile(profile)
+    cfg = cvc_profile_specs()[name]
+    tlimit_s, wall_s = cvc_time_budget(timeout, collect_difficulty=collect_difficulty)
+    try:
+        content = smt2_path.read_text(encoding="utf-8")
+    except OSError:
+        content = ""
+    goal_term = extract_proof_goal_term(content) if content else None
+    cmd = _cvc_prove_cmd(
+        cfg,
+        smt2_path,
+        timeout,
+        collect_stats=True,
+        collect_difficulty=collect_difficulty,
+        tlimit_s=tlimit_s,
+    )
+    result = _execute_single(cmd, int(math.ceil(wall_s)), strategy=name)
+    result.goal_term = goal_term
+    if collect_difficulty:
+        result.difficulty = parse_cvc_difficulty(result.stdout + "\n" + result.stderr)
+    if collect_difficulty and formula_evidence_enabled() and not result.lemmas:
+        result.lemmas = parse_cvc_lemmas(result.stdout + "\n" + result.stderr)
+    return result
+
+
+def run_cvc_difficulty(smt2_path, timeout: int = 3, *, profile: Optional[str] = None) -> CvcResult:
+    """
+    Run cvc5 with ``--produce-difficulty --dump-difficulty`` (same process as prove).
+    """
+    return run_cvc_diagnostic(
+        smt2_path, timeout=timeout, collect_difficulty=True, profile=profile,
+    )
+
+
+def parse_cvc_stats(text: str) -> Dict[str, int]:
+    """Parse --stats counters into a flat int dict."""
+    stats: Dict[str, int] = {}
+    # Also parse compact "KEY: n" forms inside braces by scanning all KEY: n
+    for key in (
+        "QUANTIFIERS_INST_E_MATCHING",
+        "QUANTIFIERS_INST_E_MATCHING_SIMPLE",
+        "QUANTIFIERS_INST_CBQI_PROP",
+        "QUANTIFIERS_INST_CBQI_CONFLICT",
+        "QUANTIFIERS_SKOLEMIZE",
+        "QUANTIFIERS_CONJ_GEN_GT_ENUM",
+        "QUANTIFIERS_CONJ_GEN_SPLIT",
+        "DATATYPES_INST",
+        "DATATYPES_SPLIT",
+        "DATATYPES_UNIF",
+        "DATATYPES_LABEL_EXH",
+        "DATATYPES_COLLAPSE_SEL",
+    ):
+        matches = re.findall(rf"{re.escape(key)}\s*:\s*(\d+)", text)
+        if matches:
+            # Sum if multiple blocks; usually one
+            stats[key] = sum(int(x) for x in matches)
+
+    # Derived aggregates for scoring
+    stats["INST_TOTAL"] = (
+        stats.get("QUANTIFIERS_INST_E_MATCHING", 0)
+        + stats.get("QUANTIFIERS_INST_E_MATCHING_SIMPLE", 0)
+        + stats.get("QUANTIFIERS_INST_CBQI_PROP", 0)
+    )
+    stats["CONJ_TOTAL"] = (
+        stats.get("QUANTIFIERS_CONJ_GEN_GT_ENUM", 0)
+        + stats.get("QUANTIFIERS_CONJ_GEN_SPLIT", 0)
+    )
+    stats["DT_TOTAL"] = (
+        stats.get("DATATYPES_INST", 0)
+        + stats.get("DATATYPES_SPLIT", 0)
+        + stats.get("DATATYPES_UNIF", 0)
+    )
+    m = re.search(r"global::totalTime\s*=\s*(\d+)ms", text)
+    if m:
+        stats["TOTAL_TIME_MS"] = int(m.group(1))
+    return stats
+
+
+def parse_cvc_instantiations(text: str) -> List[Tuple[str, int]]:
+    """Parse `-o inst` lines: (num-instantiations <qid-or-formula> N)."""
+    items: List[Tuple[str, int]] = []
+    i = 0
+    needle = "(num-instantiations"
+    while True:
+        j = (text or "").find(needle, i)
+        if j < 0:
+            break
+        expr, nxt = _read_sexpr(text, j)
+        if not expr:
+            i = j + len(needle)
+            continue
+        kids = _sexpr_children(expr)
+        if len(kids) >= 3 and kids[0] == "num-instantiations":
+            term = kids[1]
+            try:
+                count = int(kids[-1])
+            except ValueError:
+                i = nxt
+                continue
+            if term.startswith("("):
+                term = normalize_smt_term(term)
+            if count >= 0 and term:
+                items.append((term, count))
+        i = nxt if nxt > j else j + len(needle)
+
+    best: Dict[str, int] = {}
+    out: List[Tuple[str, int]] = []
+    seen = set()
+    for term, count in items:
+        key = canonical_smt_term(term) if str(term).startswith("(") else term
+        best[key] = max(best.get(key, 0), count)
+    for term, count in sorted(items, key=lambda x: -x[1]):
+        key = canonical_smt_term(term) if str(term).startswith("(") else term
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((term, best[key]))
+    return out[:12]
+
+
+def _lemma_source_from_kids(kids: Sequence[str]) -> str:
+    for i, kid in enumerate(kids):
+        if kid == ":source" and i + 1 < len(kids):
+            return str(kids[i + 1])
+    return ""
+
+
+def _is_lemma_tautology(formula: str) -> bool:
+    kids = _sexpr_children(formula)
+    if len(kids) == 3 and kids[0] == "or":
+        a, b = kids[1], kids[2]
+        not_a = _sexpr_children(a)
+        not_b = _sexpr_children(b)
+        if not_b[:1] == ["not"] and len(not_b) >= 2 and terms_match(a, not_b[1]):
+            return True
+        if not_a[:1] == ["not"] and len(not_a) >= 2 and terms_match(b, not_a[1]):
+            return True
+    return False
+
+
+def parse_cvc_lemmas(text: str) -> List[dict]:
+    """Parse ``-o lemmas`` records: ``(lemma <formula> :source SRC)``.
+
+    Skips theory-split tautologies. Caps and prefers instantiation / datatype
+    sources. This is a search-time sample, not a complete dump.
+    """
+    items: List[dict] = []
+    i = 0
+    needle = "(lemma "
+    while True:
+        j = (text or "").find(needle, i)
+        if j < 0:
+            break
+        expr, nxt = _read_sexpr(text, j)
+        if not expr:
+            i = j + len(needle)
+            continue
+        kids = _sexpr_children(expr)
+        if len(kids) >= 2 and kids[0] == "lemma":
+            formula = normalize_smt_term(kids[1])
+            source = _lemma_source_from_kids(kids)
+            if (
+                formula
+                and source not in _LEMMA_SKIP_SOURCES
+                and not _is_lemma_tautology(formula)
+            ):
+                items.append({"formula": formula, "source": source})
+        i = nxt if nxt > j else j + len(needle)
+        if len(items) >= MAX_PARSE_LEMMAS:
+            break
+
+    preferred: List[dict] = []
+    other: List[dict] = []
+    seen = set()
+    for rec in items:
+        formula = rec["formula"]
+        key = canonical_smt_term(formula) if formula.startswith("(") else formula
+        if key in seen:
+            continue
+        seen.add(key)
+        if rec.get("source") in _LEMMA_PREFERRED_SOURCES:
+            preferred.append(rec)
+        else:
+            other.append(rec)
+    return (preferred + other)[:MAX_STORED_LEMMAS]
+
+
+def smt_fun_symbols(term: str) -> Set[str]:
+    """Declared-style function names applied in ``term`` (conservative)."""
+    names: Set[str] = set()
+    for match in re.finditer(
+        r"[A-Za-z_@][A-Za-z0-9_+\-*/<>=!?@]*", term or ""
+    ):
+        name = match.group(0)
+        if name in _SMT_CORE_SYMBOLS:
+            continue
+        if name.startswith("@") or name.startswith("_let"):
+            continue
+        if name.startswith("BOUND_VARIABLE"):
+            continue
+        names.add(name)
+    return names
+
+
+def _source_quantifiers(formula: str) -> List[str]:
+    """Top-level forall/exists antecedents only; no let-unfolding."""
+    kids = _sexpr_children(formula)
+    if not kids:
+        return []
+    found: List[str] = []
+    head = kids[0]
+    if head in ("=>", "implies") and len(kids) >= 2:
+        ant = kids[1]
+        if _head_symbol(ant) in ("forall", "exists"):
+            found.append(normalize_smt_term(ant))
+    elif head == "or":
+        for kid in kids[1:]:
+            if _head_symbol(kid) in ("forall", "exists"):
+                found.append(normalize_smt_term(kid))
+    elif head in ("forall", "exists"):
+        found.append(normalize_smt_term(formula))
+    return found
+
+
+def _relate_formula(
+    formula: str,
+    hard_axioms: Sequence[str],
+    goal_term: Optional[str],
+) -> Tuple[str, str, bool]:
+    """Return ``(relation, related_axiom, goal_related)``.
+
+    ``matched_quantifier`` is conservative identity via ``terms_match``.
+    ``shared_symbols`` is not treated as a confirmed axiom source.
+    """
+    quants = _source_quantifiers(formula)
+    for axiom in hard_axioms:
+        if any(terms_match(quant, axiom) for quant in quants):
+            goal_hit = bool(
+                goal_term
+                and _applied_fun_symbols(formula) & _applied_fun_symbols(goal_term)
+            )
+            return "matched_quantifier", axiom, goal_hit
+    funs = _applied_fun_symbols(formula)
+    goal_hit = bool(goal_term and funs & _applied_fun_symbols(goal_term))
+    best_ax = ""
+    best_n = 0
+    for axiom in hard_axioms:
+        shared = funs & _applied_fun_symbols(axiom)
+        if len(shared) > best_n:
+            best_n = len(shared)
+            best_ax = axiom
+    if best_ax:
+        return "shared_symbols", best_ax, goal_hit
+    return "unlinked", "", goal_hit
+
+
+def _strip_lets(formula: str) -> str:
+    body = (formula or "").strip()
+    seen = set()
+    while body.startswith("(") and body not in seen:
+        seen.add(body)
+        kids = _sexpr_children(body)
+        if kids and kids[0] == "let" and len(kids) >= 3:
+            body = kids[-1]
+            continue
+        break
+    return body
+
+
+def _applied_fun_symbols(term: str) -> Set[str]:
+    """Function symbols in applications; skip binders, lets, and sorts."""
+    expr = (term or "").strip()
+    if not expr.startswith("("):
+        return set()
+    kids = _sexpr_children(expr)
+    if not kids:
+        return set()
+    head = kids[0]
+    if head in ("forall", "exists") and len(kids) >= 3:
+        return _applied_fun_symbols(kids[-1])
+    if head == "let" and len(kids) >= 3:
+        return _applied_fun_symbols(kids[-1])
+    if head == "!" and len(kids) >= 2:
+        return _applied_fun_symbols(kids[1])
+    names: Set[str] = set()
+    rest = kids[1:]
+    if not str(head).startswith("("):
+        if (
+            head not in _SMT_CORE_SYMBOLS
+            and head not in _SORT_LIKE_SYMBOLS
+            and not str(head).startswith("@")
+            and not str(head).startswith("_let")
+            and not str(head).startswith("BOUND_VARIABLE")
+        ):
+            names.add(head)
+    else:
+        rest = kids
+    for kid in rest:
+        if str(kid).startswith("("):
+            names |= _applied_fun_symbols(kid)
+    return names
+
+
+def _relevance_term(formula: str) -> Tuple[str, str]:
+    """Term used for R: instance consequent when ``Q => Q[t/x]``, else full formula."""
+    body = _strip_lets(formula)
+    kids = _sexpr_children(body)
+    if kids and kids[0] in ("=>", "implies") and len(kids) >= 3:
+        if _head_symbol(kids[1]) in ("forall", "exists"):
+            return kids[2], "instance"
+    return body, "full"
+
+
+def _fun_jaccard(term: str, goal_term: Optional[str]) -> float:
+    left = _applied_fun_symbols(term)
+    right = _applied_fun_symbols(goal_term or "")
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _axiom_hotness_ranks(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str],
+) -> Dict[str, int]:
+    """Dense rank (1 = hottest) among this profile's axiom difficulty scores."""
+    best: Dict[str, int] = {}
+    for term, score in difficulty or []:
+        if int(score or 0) <= 0:
+            continue
+        if classify_difficulty_term(str(term), goal_term) != "axiom":
+            continue
+        key = canonical_smt_term(str(term))
+        best[key] = max(best.get(key, 0), int(score))
+    ordered = sorted(best.items(), key=lambda item: -item[1])
+    ranks: Dict[str, int] = {}
+    prev: Optional[int] = None
+    rank = 0
+    for key, score in ordered:
+        if score != prev:
+            rank += 1
+            prev = score
+        ranks[key] = rank
+    return ranks
+
+
+def _compactness_scores(sizes: Sequence[int]) -> List[float]:
+    """Relative compactness in this candidate set: shorter → closer to 1."""
+    if not sizes:
+        return []
+    uniq = sorted(set(int(n) for n in sizes))
+    if len(uniq) == 1:
+        return [1.0] * len(sizes)
+    rank = {n: i for i, n in enumerate(uniq)}
+    denom = len(uniq) - 1
+    return [1.0 - (rank[int(n)] / denom) for n in sizes]
+
+
+def _primary_applied_fun(term: str) -> str:
+    body = _strip_lets(term)
+    kids = _sexpr_children(body)
+    target = kids[1] if kids and kids[0] == "=" and len(kids) >= 2 else body
+    head = _head_symbol(target)
+    if (
+        head
+        and not str(head).startswith("(")
+        and head not in _SMT_CORE_SYMBOLS
+        and head not in _SORT_LIKE_SYMBOLS
+        and not str(head).startswith("@")
+    ):
+        return head
+    names = sorted(_applied_fun_symbols(body))
+    return names[0] if names else ""
+
+
+def _formula_key(formula: str) -> str:
+    text = formula or ""
+    return canonical_smt_term(text) if text.startswith("(") else text
+
+
+def _is_skolem_split(row: dict) -> bool:
+    source = str(row.get("source") or "")
+    if "SKOLEMIZE" in source:
+        return True
+    return (
+        str(row.get("relevance_scope") or "") == "full"
+        and bool(row.get("goal_related"))
+        and len(str(row.get("formula") or "")) > 240
+    )
+
+
+def _is_primary_instance(row: dict) -> bool:
+    if _is_skolem_split(row):
+        return False
+    if row.get("relation") == "matched_quantifier":
+        return True
+    return (
+        str(row.get("source") or "") in _LEMMA_INSTANCE_SOURCES
+        and str(row.get("relevance_scope") or "") == "instance"
+        and float(row.get("goal_relevance") or 0.0) >= 0.25
+    )
+
+
+def _lemma_records_by_profile(result: CvcResult) -> List[Tuple[str, List[dict], List[Tuple[str, int]]]]:
+    """Per-profile lemma lists with that profile's own difficulty."""
+    rows: List[Tuple[str, List[dict], List[Tuple[str, int]]]] = []
+    seen = set()
+    portfolio = result.portfolio_results or {}
+    names = list(portfolio.keys())
+    if result.strategy and result.strategy not in names:
+        names = [result.strategy] + names
+    if not names and (result.lemmas or result.difficulty):
+        names = [result.strategy or ""]
+    for name in names:
+        sub = profile_as_result(result, name) if name else None
+        if sub is None and name == (result.strategy or ""):
+            sub = result
+        if sub is None:
+            continue
+        lemmas = list(sub.lemmas or [])
+        if not lemmas and name == (result.strategy or ""):
+            lemmas = list(result.lemmas or [])
+        if not lemmas:
+            continue
+        key = name or "_"
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((name or result.strategy or "", lemmas, list(sub.difficulty or [])))
+    return rows
+
+
+def select_formula_evidence_samples(result: CvcResult) -> List[dict]:
+    """Pick up to 4 samples by display priority, then diversity quotas.
+
+    ``selection_score`` is how worth showing a formula is, not usefulness or
+    proof contribution. Difficulty ranks apply only to matched origin axioms.
+    """
+    classified: List[dict] = []
+    goal_term = result.goal_term
+    for profile, lemmas, difficulty in _lemma_records_by_profile(result):
+        hard_axioms = hard_axioms_from_difficulty(difficulty, goal_term)
+        ranks = _axiom_hotness_ranks(difficulty, goal_term)
+        for rec in lemmas:
+            formula = str(rec.get("formula") or "")
+            if not formula:
+                continue
+            relation, related, goal_hit = _relate_formula(
+                formula, hard_axioms, goal_term,
+            )
+            rel_term, rel_scope = _relevance_term(formula)
+            relevance = _fun_jaccard(rel_term, goal_term)
+            hotspot_known = relation == "matched_quantifier" and bool(related)
+            hotness = 0.0
+            if hotspot_known:
+                rank = ranks.get(canonical_smt_term(related))
+                if rank:
+                    hotness = 1.0 / float(rank)
+            funs = _applied_fun_symbols(rel_term)
+            origin_key = canonical_smt_term(related) if hotspot_known else ""
+            classified.append({
+                "profile": profile,
+                "source": str(rec.get("source") or ""),
+                "formula": formula,
+                "related_axiom": related if relation != "unlinked" else "",
+                "relation": relation,
+                "goal_related": goal_hit,
+                "goal_relevance": relevance,
+                "origin_hotness": hotness,
+                "hotspot_known": hotspot_known,
+                "relevance_scope": rel_scope,
+                "origin_match": relation,
+                "applied_funs": funs,
+                "primary_fun": _primary_applied_fun(rel_term),
+                "shape_key": (origin_key, tuple(sorted(funs))),
+                "size": len(formula),
+            })
+
+    best_by_key: Dict[str, dict] = {}
+    for row in classified:
+        key = _formula_key(row["formula"])
+        prev = best_by_key.get(key)
+        if prev is None:
+            best_by_key[key] = row
+            continue
+        if (
+            float(row["goal_relevance"]),
+            float(row["origin_hotness"]),
+            -int(row["size"]),
+        ) > (
+            float(prev["goal_relevance"]),
+            float(prev["origin_hotness"]),
+            -int(prev["size"]),
+        ):
+            best_by_key[key] = row
+    rows = list(best_by_key.values())
+    compact = _compactness_scores([int(item["size"]) for item in rows])
+    for row, compact_s in zip(rows, compact):
+        row["compactness"] = compact_s
+        row["selection_score"] = (
+            SCORE_W_RELEVANCE * float(row["goal_relevance"])
+            + SCORE_W_HOTNESS * float(row["origin_hotness"])
+            + SCORE_W_COMPACT * compact_s
+        )
+    rows.sort(
+        key=lambda item: (
+            -float(item["selection_score"]),
+            -float(item["goal_relevance"]),
+            int(item["size"]),
+        ),
+    )
+    return _select_diverse_formula_samples(rows)
+
+
+def _public_sample(row: dict) -> dict:
+    rec = {
+        "profile": row.get("profile") or "",
+        "source": row.get("source") or "",
+        "formula": row["formula"],
+        "related_axiom": row.get("related_axiom") or "",
+        "relation": row.get("relation") or "unlinked",
+        "selection_score": round(float(row.get("selection_score") or 0.0), 4),
+        "goal_relevance": round(float(row.get("goal_relevance") or 0.0), 4),
+        "origin_hotness": round(float(row.get("origin_hotness") or 0.0), 4),
+        "compactness": round(float(row.get("compactness") or 0.0), 4),
+        "origin_match": row.get("origin_match") or row.get("relation") or "unlinked",
+        "hotspot_known": bool(row.get("hotspot_known")),
+        "relevance_scope": row.get("relevance_scope") or "full",
+    }
+    return rec
+
+
+def _select_diverse_formula_samples(rows: Sequence[dict]) -> List[dict]:
+    selected: List[dict] = []
+    seen_shapes: Set = set()
+
+    def _take(row: dict, *, ignore_shape: bool = False) -> bool:
+        if len(selected) >= MAX_FORMULA_SAMPLES:
+            return False
+        key = _formula_key(row["formula"])
+        if any(_formula_key(item["formula"]) == key for item in selected):
+            return False
+        shape = row.get("shape_key")
+        if not ignore_shape and shape in seen_shapes:
+            return False
+        selected.append(row)
+        seen_shapes.add(shape)
+        return True
+
+    primary_funs: Set[str] = set()
+    for row in rows:
+        n_primary = sum(1 for item in selected if _is_primary_instance(item))
+        if n_primary >= MAX_HOTSPOT_SAMPLES:
+            break
+        if not _is_primary_instance(row):
+            continue
+        fun = str(row.get("primary_fun") or "")
+        if fun and fun in primary_funs:
+            continue
+        if _take(row):
+            if fun:
+                primary_funs.add(fun)
+
+    skolem_n = 0
+    for row in rows:
+        if skolem_n >= MAX_SKOLEM_SAMPLES:
+            break
+        if not _is_skolem_split(row):
+            continue
+        if _take(row):
+            skolem_n += 1
+
+    selected_funs: Set[str] = set()
+    for item in selected:
+        selected_funs |= set(item.get("applied_funs") or [])
+    for row in rows:
+        if len(selected) >= MAX_FORMULA_SAMPLES:
+            break
+        if _is_skolem_split(row) and skolem_n >= MAX_SKOLEM_SAMPLES:
+            continue
+        funs = set(row.get("applied_funs") or [])
+        if row.get("hotspot_known") and funs and funs <= selected_funs:
+            continue
+        if _take(row):
+            selected_funs |= funs
+            break
+
+    def _fill(*, ignore_shape: bool) -> None:
+        for row in rows:
+            if len(selected) >= MAX_FORMULA_SAMPLES:
+                return
+            if _is_skolem_split(row) and skolem_n >= MAX_SKOLEM_SAMPLES:
+                continue
+            _take(row, ignore_shape=ignore_shape)
+
+    _fill(ignore_shape=False)
+    if len(selected) < MAX_FORMULA_SAMPLES:
+        _fill(ignore_shape=True)
+
+    return [_public_sample(row) for row in selected]
+
+
+
+def _skip_ws_and_comments(text: str, i: int) -> int:
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        if c == ";":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        break
+    return i
+
+
+def _read_sexpr(text: str, i: int):
+    """Return (lexeme, next_index) or (None, i) at EOF / closing paren."""
+    i = _skip_ws_and_comments(text, i)
+    n = len(text)
+    if i >= n or text[i] == ")":
+        return None, i
+    if text[i] == "(":
+        start = i
+        i += 1
+        depth = 1
+        while i < n and depth:
+            c = text[i]
+            if c == ";":
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if c == "|":
+                i += 1
+                while i < n and text[i] != "|":
+                    i += 1
+                i = min(i + 1, n)
+                continue
+            if c == '"':
+                i += 1
+                while i < n:
+                    if text[i] == "\\":
+                        i += 2
+                        continue
+                    if text[i] == '"':
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        return text[start:i], i
+    start = i
+    if text[i] == "|":
+        i += 1
+        while i < n and text[i] != "|":
+            i += 1
+        i = min(i + 1, n)
+        return text[start:i], i
+    if text[i] == '"':
+        i += 1
+        while i < n:
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == '"':
+                i += 1
+                break
+            i += 1
+        return text[start:i], i
+    while i < n and text[i] not in " \t\r\n();|\"":
+        i += 1
+    return text[start:i], i
+
+
+def _sexpr_children(expr: str) -> List[str]:
+    expr = expr.strip()
+    if not expr.startswith("("):
+        return []
+    inner = expr[1:-1] if expr.endswith(")") else expr[1:]
+    kids: List[str] = []
+    i = 0
+    while True:
+        kid, i = _read_sexpr(inner, i)
+        if kid is None:
+            break
+        kids.append(kid)
+    return kids
+
+
+def normalize_smt_term(term: str) -> str:
+    return re.sub(r"\s+", " ", (term or "").strip())
+
+
+def strip_named_annotation(term: str) -> str:
+    kids = _sexpr_children(term)
+    if kids and kids[0] == "!" and len(kids) >= 2:
+        return strip_named_annotation(kids[1])
+    return term
+
+
+def _unwrap_assert(term: str) -> str:
+    kids = _sexpr_children(term)
+    if kids and kids[0] == "assert" and len(kids) >= 2:
+        return kids[1]
+    return term
+
+
+def _sorted_vars(expr: str) -> List[Tuple[str, str]]:
+    kids = _sexpr_children(expr)
+    if not kids:
+        return []
+    if not kids[0].startswith("(") and len(kids) >= 2:
+        return [(kids[0], kids[1])]
+    out: List[Tuple[str, str]] = []
+    for kid in kids:
+        parts = _sexpr_children(kid)
+        if len(parts) >= 2:
+            out.append((parts[0], parts[1]))
+    return out
+
+
+def _alpha_normalize(expr: str, env=None, nxt=None) -> str:
+    env = dict(env or {})
+    nxt = nxt if nxt is not None else [0]
+    expr = expr.strip()
+    if not expr.startswith("("):
+        return env.get(expr, expr)
+    kids = _sexpr_children(expr)
+    if not kids:
+        return "()"
+    head = kids[0]
+    if head in ("forall", "exists") and len(kids) >= 3:
+        binders = _sorted_vars(kids[1])
+        new_env = dict(env)
+        bind_parts = []
+        for name, sort in binders:
+            fresh = f"_b{nxt[0]}"
+            nxt[0] += 1
+            new_env[name] = fresh
+            bind_parts.append(f"({fresh} {_alpha_normalize(sort, env, nxt)})")
+        body = _alpha_normalize(kids[2], new_env, nxt)
+        extra = " ".join(_alpha_normalize(k, new_env, nxt) for k in kids[3:])
+        core = f"({head} ({' '.join(bind_parts)}) {body}"
+        return core + (f" {extra})" if extra else ")")
+    return "(" + " ".join(_alpha_normalize(k, env, nxt) for k in kids) + ")"
+
+
+def canonical_smt_term(term: str) -> str:
+    body = _unwrap_assert(strip_named_annotation(normalize_smt_term(term)))
+    return _alpha_normalize(normalize_smt_term(body))
+
+
+def terms_match(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    return canonical_smt_term(a) == canonical_smt_term(b)
+
+
+def _head_symbol(term: str) -> str:
+    kids = _sexpr_children(term)
+    if kids:
+        return kids[0]
+    return term.strip()
+
+
+def classify_difficulty_term(term: str, goal_term: Optional[str] = None) -> str:
+    """Return 'goal', 'axiom', or 'other'."""
+    body = _unwrap_assert(strip_named_annotation(term))
+    if goal_term and terms_match(body, goal_term):
+        return "goal"
+    head = _head_symbol(body)
+    if head == "not":
+        kids = _sexpr_children(body)
+        inner = kids[1] if len(kids) > 1 else ""
+        inner_head = _head_symbol(inner)
+        if goal_term:
+            # A negated formula that is not the proof goal is still an axiom/lemma.
+            return "axiom" if inner_head in ("forall", "exists") else "other"
+        if inner_head in ("forall", "exists"):
+            return "goal"
+        return "other"
+    if head in ("forall", "exists"):
+        return "axiom"
+    return "other"
+
+
+_PROOF_GOAL_BLOCK = re.compile(
+    r";\s*proof goal\b[^\n]*\n(?P<body>.*?);\s*proof goal end\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _assert_bodies(smt: str) -> List[str]:
+    bodies: List[str] = []
+    i = 0
+    while True:
+        expr, i = _read_sexpr(smt, i)
+        if expr is None:
+            break
+        kids = _sexpr_children(expr)
+        if kids and kids[0] == "assert" and len(kids) >= 2:
+            bodies.append(kids[1])
+    return bodies
+
+
+def extract_proof_goal_term(smt: str) -> Optional[str]:
+    """Proof-goal assertion body from `; proof goal` markers, else last negated quantifier."""
+    if not smt:
+        return None
+    m = _PROOF_GOAL_BLOCK.search(smt)
+    if m:
+        bodies = _assert_bodies(m.group("body"))
+        if bodies:
+            return normalize_smt_term(strip_named_annotation(bodies[0]))
+    for body in reversed(_assert_bodies(smt)):
+        if classify_difficulty_term(body, None) == "goal":
+            return normalize_smt_term(strip_named_annotation(body))
+    return None
+
+
+def prepare_smt_for_get_model(smt: str) -> str:
+    """Ensure ``:produce-models`` and a trailing ``(get-model)`` after ``(check-sat)``."""
+    text = smt or ""
+    if "produce-models" not in text:
+        text = "(set-option :produce-models true)\n" + text
+    if "(get-model)" not in text:
+        if re.search(r"\(check-sat\)", text):
+            text = re.sub(
+                r"\(check-sat\)",
+                "(check-sat)\n(get-model)",
+                text,
+                count=1,
+            )
+        else:
+            text = text.rstrip() + "\n(check-sat)\n(get-model)\n"
+    return text
+
+
+def smt_negate_proof_goal_assert(smt: str) -> str:
+    """Rewrite ``; proof goal (assert φ)`` into ``(assert (not φ))`` for cex search.
+
+    Validation files assert φ positively; after unsat we seek a model of ¬φ.
+    If the body is already ``(not ...)``, leave it unchanged.
+    """
+    def _repl(match: re.Match) -> str:
+        body = (match.group(1) or "").strip()
+        stripped = body
+        if stripped.startswith("(not ") or stripped.startswith("(not\n"):
+            return match.group(0)
+        return f"; proof goal\n(assert (not {body}))\n; proof goal end"
+
+    return re.sub(
+        r";\s*proof goal\s*\(assert\s+(.+?)\)\s*;\s*proof goal end",
+        _repl,
+        smt,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def parse_cvc_model(text: str) -> Optional[str]:
+    """Extract a compact model block from cvc5 stdout after ``(get-model)``.
+
+    Accepts ``sat`` or ``unknown`` followed by a ``define-fun`` model — some
+    quantifier problems report unknown while still printing a witness.
+    """
+    raw = text or ""
+    # Prefer a top-level s-expression that contains define-fun (standard get-model).
+    best: Optional[str] = None
+    best_len = 0
+    i = 0
+    while i < len(raw):
+        if raw[i] != "(":
+            i += 1
+            continue
+        expr, nxt = _read_sexpr(raw, i)
+        if expr is None:
+            break
+        if "define-fun" in expr or "define-funs-rec" in expr:
+            if len(expr) > best_len:
+                best = expr
+                best_len = len(expr)
+        i = nxt if nxt > i else i + 1
+    if best:
+        return re.sub(r"\s+", " ", best).strip()
+    # Fallback: lines after sat/unknown until blank.
+    lines = []
+    seen_status = False
+    for line in raw.splitlines():
+        if re.match(r"(?i)^(sat|unknown)\s*$", line.strip()):
+            seen_status = True
+            continue
+        if not seen_status:
+            continue
+        if re.match(r"(?i)^(unsat|timeout)\b", line.strip()):
+            break
+        if line.strip().startswith("(") or lines:
+            lines.append(line.rstrip())
+        if lines and not line.strip():
+            break
+    blob = " ".join(x.strip() for x in lines if x.strip())
+    return re.sub(r"\s+", " ", blob).strip() or None
+
+
+def format_counterexample_reason(
+    model_text: Optional[str],
+    *,
+    fallback: str = "solver:sat",
+    limit: int = MAX_CEX_REASON_CHARS,
+) -> str:
+    """Build an invalid/node reason that includes the solver model when available."""
+    model = (model_text or "").strip()
+    if not model:
+        return fallback
+    body = model if len(model) <= limit - len("Counterexample: ") else (
+        model[: max(0, limit - len("Counterexample: ") - 3)] + "..."
+    )
+    return f"Counterexample: {body}"
+
+
+def run_cvc_counterexample(
+    smt2_path,
+    timeout: int = _CEX_TIMEOUT_S,
+    *,
+    profile: str = "cvc5_simple",
+    negate_proof_goal: bool = False,
+) -> CvcResult:
+    """Short CVC5 run that asks for a model on sat (for invalid / refutation reasons).
+
+    ``negate_proof_goal``: flip validation-style ``(assert φ)`` to ``(assert (not φ))``
+    so a lemma that contradicted axioms can still yield a concrete witness.
+    """
+    import tempfile
+
+    src = Path(smt2_path)
+    try:
+        content = src.read_text(encoding="utf-8")
+    except OSError as exc:
+        return CvcResult(status="error", error=str(exc), strategy=profile)
+
+    if negate_proof_goal:
+        content = smt_negate_proof_goal_assert(content)
+    content = prepare_smt_for_get_model(content)
+
+    specs = cvc_profile_specs()
+    cfg = specs.get(profile) or specs.get("cvc5_simple")
+    if not cfg or cfg.get("type") != "CVC5":
+        return CvcResult(status="error", error="no CVC5 profile for model query", strategy=profile)
+
+    with tempfile.TemporaryDirectory(prefix="cvc_cex_") as tmp:
+        cex_path = Path(tmp) / "cex.smt2"
+        cex_path.write_text(content, encoding="utf-8")
+        cmd = [cfg["binary"]] + list(cfg["options"]) + [str(cex_path)]
+        # Prefer a light quantifier schedule; models only need a sat witness.
+        if "--full-saturate-quant" not in cmd:
+            pass
+        result = _execute_single(cmd, max(1, int(timeout)), strategy=profile)
+        result.goal_term = extract_proof_goal_term(content)
+        result.model_text = parse_cvc_model(result.stdout + "\n" + result.stderr)
+        # A printed model is a usable witness even when the solver says unknown.
+        if result.model_text and result.status in ("unknown", "timeout", ""):
+            result.status = "sat"
+        return result
+
+
+def counterexample_reason_for_smt(
+    smt2_path,
+    *,
+    timeout: int = _CEX_TIMEOUT_S,
+    negate_proof_goal: bool = False,
+    fallback: str = "solver:sat",
+) -> str:
+    """Return ``Counterexample: …`` or ``fallback`` after a short model query."""
+    result = run_cvc_counterexample(
+        smt2_path,
+        timeout=timeout,
+        negate_proof_goal=negate_proof_goal,
+    )
+    if result.model_text:
+        return format_counterexample_reason(result.model_text, fallback=fallback)
+    if result.status == "sat":
+        return fallback
+    return fallback
+
+
+def _iter_top_sexprs(text: str) -> List[str]:
+    out: List[str] = []
+    i = 0
+    while True:
+        expr, nxt = _read_sexpr(text, i)
+        if expr is None:
+            break
+        out.append(expr)
+        i = nxt if nxt > i else i + 1
+    return out
+
+
+def parse_nullary_define_fun_bindings(ce_smt: str) -> Tuple[Dict[str, str], List[str]]:
+    """Parse nullary ``(define-fun x () Sort body)`` → ``{x: body}`` plus leftovers."""
+    bindings: Dict[str, str] = {}
+    leftovers: List[str] = []
+    for expr in _iter_top_sexprs(ce_smt or ""):
+        kids = _sexpr_children(expr)
+        if not kids or kids[0] != "define-fun" or len(kids) < 5:
+            leftovers.append(expr)
+            continue
+        name, args, _sort, body = kids[1], kids[2], kids[3], kids[4]
+        arg_kids = _sexpr_children(args) if str(args).strip().startswith("(") else []
+        if str(args).strip() in ("()", "") or arg_kids == []:
+            if name and body:
+                bindings[str(name)] = str(body)
+            else:
+                leftovers.append(expr)
+        else:
+            leftovers.append(expr)
+    return bindings, leftovers
+
+
+def _subst_free_symbols(expr: str, env: Dict[str, str]) -> str:
+    """Replace free atoms in *expr* using *env* (does not enter shadowed binders)."""
+    if not env:
+        return expr
+    text = (expr or "").strip()
+    if not text.startswith("("):
+        return env.get(text, text)
+    kids = _sexpr_children(text)
+    if not kids:
+        return "()"
+    head = kids[0]
+    if head in ("forall", "exists") and len(kids) >= 3:
+        binders = _sorted_vars(kids[1])
+        shadowed = {name for name, _sort in binders}
+        inner = {k: v for k, v in env.items() if k not in shadowed}
+        bind_parts = []
+        for name, sort in binders:
+            bind_parts.append(
+                f"({name} {_subst_free_symbols(sort, env)})"
+            )
+        body = _subst_free_symbols(kids[2], inner)
+        extra = " ".join(_subst_free_symbols(k, inner) for k in kids[3:])
+        core = f"({head} ({' '.join(bind_parts)}) {body}"
+        return core + (f" {extra})" if extra else ")")
+    return "(" + " ".join(_subst_free_symbols(k, env) for k in kids) + ")"
+
+
+def instantiate_goal_with_bindings(
+    phi: str, bindings: Dict[str, str]
+) -> Tuple[str, Dict[str, str]]:
+    """Instantiate leading ``forall`` binders present in *bindings*.
+
+    Returns ``(formula, unused_bindings)``.
+    """
+    kids = _sexpr_children(phi or "")
+    if kids and kids[0] == "forall" and len(kids) >= 3:
+        binders = _sorted_vars(kids[1])
+        body = kids[2]
+        used: Dict[str, str] = {}
+        remaining: List[Tuple[str, str]] = []
+        for name, sort in binders:
+            if name in bindings:
+                used[name] = bindings[name]
+            else:
+                remaining.append((name, sort))
+        subst_body = _subst_free_symbols(body, used)
+        unused = {k: v for k, v in bindings.items() if k not in used}
+        if remaining:
+            bind_s = " ".join(f"({n} {s})" for n, s in remaining)
+            return f"(forall ({bind_s}) {subst_body})", unused
+        return subst_body, unused
+    if bindings:
+        return _subst_free_symbols(phi, bindings), {}
+    return phi, {}
+
+
+def inject_counterexample_into_smt(smt: str, ce_smt: str) -> str:
+    """Apply LLM CE bindings to the proof goal, then check axioms ∧ ¬φ[ce].
+
+    Prefer instantiating ``forall`` binders named in nullary ``define-fun``
+    bindings (typical LLM CE). Remaining free-constant bindings become
+    ``(assert (= x v))`` before the goal. Non-nullary leftovers are injected
+    as raw sexprs.
+    """
+    bindings, leftovers = parse_nullary_define_fun_bindings(ce_smt)
+    text = smt or ""
+    goal_term = extract_proof_goal_term(text)
+    new_goal_assert = None
+    unused = dict(bindings)
+    if goal_term and bindings:
+        phi = goal_term
+        kids = _sexpr_children(phi)
+        if kids and kids[0] == "not" and len(kids) >= 2:
+            # Child files store (assert (not φ)); instantiate φ then re-negate.
+            inst, unused = instantiate_goal_with_bindings(kids[1], bindings)
+            new_goal_assert = f"(assert (not {inst}))"
+        else:
+            # Positive assert φ (rare here): instantiate and keep positive.
+            inst, unused = instantiate_goal_with_bindings(phi, bindings)
+            new_goal_assert = f"(assert {inst})"
+
+    free_asserts = [f"(assert (= {name} {val}))" for name, val in unused.items()]
+    block_lines = leftovers + free_asserts
+    block = ""
+    if block_lines:
+        block = (
+            "; LLM counterexample bindings (verified)\n"
+            + "\n".join(block_lines)
+            + "\n"
+        )
+
+    if new_goal_assert and _PROOF_GOAL_BLOCK.search(text):
+        def _repl(_match: re.Match) -> str:
+            return (
+                f"; proof goal\n{new_goal_assert}\n; proof goal end"
+            )
+
+        text = _PROOF_GOAL_BLOCK.sub(_repl, text, count=1)
+        marker = re.search(r";\s*proof goal\b", text, flags=re.IGNORECASE)
+        if block and marker:
+            text = text[: marker.start()] + block + text[marker.start() :]
+        elif block:
+            text = text.rstrip() + "\n" + block
+        return text
+
+    # Fallback: pin bindings only (no forall rewrite).
+    if not block:
+        return text
+    marker = re.search(r";\s*proof goal\b", text, flags=re.IGNORECASE)
+    if marker:
+        return text[: marker.start()] + block + text[marker.start() :]
+    check = re.search(r"(?m)^[ \t]*\(check-sat\)", text)
+    if check:
+        return text[: check.start()] + block + text[check.start() :]
+    return text.rstrip() + "\n" + block
+
+
+def verify_llm_goal_counterexample(
+    smt2_path,
+    ce_smt: str,
+    *,
+    timeout: int = _CEX_TIMEOUT_S,
+) -> Tuple[bool, str]:
+    """Check LLM CE bindings against child SMT (axioms ∧ ¬φ[ce]).
+
+    Returns ``(verified, reason)``. On success reason is ``Counterexample: …``.
+    Fail-closed on missing CE, inject issues, or non-sat.
+    """
+    import tempfile
+
+    ce = (ce_smt or "").strip()
+    if not ce:
+        return False, "missing_ce_smt"
+    src = Path(smt2_path)
+    try:
+        content = src.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"ce_verify_io:{exc}"
+    try:
+        content = inject_counterexample_into_smt(content, ce)
+        content = prepare_smt_for_get_model(content)
+    except Exception as exc:
+        return False, f"ce_inject_error:{exc}"
+
+    specs = cvc_profile_specs()
+    cfg = specs.get("cvc5_simple") or next(
+        (v for v in specs.values() if v.get("type") == "CVC5"), None
+    )
+    if not cfg:
+        return False, "ce_verify_no_cvc5"
+    with tempfile.TemporaryDirectory(prefix="llm_ce_") as tmp:
+        path = Path(tmp) / "ce_check.smt2"
+        path.write_text(content, encoding="utf-8")
+        cmd = [cfg["binary"]] + list(cfg["options"]) + [str(path)]
+        result = _execute_single(cmd, max(1, int(timeout)), strategy="cvc5_simple")
+        result.model_text = parse_cvc_model(result.stdout + "\n" + result.stderr)
+        if result.model_text and result.status in ("unknown", "timeout", ""):
+            result.status = "sat"
+        if result.status == "sat" or result.model_text:
+            compact = re.sub(r"\s+", " ", ce).strip()
+            model = (result.model_text or "").strip()
+            if model and model not in ("()", "( )"):
+                return True, format_counterexample_reason(model)
+            return True, format_counterexample_reason(compact)
+        return False, f"ce_unverified:{result.status or 'unknown'}"
+
+
+def named_attr_id(term: str) -> Optional[str]:
+    """``C1`` from ``(! φ :named C1)``, else None."""
+    kids = _sexpr_children(term)
+    if not kids or kids[0] != "!":
+        return None
+    i = 2
+    while i < len(kids) - 1:
+        if kids[i] == ":named":
+            label = str(kids[i + 1] or "").strip()
+            return label or None
+        i += 1
+    return None
+
+
+def _parse_difficulty_entry(expr: str) -> Optional[Tuple[str, int]]:
+    kids = _sexpr_children(expr)
+    if len(kids) != 2:
+        return None
+    term, score_tok = kids
+    if not re.fullmatch(r"-?\d+", score_tok):
+        return None
+    # Named dump prints ``(C1 756)``; formulas still start with ``(``.
+    if not term:
+        return None
+    return normalize_smt_term(term), int(score_tok)
+
+
+def _parse_difficulty_list(expr: str) -> List[Tuple[str, int]]:
+    items: List[Tuple[str, int]] = []
+    for kid in _sexpr_children(expr):
+        parsed = _parse_difficulty_entry(kid)
+        if parsed is None:
+            return []
+        items.append(parsed)
+    return items
+
+
+def parse_cvc_difficulty(text: str) -> List[Tuple[str, int]]:
+    """
+    Parse ``--dump-difficulty`` (or legacy ``(get-difficulty)``) output with a
+    balanced s-expr scan.
+
+    Each entry is `( <s-expr-or-name> <int> )`. Nested SMT such as
+    `(plus (succ n) m)` is allowed. ``:named C1`` dumps as ``(C1 756)``.
+    """
+    items: List[Tuple[str, int]] = []
+    i = 0
+    while True:
+        expr, i = _read_sexpr(text, i)
+        if expr is None:
+            break
+        if not expr.startswith("("):
+            continue
+        as_entry = _parse_difficulty_entry(expr)
+        if as_entry is not None:
+            items.append(as_entry)
+            continue
+        items.extend(_parse_difficulty_list(expr))
+
+    items = [(t, s) for t, s in items if s > 0]
+    items.sort(key=lambda x: -x[1])
+    seen = set()
+    out: List[Tuple[str, int]] = []
+    for t, s in items:
+        if t not in seen:
+            seen.add(t)
+            out.append((t, s))
+    return out
+
+
+
+def _cvc_stat_rate(stats: Dict[str, int], elapsed: float, key: str) -> float:
+    count = int(stats.get(key, 0))
+    time_s = elapsed
+    ms = stats.get("TOTAL_TIME_MS", 0)
+    if ms:
+        time_s = max(time_s, ms / 1000.0)
+    return activity_rate(count, time_s)
+
+
+def difficulty_dump_complete(difficulty: Optional[List[Tuple[str, int]]]) -> bool:
+    """True when CVC returned at least one positive score.
+
+    Official dumps omit difficulty-0 assertions. Our former top-12 cap is gone,
+    so a non-empty dump may treat unlisted assertions as 0. An empty list means
+    the dump is missing (timeout/no flush), not that everything is 0.
+    """
+    return bool(difficulty)
+
+
+def compute_progress_score(
+    baseline: CvcResult,
+    candidate: CvcResult,
+    *,
+    control: Optional[CvcResult] = None,
+) -> Tuple[float, List[str]]:
+    """
+    Score whether lemmas made cvc5 less stuck, using relative stats deltas.
+
+    Gains are log1p relative increases of per-second rates vs the control
+    (or baseline) run. Difficulty uses in-problem relative drops, not a
+    fixed point cutoff.
+    """
+    if candidate.proved:
+        return 100.0, ["proved_goal"]
+    if candidate.status == "error":
+        return -10.0, ["solver_error"]
+
+    c = candidate.stats
+    ref_stats = control.stats if control is not None else baseline.stats
+    ref_elapsed = control.elapsed if control is not None else baseline.elapsed
+    cand_elapsed = candidate.elapsed
+    signals: List[str] = []
+    score = 0.0
+
+    conj_c = _cvc_stat_rate(c, cand_elapsed, "CONJ_TOTAL")
+    conj_r = _cvc_stat_rate(ref_stats, ref_elapsed, "CONJ_TOTAL")
+    inst_c = _cvc_stat_rate(c, cand_elapsed, "INST_TOTAL")
+    inst_r = _cvc_stat_rate(ref_stats, ref_elapsed, "INST_TOTAL")
+    skol_c = _cvc_stat_rate(c, cand_elapsed, "QUANTIFIERS_SKOLEMIZE")
+    skol_r = _cvc_stat_rate(ref_stats, ref_elapsed, "QUANTIFIERS_SKOLEMIZE")
+    dt_c = _cvc_stat_rate(c, cand_elapsed, "DT_TOTAL")
+    dt_r = _cvc_stat_rate(ref_stats, ref_elapsed, "DT_TOTAL")
+    matching_c = conj_c + inst_c
+    matching_r = conj_r + inst_r
+    strong = 0
+
+    if is_relative_gain(matching_c, matching_r):
+        score += gain_score(matching_c, matching_r, 2.5)
+        if log_gain(inst_c, inst_r) >= log_gain(conj_c, conj_r):
+            signals.append(f"more_instantiations(+{pct_label(inst_c, inst_r)}%)")
+        else:
+            signals.append(f"more_conjecture_gen(+{pct_label(conj_c, conj_r)}%)")
+        strong += 1
+    if is_relative_gain(skol_c, skol_r, rare=True):
+        score += min(2.0, 0.4 + gain_score(skol_c, skol_r, 1.6))
+        signals.append(f"more_skolemize(+{pct_label(skol_c, skol_r)}%)")
+        strong += 1
+    if is_relative_gain(dt_c, dt_r, rare=True):
+        score += gain_score(dt_c, dt_r, 1.5)
+        signals.append(f"more_datatype_inference(+{pct_label(dt_c, dt_r)}%)")
+        strong += 1
+
+    goal_term = candidate.goal_term or baseline.goal_term
+    if control is not None and not goal_term:
+        goal_term = control.goal_term
+
+    def goal_diff(res: CvcResult) -> Optional[int]:
+        g = goal_term or res.goal_term
+        for term, s in res.difficulty:
+            if classify_difficulty_term(term, g) == "goal":
+                return s
+        return None
+
+    gb, gc = goal_diff(baseline), goal_diff(candidate)
+    if gb is not None and gc is not None and is_relative_drop(gb, gc):
+        drop = relative_drop(gb, gc)
+        score += 1.5 * min(drop / 0.5, 1.0)
+        signals.append(f"goal_difficulty_drop({gb}->{gc},{int(round(100 * drop))}%)")
+        strong += 1
+
+    if (
+        difficulty_dump_complete(baseline.difficulty)
+        and difficulty_dump_complete(candidate.difficulty)
+    ):
+        def axiom_map(res: CvcResult) -> dict:
+            g = goal_term or res.goal_term
+            out = {}
+            for t, s in res.difficulty:
+                if classify_difficulty_term(t, g) == "axiom":
+                    out[canonical_smt_term(t)] = s
+            return out
+
+        b_ax = axiom_map(baseline)
+        c_ax = axiom_map(candidate)
+        dropped = 0
+        for key, old_s in b_ax.items():
+            if key not in c_ax:
+                dropped += 1
+            elif is_relative_drop(old_s, c_ax[key]):
+                dropped += 1
+        if dropped >= 1:
+            score += min(dropped * 0.75, 2.0)
+            signals.append(f"axiom_difficulty_drop(x{dropped})")
+            strong += 1
+
+    product = any(
+        s.startswith("more_skolemize")
+        or s.startswith("goal_difficulty")
+        or s.startswith("axiom_difficulty")
+        or s.startswith("more_datatype")
+        for s in signals
+    )
+    if log_gain(conj_c, conj_r) >= EXPLOSION_LOG_GAIN and not product:
+        score -= min(gain_score(conj_c, conj_r, 1.5), 1.5)
+        signals.append(f"search_explosion(+{pct_label(conj_c, conj_r)}%)")
+    if (
+        log_gain(inst_c, inst_r) >= EXPLOSION_LOG_GAIN
+        and log_gain(conj_c, conj_r) >= LOG_GAIN_MIN
+        and not product
+    ):
+        score -= min(gain_score(inst_c, inst_r, 1.5), 1.5)
+        signals.append(f"search_explosion(+{pct_label(inst_c, inst_r)}%)")
+
+    if strong < 2 and "more_skolemize" not in "".join(signals) and "goal_difficulty" not in "".join(signals):
+        if score > 0:
+            score *= 0.4
+            signals.append("weak_single_signal")
+
+    if not signals:
+        signals.append("no_measurable_progress")
+    return score, signals
+
+
+def rarely_instantiated_axioms(
+    hard_axioms: List[str],
+    instantiations: Optional[List[Tuple[str, int]]],
+    *,
+    limit: int = 3,
+) -> List[str]:
+    """Hard axioms with formula-shaped inst traces but zero matching counts.
+
+    If `-o inst` only printed qids (no formulas), return empty — we cannot tell.
+    """
+    if not hard_axioms or not instantiations:
+        return []
+    formula_shaped = [t for t, _ in instantiations if str(t).startswith("(")]
+    if not formula_shaped:
+        return []
+    rare: List[str] = []
+    for axiom in hard_axioms:
+        count = _inst_count_for_axiom(axiom, instantiations)
+        if count == 0:
+            rare.append(axiom)
+        if len(rare) >= limit:
+            break
+    return rare
+
+
+def _inst_count_for_axiom(
+    axiom: str,
+    instantiations: List[Tuple[str, int]],
+) -> Optional[int]:
+    """Attributed inst count, or 0 if formulas were dumped but this axiom never matched."""
+    can = canonical_smt_term(axiom)
+    best: Optional[int] = None
+    for term, n in instantiations:
+        if not str(term).startswith("("):
+            continue
+        if canonical_smt_term(term) == can:
+            best = n if best is None else max(best, n)
+    return 0 if best is None else best
+
+
+def hard_axioms_from_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str] = None,
+    *,
+    limit: int = 4,
+) -> List[str]:
+    """Hard axioms for LLM prompts: in-problem cutoff, then difficulty desc.
+
+    Returns formula strings only; use ``hard_axiom_entries_from_difficulty``
+    when scores are needed for the prompt. No goal-symbol overlap reordering:
+    surface token overlap is an unreliable relevance signal (bound vars, shared
+    ctors) and truncating on it can drop indirect hotspots from feedback/advice.
+    """
+    return [t for t, _s in hard_axiom_entries_from_difficulty(
+        difficulty, goal_term, limit=limit
+    )]
+
+
+def hard_axiom_entries_from_difficulty(
+    difficulty: Optional[List[Tuple[str, int]]],
+    goal_term: Optional[str] = None,
+    *,
+    limit: int = 4,
+) -> List[Tuple[str, int]]:
+    """Like ``hard_axioms_from_difficulty``, but keep ``(formula, score)`` pairs."""
+    axiom_scores = [
+        s
+        for t, s in (difficulty or [])
+        if s > 0 and classify_difficulty_term(t, goal_term) == "axiom"
+    ]
+    cutoff = in_problem_hard_cutoff(axiom_scores)
+    entries = [
+        (t, int(s))
+        for t, s in (difficulty or [])
+        if s > 0
+        and classify_difficulty_term(t, goal_term) == "axiom"
+        and s >= cutoff
+    ]
+    entries.sort(key=lambda pair: -pair[1])
+    return entries[:limit]
+
+
+def derive_repair_hints(result: CvcResult, context: str = "goal") -> List[dict]:
+    """Turn cvc5 failure signals into structured repair hints for the LLM.
+
+    Emits high_difficulty_assertions and, when ``FEEDBACK_FORMULA_EVIDENCE``
+    is on, solver_formula_evidence samples from ``-o lemmas``. need_rewrite /
+    need_stronger_lemma and generic timeout stay disabled (commented).
+    """
+    if result.proved:
+        return []
+
+    hints: List[dict] = []
+    stats = result.stats
+    attempt_id = (
+        f"{context}:{result.strategy or ''}:"
+        f"{round(float(result.elapsed or 0.0), 3)}:"
+        f"{len(result.lemmas or [])}"
+    )
+
+    roles = [
+        (t, s, classify_difficulty_term(t, result.goal_term))
+        for t, s in result.difficulty
+        if s > 0
+    ]
+    hard_entries = hard_axiom_entries_from_difficulty(
+        result.difficulty, result.goal_term
+    )
+    hard_axioms = [t for t, _s in hard_entries]
+    hard_scores = {t: s for t, s in hard_entries}
+    goal_bits = [t for t, s, role in roles if role == "goal"][:2]
+    rare = rarely_instantiated_axioms(hard_axioms, result.instantiations)
+
+    if hard_axioms or goal_bits:
+        hints.append({
+            "kind": "high_difficulty_assertions",
+            "context": context,
+            "attempt_id": attempt_id,
+            "detail": (
+                "CVC5 difficulty marks these input assertions as runtime hotspots "
+                "(lemma-literal-all), not proof dependencies or instantiation counts."
+            ),
+            "hard_axioms": hard_axioms,
+            "hard_axiom_scores": hard_scores,
+            "rarely_instantiated": rare,
+            "goal_fragments": goal_bits,
+            "suggested_actions": [
+                "Listed axioms are possible starting points; propose lemmas "
+                "that help prove the CURRENT goal (a hotspot need not be used).",
+            ],
+        })
+        if rare:
+            hints[-1]["detail"] += (
+                " Some hotspot axioms had no matching instantiations; "
+                "a rewrite whose LHS matches them or the goal may help triggering."
+            )
+
+    if formula_evidence_enabled():
+        samples = select_formula_evidence_samples(result)
+        if samples:
+            hints.append({
+                "kind": FORMULA_EVIDENCE_KIND,
+                "context": context,
+                "attempt_id": attempt_id,
+                "detail": (
+                    "Solver formulas from the same query as the hotspots: "
+                    "actual instantiations, constructor expansions, or skolem "
+                    "forms. They are evidence, not missing lemmas."
+                ),
+                "samples": samples,
+                "suggested_actions": [
+                    "Inspect formula conditions and recursive-call arguments.",
+                    "Do not treat a sample as proof that a condition is missing "
+                    "or that generalization is required.",
+                ],
+            })
+
+    conj = stats.get("CONJ_TOTAL", 0)
+    skol = stats.get("QUANTIFIERS_SKOLEMIZE", 0)
+    inst = stats.get("INST_TOTAL", 0)
+    q_activity = conj + skol + inst
+
+    if q_activity > 0:
+        matching = skol + inst
+        inst_of_matching = inst / max(matching, 1)
+        # Disabled: need_stronger_lemma — skolem/conj low is often "not instantiating"
+        # (bridge already present / needs :pattern), but the prompt text pushes the
+        # LLM to strengthen/generalize the whole goal and misleads retarget.
+        # skol_per_conj = skol / max(conj, 1)
+        # if conj > 0 and skol_per_conj <= SKOLEM_PER_CONJ_MAX:
+        #     hints.append({
+        #         "kind": "need_stronger_lemma",
+        #         "priority": 1,
+        #         "context": context,
+        #         "detail": (
+        #             "Skolem/induction strengthening is low relative to conjecture-gen "
+        #             "(skolem/conj ≤ 0.05). Likely missing a stronger inductive lemma."
+        #         ),
+        #         "strength": round(gate_overshoot(skol_per_conj, SKOLEM_PER_CONJ_MAX), 4),
+        #         "suggested_actions": [
+        #             "Strengthen or generalize the goal into an inductive lemma",
+        #             "Try associativity/commutativity/distributivity style facts",
+        #         ],
+        #     })
+        # Disabled: need_rewrite — mix ratio (inst/(skol+inst) < 0.75) mainly
+        # tells the LLM to emit equational/rewrite lemmas; it is laggy when C
+        # changes and is a weaker prompt signal than high-difficulty axioms.
+        # The same stats still feed rewrite_scarce_stats in smt_patterns.
+        # if skol > 0 and inst_of_matching < INST_OF_MATCHING_MAX:
+        #     hints.append({
+        #         "kind": "need_rewrite",
+        #         "priority": 2,
+        #         "context": context,
+        #         "detail": (
+        #             "cvc5 skolemized but instantiations are not the majority of "
+        #             "skolem+matching activity. Missing rewrite-oriented lemmas "
+        #             "may be blocking matching."
+        #         ),
+        #         "strength": round(gate_overshoot(inst_of_matching, INST_OF_MATCHING_MAX), 4),
+        #         "suggested_actions": [
+        #             "Propose rewrite lemmas whose LHS matches a subterm of the goal",
+        #             "Unfold recursive definitions one step in a lemma",
+        #         ],
+        #     })
+
+    # Disabled: generic timeout hint — low information; success/fail both emit it often.
+    # if result.status in ("timeout", "unknown") and not hints:
+    #     hints.append({
+    #         "kind": "timeout",
+    #         "context": context,
+    #         "detail": "cvc5 timed out / returned unknown without clear difficulty signal.",
+    #         "suggested_actions": [
+    #             "Generate simpler lemmas close to the recursive definitions",
+    #             "Split the goal into smaller equational facts",
+    #         ],
+    #     })
+
+    return hints
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+def _stdout_is_unsat(stdout: str) -> bool:
+    for line in stdout.splitlines():
+        s = line.strip().lower()
+        if s == "unsat":
+            return True
+        if s == "sat":
+            return False
+    return "unsat" in stdout.lower() and not re.search(
+        r"(?m)^(sat)\s*$", stdout.lower()
+    )
+
+
+def _execute_single(cmd: List[str], timeout: int, strategy: str) -> CvcResult:
+    result = CvcResult(strategy=strategy)
+    try:
+        logging.debug("启动CVC诊断: %s", " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=os.setsid,
+        )
+        start = time.time()
+        timed_out = False
+        try:
+            # Keep collection overhead bounded; routed calls reserve time for
+            # the paper fallback.
+            stdout, stderr = proc.communicate(timeout=timeout + 1)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_proc(proc)
+            stdout, stderr = "", ""
+            try:
+                stdout, stderr = proc.communicate(timeout=1)
+            except Exception:
+                pass
+
+        result.elapsed = time.time() - start
+        result.stdout = stdout or ""
+        result.stderr = stderr or ""
+        text = result.stdout + "\n" + result.stderr
+        result.stats = parse_cvc_stats(text)
+        result.instantiations = parse_cvc_instantiations(text)
+        if formula_evidence_enabled():
+            result.lemmas = parse_cvc_lemmas(text)
+
+        if timed_out:
+            result.status = "timeout"
+        elif _stdout_is_unsat(result.stdout):
+            result.status = "unsat"
+            result.proved = True
+        elif re.search(r"(?m)^sat\s*$", result.stdout.lower()):
+            result.status = "sat"
+        elif "unknown" in result.stdout.lower():
+            result.status = "unknown"
+        else:
+            result.status = "timeout" if "interrupted" in text.lower() else "unknown"
+
+        return result
+    except FileNotFoundError:
+        return CvcResult(status="error", error=f"binary not found: {cmd[0]}", strategy=strategy)
+    except Exception as e:
+        return CvcResult(status="error", error=str(e), strategy=strategy)
+
+
+def _kill_proc(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                proc.kill()
+            proc.wait()
+    except Exception as e:
+        logging.error("kill cvc process failed: %s", e)
+
+
+def _cleanup_processes(processes, exclude=None):
+    for name, proc in processes.items():
+        if exclude and name == exclude:
+            continue
+        if proc.poll() is None:
+            _kill_proc(proc)
+            if psutil is not None:
+                try:
+                    if psutil.pid_exists(proc.pid):
+                        parent = psutil.Process(proc.pid)
+                        for child in parent.children(recursive=True):
+                            try:
+                                child.kill()
+                            except psutil.NoSuchProcess:
+                                pass
+                        try:
+                            parent.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Lemma well-formedness (parse / type) before portfolio prove
+# ---------------------------------------------------------------------------
+
+_TYPE_ERROR_MARKERS = (
+    "expecting an arithmetic",
+    "has incorrect type",
+    "typing error",
+    "type mismatch",
+    "is not of sort",
+    "expected sort",
+    "invalid type",
+    "term of sort",
+)
+
+
+@dataclass
+class WellformedResult:
+    """Result of a cheap cvc5 ``--parse-only`` check on one candidate lemma."""
+
+    ok: bool
+    kind: Optional[str] = None  # parse_error | type_error
+    message: str = ""
+
+
+def classify_cvc_wellformed_message(text: str) -> Tuple[str, str]:
+    """Map cvc5 stderr/stdout to ``(parse_error|type_error, short_message)``."""
+    raw = (text or "").strip()
+    line = next(
+        (
+            ln.strip()
+            for ln in raw.splitlines()
+            if "error" in ln.lower() or "expecting" in ln.lower()
+        ),
+        raw.splitlines()[-1] if raw else "wellformedness check failed",
+    )
+    # Drop absolute temp paths for stable feedback / logs.
+    line = re.sub(r"Parse Error:\s*\S+:\d+\.\d+:\s*", "Parse Error: ", line)
+    line = re.sub(r'\(error\s+"|"\)$', "", line).strip()
+    low = raw.lower()
+    for marker in _TYPE_ERROR_MARKERS:
+        if marker in low:
+            return "type_error", line[:400]
+    return "parse_error", line[:400]
+
+
+def build_lemma_assert_smt(smt_content: str, lemma: str) -> str:
+    """Theory + ``(assert lemma)`` as the proof goal, single trailing check-sat."""
+    body = (lemma or "").strip()
+    if not body:
+        body = "true"
+    text = smt_content or ""
+    if re.search(r"; proof goal\s*\(assert.*?\)\s*; proof goal end", text, flags=re.DOTALL):
+        text = re.sub(
+            r"; proof goal\s*\(assert.*?\)\s*; proof goal end",
+            f"; proof goal\n(assert {body})\n; proof goal end",
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+    else:
+        text = text.rstrip() + f"\n; proof goal\n(assert {body})\n; proof goal end\n"
+    text = re.sub(r"(?m)^[ \t]*\(check-sat\)[ \t]*\r?\n?", "", text)
+    text = re.sub(r"(?m)^[ \t]*\(exit\)[ \t]*\r?\n?", "", text)
+    return text.rstrip() + "\n(check-sat)\n"
+
+
+def check_lemma_wellformed(
+    lemma: str,
+    smt_content: str,
+    *,
+    binary: Optional[str] = None,
+) -> WellformedResult:
+    """Run cvc5 ``--parse-only`` on theory + asserted lemma (no prove profiles).
+
+    Normalizes nullary constructor apps (``(nil)``→``nil``) before parsing so
+    lemmas that Vampire accepts are not false-dropped by cvc5's stricter syntax.
+    """
+    from smt_nullary_normalize import normalize_lemma_nullary_ctors
+
+    formula = (lemma or "").strip()
+    if not formula:
+        return WellformedResult(ok=False, kind="parse_error", message="empty lemma")
+    formula, _ = normalize_lemma_nullary_ctors(formula, smt_content)
+    content = build_lemma_assert_smt(smt_content, formula)
+    cvc5 = binary or _cvc5_binary()
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".smt2",
+            prefix="lemma_wf_",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp:
+            tmp.write(content)
+            tmp_path = Path(tmp.name)
+        proc = subprocess.run(
+            [cvc5, "--lang=smt2", "--parse-only", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if proc.returncode == 0 and "error" not in text.lower():
+            return WellformedResult(ok=True)
+        kind, message = classify_cvc_wellformed_message(text)
+        return WellformedResult(ok=False, kind=kind, message=message)
+    except FileNotFoundError:
+        return WellformedResult(
+            ok=False,
+            kind="parse_error",
+            message=f"cvc5 binary not found: {cvc5}",
+        )
+    except subprocess.TimeoutExpired:
+        return WellformedResult(
+            ok=False,
+            kind="parse_error",
+            message="cvc5 --parse-only timed out",
+        )
+    except Exception as exc:
+        return WellformedResult(ok=False, kind="parse_error", message=str(exc))
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def cvc_output_wellformed_failure(stdout: str, stderr: str) -> Optional[WellformedResult]:
+    """If solver output is a parse/type failure, return a WellformedResult; else None."""
+    text = (stdout or "") + "\n" + (stderr or "")
+    low = text.lower()
+    if "parse error" not in low and "expecting an arithmetic" not in low:
+        if "typing error" not in low and "incorrect type" not in low:
+            return None
+    kind, message = classify_cvc_wellformed_message(text)
+    return WellformedResult(ok=False, kind=kind, message=message)

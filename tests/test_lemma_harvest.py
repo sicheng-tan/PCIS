@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""Delayed harvest during usefulness: skip, pin, local, skip_initial."""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
+os.environ.setdefault("MODEL_TYPE", "gpt-4o")
+
+from cvc5_runner import CvcResult
+from obligation_tree import (
+    HARVEST_VAMPIRE_PROFILES,
+    lemma_library_role,
+    load_lemma_library,
+)
+from solver_routing import VAMPIRE_RACE_PROFILES
+from vampire_runner import VampireResult
+
+_GOAL = """(set-logic ALL)
+(declare-fun P (Int) Bool)
+; proof goal
+(assert (not (forall ((x Int)) (P x))))
+; proof goal end
+(check-sat)
+"""
+_LEMMA = "(forall ((y Int)) (=> (P y) (P y)))"
+
+_HARVEST_ENV = {
+    "LEMMA_LIBRARY": "on",
+    "LEMMA_LIBRARY_LOCAL": "on",
+    "SOLVER_ROUTING": "off",
+    "LEMMA_DEFINED_SYMBOLS": "off",
+}
+
+
+def _unsat(**kwargs) -> CvcResult:
+    payload = {"proved": True, "status": "unsat", "elapsed": 0.01}
+    payload.update(kwargs)
+    return CvcResult(**payload)
+
+
+def _timeout(**kwargs) -> CvcResult:
+    payload = {"proved": False, "status": "timeout", "elapsed": 0.2}
+    payload.update(kwargs)
+    return CvcResult(**payload)
+
+
+def _run_quick(tmp: str, *, delay: str, usefulness, harvest, retry=None):
+    import Mate_new as mate
+
+    env = dict(_HARVEST_ENV)
+    env["USEFULNESS_HARVEST_DELAY_S"] = delay
+    (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+    patches = [
+        patch.dict(os.environ, env),
+        patch("Mate_new.generate_lemmas_with_llm", return_value=[_LEMMA]),
+        patch("Mate_new.validate_lemmas_parallel", side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas)),
+        patch("Mate_new.verify_combined_lemmas", side_effect=usefulness),
+        patch("Mate_new.run_cvc", side_effect=harvest),
+    ]
+    if retry is not None:
+        patches.append(patch("Mate_new.perform_initial_verification", side_effect=retry))
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        if retry is not None:
+            with patches[5]:
+                return mate.quick_run(tmp, "template", "p", "./prompts_ours")
+        return mate.quick_run(tmp, "template", "p", "./prompts_ours")
+
+
+def test_fast_unsat_does_not_start_harvest() -> None:
+    import Mate_new as mate
+
+    harvest = MagicMock(return_value=_timeout())
+
+    def usefulness(*_a, **_k):
+        return True, [_LEMMA], _unsat(elapsed=0.01)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch("Mate_new.run_cvc", harvest):
+            proved, subgoals, lemmas = _run_quick(
+                tmp, delay="2", usefulness=usefulness, harvest=harvest,
+            )
+        dispatch = mate.load_failed_lemmas(tmp, "template").get("harvest_dispatch") or {}
+        assert proved is True
+        assert lemmas == [_LEMMA]
+        assert subgoals == ["template_1"]
+        assert dispatch.get("skip_initial") == []
+        assert dispatch.get("pre_proved") == {}
+        harvest.assert_not_called()
+
+
+def test_timeout_harvest_local_retries_goal_without_prove_run() -> None:
+    import Mate_new as mate
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return False, [], _timeout(elapsed=0.08)
+
+    harvest = MagicMock(return_value=_unsat())
+    retry = MagicMock(return_value=True)
+    prove = MagicMock()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with patch("Mate_new.prove_run", prove):
+            proved, subgoals, lemmas = _run_quick(
+                tmp, delay="0.03", usefulness=usefulness, harvest=harvest, retry=retry,
+            )
+        stored = load_lemma_library(tmp)
+        assert proved is True
+        assert subgoals == []
+        assert lemmas == [_LEMMA]
+        assert len(stored) == 1
+        assert lemma_library_role(stored[0]) == "local"
+        retry.assert_called()
+        prove.assert_not_called()
+        assert harvest.call_count >= 1
+        assert retry.call_args.kwargs.get("log_event") == "harvest_retry"
+        assert retry.call_args.kwargs.get("timeout") == 2
+
+
+def test_cvc_unknown_usefulness_still_harvests_local() -> None:
+    """CVC portfolio may finish as unknown (not timeout); local harvest must still run."""
+    from lemma_harvest import usefulness_fail_allows_local_harvest
+
+    assert usefulness_fail_allows_local_harvest("unknown")
+    assert not usefulness_fail_allows_local_harvest("sat")
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return False, [], CvcResult(proved=False, status="unknown", elapsed=0.08)
+
+    harvest = MagicMock(return_value=_unsat())
+    retry = MagicMock(return_value=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proved, subgoals, lemmas = _run_quick(
+            tmp, delay="0.03", usefulness=usefulness, harvest=harvest, retry=retry,
+        )
+        stored = load_lemma_library(tmp)
+        assert proved is True
+        assert subgoals == []
+        assert lemmas == [_LEMMA]
+        assert lemma_library_role(stored[0]) == "local"
+        retry.assert_called()
+        assert retry.call_args.kwargs.get("log_event") == "harvest_retry"
+
+
+def _v_incomplete(**kwargs) -> VampireResult:
+    payload = {"proved": False, "status": "incomplete", "elapsed": 0.08}
+    payload.update(kwargs)
+    return VampireResult(**payload)
+
+
+def test_slow_unsat_proved_harvest_skips_prove_run_and_initial() -> None:
+    import Mate_new as mate
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return True, [_LEMMA], _unsat(elapsed=0.08)
+
+    harvest = MagicMock(return_value=_unsat())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proved, subgoals, lemmas = _run_quick(
+            tmp, delay="0.03", usefulness=usefulness, harvest=harvest,
+        )
+        dispatch = mate.load_failed_lemmas(tmp, "template").get("harvest_dispatch") or {}
+        stored = load_lemma_library(tmp)
+        assert proved is True
+        assert subgoals == []
+        assert lemmas == [_LEMMA]
+        assert "template_1" in (dispatch.get("pre_proved") or {})
+        assert lemma_library_role(stored[0]) == "pin"
+        harvest.assert_called()
+
+
+def test_exhausted_harvest_unsat_sets_skip_initial() -> None:
+    import Mate_new as mate
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return True, [_LEMMA], _unsat(elapsed=0.08)
+
+    harvest = MagicMock(return_value=_timeout())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proved, subgoals, lemmas = _run_quick(
+            tmp, delay="0.03", usefulness=usefulness, harvest=harvest,
+        )
+        dispatch = mate.load_failed_lemmas(tmp, "template").get("harvest_dispatch") or {}
+        assert proved is True
+        assert subgoals == ["template_1"]
+        assert lemmas == [_LEMMA]
+        assert dispatch.get("skip_initial") == ["template_1"]
+        assert dispatch.get("pre_proved") == {}
+        diag = (dispatch.get("skip_initial_diag") or {}).get("template_1") or {}
+        assert diag.get("status") == "timeout"
+        assert diag.get("proved") is False
+
+
+def test_skip_initial_prove_run_does_not_call_initial() -> None:
+    import Mate_new as mate
+
+    initial = MagicMock(return_value=False)
+    harvested = CvcResult(
+        status="timeout",
+        stats={"CONJ_TOTAL": 7, "INST_TOTAL": 1},
+        difficulty=[("(not (P 0))", 4)],
+        elapsed=0.2,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "SOLVER_ROUTING": "off",
+            "LLM_LEMMA_DIAGNOSIS": "off",
+            "CHILD_LLM_ATTEMPTS": "1",
+        }), patch("Mate_new.perform_initial_verification", initial), patch(
+            "Mate_new.quick_run", return_value=(False, [], [])
+        ):
+            mate.prove_run(
+                tmp, "template", depth=1, skip_initial=True,
+                skip_initial_diag=mate._compact_cvc_diag(harvested),
+            )
+        initial.assert_not_called()
+        cached = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert cached is not None
+        assert cached.status == "timeout"
+        assert cached.stats["CONJ_TOTAL"] == 7
+        assert cached.difficulty[0][1] == 4
+
+
+def test_harvest_retry_refreshes_goal_only_baseline() -> None:
+    import Mate_new as mate
+
+    first = CvcResult(status="timeout", stats={"CONJ_TOTAL": 1}, strategy="a")
+    retry = CvcResult(status="timeout", stats={"CONJ_TOTAL": 9}, strategy="b")
+    with tempfile.TemporaryDirectory() as tmp:
+        smt = Path(tmp) / "template.smt2"
+        smt.write_text(_GOAL, encoding="utf-8")
+        mate._set_goal_only_baseline(
+            tmp, "template", first, context="initial_goal", replace=False,
+        )
+        with patch("Mate_new.run_cvc_routed", return_value=retry), patch.dict(
+            os.environ, {"SOLVER_ROUTING": "off"},
+        ):
+            ok = mate.perform_initial_verification(
+                smt, base_path=tmp, goal_name="template", log_event="harvest_retry",
+            )
+        assert ok is False
+        cached = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert cached is not None
+        assert cached.stats["CONJ_TOTAL"] == 9
+        assert cached.strategy == "b"
+
+
+def test_library_off_disables_harvest() -> None:
+    harvest = MagicMock(return_value=_unsat())
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return False, [], _timeout(elapsed=0.08)
+
+    import Mate_new as mate
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "LEMMA_LIBRARY": "off",
+            "LEMMA_LIBRARY_LOCAL": "on",
+            "SOLVER_ROUTING": "off",
+            "LEMMA_DEFINED_SYMBOLS": "off",
+            "USEFULNESS_HARVEST_DELAY_S": "0.03",
+        }), patch("Mate_new.generate_lemmas_with_llm", return_value=[_LEMMA]), patch(
+            "Mate_new.validate_lemmas_parallel",
+            side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas),
+        ), patch("Mate_new.verify_combined_lemmas", side_effect=usefulness), patch(
+            "Mate_new.run_cvc", harvest
+        ), patch("Mate_new.perform_initial_verification", return_value=True):
+            proved, subgoals, lemmas = mate.quick_run(
+                tmp, "template", "p", "./prompts_ours"
+            )
+        assert proved is False
+        assert subgoals == []
+        assert lemmas == [_LEMMA]
+        harvest.assert_not_called()
+        assert load_lemma_library(tmp) == []
+
+
+def _v_unsat(**kwargs) -> VampireResult:
+    payload = {"proved": True, "status": "unsat", "elapsed": 0.01}
+    payload.update(kwargs)
+    return VampireResult(**payload)
+
+
+def _v_timeout(**kwargs) -> VampireResult:
+    payload = {"proved": False, "status": "timeout", "elapsed": 0.2}
+    payload.update(kwargs)
+    return VampireResult(**payload)
+
+
+def _run_quick_vampire(tmp: str, *, delay: str, usefulness, harvest, retry=None):
+    import Mate_new_vampire as mate
+
+    env = dict(_HARVEST_ENV)
+    env["USEFULNESS_HARVEST_DELAY_S"] = delay
+    (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+    patches = [
+        patch.dict(os.environ, env),
+        patch("Mate_new_vampire.generate_lemmas_with_llm", return_value=[_LEMMA]),
+        patch(
+            "Mate_new_vampire.validate_lemmas_parallel",
+            side_effect=lambda _paths, lemmas, *_a, **_k: list(lemmas),
+        ),
+        patch("Mate_new_vampire.verify_combined_lemmas", side_effect=usefulness),
+        patch("Mate_new_vampire.run_vampire_routed", side_effect=harvest),
+    ]
+    if retry is not None:
+        patches.append(
+            patch("Mate_new_vampire.perform_initial_verification", side_effect=retry)
+        )
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        if retry is not None:
+            with patches[5]:
+                return mate.quick_run(tmp, "template", "p", "./prompts_ours")
+        return mate.quick_run(tmp, "template", "p", "./prompts_ours")
+
+
+def test_vampire_harvest_profiles_match_race() -> None:
+    assert tuple(HARVEST_VAMPIRE_PROFILES) == tuple(VAMPIRE_RACE_PROFILES)
+
+
+def test_vampire_exhausted_harvest_sets_skip_initial_diag() -> None:
+    import Mate_new_vampire as mate
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return True, [_LEMMA], _v_unsat(elapsed=0.08)
+
+    harvest = MagicMock(return_value=_v_timeout(induction_focus=["(P x)"]))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proved, subgoals, lemmas = _run_quick_vampire(
+            tmp, delay="0.03", usefulness=usefulness, harvest=harvest,
+        )
+        dispatch = mate.load_failed_lemmas(tmp, "template").get("harvest_dispatch") or {}
+        assert proved is True
+        assert subgoals == ["template_1"]
+        assert lemmas == [_LEMMA]
+        assert dispatch.get("skip_initial") == ["template_1"]
+        diag = (dispatch.get("skip_initial_diag") or {}).get("template_1") or {}
+        assert diag.get("status") == "timeout"
+        assert diag.get("proved") is False
+        assert diag.get("induction_focus") == ["(P x)"]
+        # Harvest uses the same paper schedule as usefulness / node prove.
+        assert harvest.call_count >= 1
+        # Harvest now goes through run_vampire_routed (serial dual / paper portfolio).
+        assert harvest.call_args[0][0]  # smt path
+        assert int(harvest.call_args[0][1]) > 0  # timeout
+
+
+def test_vampire_skip_initial_seeds_baseline() -> None:
+    import Mate_new_vampire as mate
+
+    initial = MagicMock(return_value=False)
+    harvested = VampireResult(
+        status="timeout",
+        stats={"Activation count": 12},
+        induction_focus=["(len xs)"],
+        elapsed=0.2,
+        strategy="struct_induction",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
+        with patch.dict(os.environ, {
+            "SOLVER_ROUTING": "off",
+            "LLM_LEMMA_DIAGNOSIS": "off",
+            "CHILD_LLM_ATTEMPTS": "1",
+        }), patch("Mate_new_vampire.perform_initial_verification", initial), patch(
+            "Mate_new_vampire.quick_run", return_value=(False, [], [])
+        ):
+            mate.prove_run(
+                tmp, "template", depth=1, skip_initial=True,
+                skip_initial_diag=mate._compact_vampire_diag(harvested),
+            )
+        initial.assert_not_called()
+        cached = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert cached is not None
+        assert cached.status == "timeout"
+        assert cached.stats["Activation count"] == 12
+        assert cached.induction_focus == ["(len xs)"]
+
+
+def test_vampire_harvest_retry_refreshes_baseline() -> None:
+    import Mate_new_vampire as mate
+
+    first = VampireResult(status="timeout", stats={"Generated clauses": 1}, strategy="a")
+    retry = VampireResult(status="timeout", stats={"Generated clauses": 9}, strategy="b")
+    with tempfile.TemporaryDirectory() as tmp:
+        smt = Path(tmp) / "template.smt2"
+        smt.write_text(_GOAL, encoding="utf-8")
+        mate._set_goal_only_baseline(
+            tmp, "template", first, context="initial_goal", replace=False,
+        )
+        with patch("Mate_new_vampire.run_vampire_routed", return_value=retry), patch.dict(
+            os.environ, {"SOLVER_ROUTING": "off"},
+        ):
+            ok = mate.perform_initial_verification(
+                smt, base_path=tmp, goal_name="template", log_event="harvest_retry",
+            )
+        assert ok is False
+        cached = mate._load_cached_diag(tmp, "template", "baseline_diag")
+        assert cached is not None
+        assert cached.stats["Generated clauses"] == 9
+        assert cached.strategy == "b"
+
+
+def test_vampire_incomplete_usefulness_still_harvests_local() -> None:
+    """Single-schedule Vampire often ends incomplete (not timeout); harvest must pin."""
+    from lemma_harvest import usefulness_fail_allows_local_harvest
+
+    assert usefulness_fail_allows_local_harvest("incomplete")
+    assert usefulness_fail_allows_local_harvest("timeout")
+
+    def usefulness(*_a, **_k):
+        time.sleep(0.08)
+        return False, [], _v_incomplete(elapsed=0.08)
+
+    harvest = MagicMock(return_value=_v_unsat())
+    retry = MagicMock(return_value=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proved, subgoals, lemmas = _run_quick_vampire(
+            tmp, delay="0.03", usefulness=usefulness, harvest=harvest, retry=retry,
+        )
+        stored = load_lemma_library(tmp)
+        assert proved is True
+        assert subgoals == []
+        assert lemmas == [_LEMMA]
+        assert len(stored) == 1
+        assert lemma_library_role(stored[0]) == "local"
+        retry.assert_called()
+        assert retry.call_args.kwargs.get("log_event") == "harvest_retry"
+
+
+def main() -> int:
+    test_fast_unsat_does_not_start_harvest()
+    test_timeout_harvest_local_retries_goal_without_prove_run()
+    test_cvc_unknown_usefulness_still_harvests_local()
+    test_slow_unsat_proved_harvest_skips_prove_run_and_initial()
+    test_exhausted_harvest_unsat_sets_skip_initial()
+    test_skip_initial_prove_run_does_not_call_initial()
+    test_harvest_retry_refreshes_goal_only_baseline()
+    test_library_off_disables_harvest()
+    test_vampire_harvest_profiles_match_race()
+    test_vampire_exhausted_harvest_sets_skip_initial_diag()
+    test_vampire_skip_initial_seeds_baseline()
+    test_vampire_harvest_retry_refreshes_baseline()
+    test_vampire_incomplete_usefulness_still_harvests_local()
+    print("lemma harvest tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

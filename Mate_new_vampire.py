@@ -1,0 +1,3775 @@
+import re
+import logging
+import sys
+import json
+import os
+import time
+import tempfile
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple, Optional, Dict, Any, Sequence, Set
+from logger_config import setup_colored_logger
+from env_config import setup_environment, setup_model
+from vampire_runner import (
+    run_vampire_with_timeout,
+    run_vampire,
+    run_vampire_diagnostic,
+    run_vampire_probe,
+    run_vampire_routed,
+    compute_progress_score,
+    derive_repair_hints,
+    extract_vampire_error_message,
+    vampire_diagnostic_profile,
+    VampireResult,
+)
+from cvc5_runner import verify_llm_goal_counterexample
+from solver_routing import (
+    GoalSearchState,
+    build_search_state,
+    fallback_profiles_for,
+    format_routing_for_prompt,
+    select_generation_prompt,
+    retarget_generation_prompt,
+    prompt_kind_signature,
+    V2_START_SIGNATURE,
+    NO_HELP_PROMPT_SWITCH,
+    probe_profile_count,
+    probe_timeout_s,
+    probes_enabled,
+    profile_utility_from_stats,
+    rank_profiles_for_attempt,
+    recommend_profiles,
+    record_pair_attempt,
+    record_profile_history,
+    collect_feedback_signal_kinds,
+    set_routing_candidates,
+    routing_enabled,
+)
+from profile_selector import (
+    choose_joint_action,
+    llm_selector_enabled,
+)
+from theory_features import analyze_smt
+from llm_time_budget import (
+    arm_task_deadline,
+    invoke_configured_chat,
+    remaining_task_s,
+    set_task_deadline,
+    usefulness_timeout_s,
+)
+from obligation_tree import (
+    add_proved_lemma,
+    append_attempt,
+    classify_failed_attempt,
+    format_obligation_prompt,
+    invalid_lemma_records,
+    invalid_lemmas_enabled,
+    invalid_lemmas_paper_mode,
+    last_normal_tree,
+    soft_rejected_lemma_records,
+    soft_rejected_memory_enabled,
+    lemma_library_enabled,
+    load_lemma_library,
+    make_child_node,
+    make_goal_tree,
+    materialize_smt_with_library,
+    merge_scheme_prelude_into_smt,
+    normalize_lemma_formula,
+    obligation_tree_enabled,
+    root_finish_prove_timeout_s,
+    solver_smt_content,
+    HARVEST_VAMPIRE_PROFILES,
+    HARVEST_DISPATCH_KEY,
+    local_lemma_harvest_enabled,
+    harvest_retry_timeout_s,
+    usefulness_harvest_delay_s,
+)
+from exp_flags import (
+    ancestor_prompt_enabled,
+    induction_scheme_enabled,
+    paper_schedule_prompt,
+    problem_profiler_enabled,
+    problem_profiler_trigger,
+    should_inject_problem_profiler,
+    progress_feedback_enabled,
+    prompt_retarget_active,
+    repair_hints_enabled,
+    resolve_prompt_pack,
+    unproved_not_invalid_enabled,
+    is_v2_strategy_mode,
+    vampire_collect_feedback_artifacts,
+)
+from ancestor_stack import (
+    AncestorStack,
+    empty_ancestor_stack,
+    extend_ancestors,
+    format_proof_path_goals_for_prompt,
+)
+from lemma_harvest import (
+    harvest_slot_kind,
+    make_harvest_slots,
+    run_usefulness_with_delayed_harvest,
+    usefulness_fail_allows_local_harvest,
+)
+from prompt_modes import apply_advice_system_instruction
+from lemma_gates import (
+    DIAGNOSIS_PROMPT_SUFFIX,
+    FINAL_DIAGNOSIS_PROMPT_SUFFIX,
+    allow_unmarked_lemma_output,
+    apply_static_lemma_screen,
+    attach_source_lemmas,
+    BENIGN_SCREEN_GATES,
+    ILLFORMED_SCREEN_GATES,
+    SOFT_SCREEN_GATES,
+    compact_repair_snapshot,
+    drop_failing_members,
+    format_attempt_feedback_for_prompt,
+    format_diagnosis_invalid_prompt,
+    format_soft_rejected_prompt,
+    infer_soft_reject_gate,
+    last_screen_records,
+    is_invalid_diagnosis_reason,
+    lemma_filter_drop_enabled,
+    lemma_known_invalid,
+    lemma_known_soft_rejected,
+    lemma_known_unproved,
+    lemma_same_as_goal,
+    add_revival_lemma,
+    promote_child_pending_lemmas,
+    seed_revival_from_unproved,
+    REVIVAL_ORIGIN_SITUATION_A,
+    llm_parse_retries,
+    llm_screen_retries,
+    format_screen_retry_user,
+    node_attempt_plan,
+    parse_final_diagnosis,
+    parse_llm_lemmas,
+    parse_llm_reason,
+    parse_llm_counterexample_smt,
+    llm_invalid_ce_verify_enabled,
+    llm_invalid_ce_retries,
+    format_ce_retry_user,
+    PROOF_SHAPE_HINT_BLOCK,
+    should_append_diagnosis_suffix,
+    should_accept_in_loop_invalid_goal,
+    should_append_proof_shape_hint,
+    should_run_final_diagnosis,
+    subgoal_sat_abort_enabled,
+    tree_status_from_child_data,
+    with_parse_retry_hint,
+    llm_invalid_only_stop_enabled,
+)
+from exp_stats import (
+    add_llm_time,
+    add_solver_time,
+    finalize_root_task,
+    log_exp,
+    log_library_inject,
+    log_prompt_blocks,
+    log_run_config,
+    log_subgoal_split,
+    record_llm_generation,
+)
+
+# 配置彩色日志
+logger = setup_colored_logger()
+config = setup_environment()
+# Vampire-only: serial dual prove floors for LLM wall budget (CVC Mate untouched).
+from vampire_runner import vampire_serial_dual_enabled as _vampire_serial_dual_enabled
+
+config["LLM_SERIAL_PROVE_BUDGET"] = bool(_vampire_serial_dual_enabled())
+
+# 初始化模型
+llm = setup_model(config)
+
+# Unique repair kinds all go into the prompt; only subgoal_failed is capped.
+_MAX_SUBGOAL_FAILED_HINTS = 2
+_MAX_PROGRESS_LEMMAS = 6
+_PROGRESS_SCORE_THRESHOLD = 0.5
+_DIAGNOSTIC_TIMEOUT = 3
+# Cheap failure-sidecar: score at most this many singleton lemmas (not pairs).
+_MAX_PROGRESS_DIAG_LEMMAS = 3
+
+# 在文件开头添加失败引理管理函数
+def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
+    """获取失败引理记录文件路径，根据目标名称生成对应文件"""
+    # 提取目标名称的后缀部分来构建文件名
+    if goal_name == "template":
+        filename = "failed_lemmas.json"
+    else:
+        # 提取template后面的部分，如template_1 -> _1, template_1_2 -> _1_2
+        suffix = goal_name.replace("template", "")
+        filename = f"failed_lemmas{suffix}.json"
+    
+    return Path(base_path) / filename
+
+def _empty_failed_data() -> dict:
+    return {
+        "invalid_lemmas": [],
+        "soft_rejected_lemmas": [],
+        "illformed_lemmas": [],
+        "useless_lemma_groups": [],
+        "progress_lemmas": [],
+        "progress_routing_signals": [],
+        "repair_hints": [],
+        "unproved_lemmas": [],
+        "revival_lemmas": [],
+        "routing": {},
+        "baseline_diag": {},
+        "baseline_diag_short": {},
+        "control_diag": {},
+        "obligation": {"attempts": [], "last_normal_tree_id": None},
+        "exp_attempts": [],
+        "node_outcome": {},
+        "last_llm_reason": "",
+        "last_llm_ce_smt": "",
+        "last_screen": [],
+        "llm_hints": {},
+    }
+
+def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
+    """加载失败引理记录（含 solver-guided repair hints）"""
+    failed_file = get_failed_lemmas_file(base_path, goal_name)
+    if failed_file.exists():
+        try:
+            with open(failed_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # Backward compatible defaults
+            data.setdefault("invalid_lemmas", [])
+            data.setdefault("soft_rejected_lemmas", [])
+            data.setdefault("illformed_lemmas", [])
+            data.setdefault("useless_lemma_groups", [])
+            data.setdefault("progress_lemmas", [])
+            data.setdefault("progress_routing_signals", [])
+            data.setdefault("repair_hints", [])
+            data.setdefault("unproved_lemmas", [])
+            seed_revival_from_unproved(data)
+            data.setdefault("routing", {})
+            data.setdefault("baseline_diag", {})
+            data.setdefault("baseline_diag_short", {})
+            data.setdefault("control_diag", {})
+            data.setdefault("obligation", {"attempts": [], "last_normal_tree_id": None})
+            data.setdefault("exp_attempts", [])
+            data.setdefault("node_outcome", {})
+            data.setdefault("last_llm_reason", "")
+            data.setdefault("last_llm_ce_smt", "")
+            data.setdefault("last_screen", [])
+            data.setdefault("llm_hints", {})
+            return data
+        except Exception as e:
+            logging.warning(f"加载失败引理文件出错: {e}")
+    return _empty_failed_data()
+
+def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
+    """保存失败引理记录"""
+    failed_file = get_failed_lemmas_file(base_path, goal_name)
+    tmp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            dir=failed_file.parent,
+            prefix=f".{failed_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_file = Path(f.name)
+            json.dump(failed_data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, failed_file)
+        logging.info(f"保存失败引理到: {failed_file.name}")
+    except Exception as e:
+        logging.error(f"保存失败引理文件出错: {e}")
+        if tmp_file is not None:
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+
+def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
+    """Hard invalid: solver-refuted or LLM/solver child write-back.
+
+    Module-2 / paper negative memory (``INVALID_LEMMAS`` not ``off``).
+    When mode is ``off``, this is a no-op. Formula already present keeps the
+    original reason (no append).
+    """
+    if not invalid_lemmas_enabled():
+        return
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    if lemma_known_invalid(lemma, failed_data.get("invalid_lemmas") or []):
+        return
+    lemma_record = {"lemma": lemma, "reason": reason}
+    failed_data["invalid_lemmas"].append(lemma_record)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
+    log_exp("invalid_lemma", goal=goal_name, reason=reason)
+
+
+def add_soft_rejected_lemma(
+    base_path: str,
+    goal_name: str,
+    lemma: str,
+    reason: str,
+    *,
+    gate: str = "",
+) -> None:
+    """Node-local suppression: not necessarily false; never hard INVALID.
+
+    Only when ``INVALID_LEMMAS=on`` (disabled for ``off`` and ``paper``).
+    """
+    if not soft_rejected_memory_enabled():
+        return
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    soft = failed_data.setdefault("soft_rejected_lemmas", [])
+    if lemma_known_soft_rejected(lemma, soft):
+        return
+    if lemma_known_invalid(lemma, invalid_lemma_records(failed_data)):
+        return
+    soft_gate = infer_soft_reject_gate(reason, gate=gate)
+    soft.append({"lemma": lemma, "reason": reason, "gate": soft_gate})
+    failed_data["soft_rejected_lemmas"] = soft[-40:]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(
+        "记录节点抑制引理到%s: %s - %s...",
+        goal_name, soft_gate, (lemma or "")[:50],
+    )
+    log_exp("soft_rejected_lemma", goal=goal_name, gate=soft_gate, reason=reason)
+
+
+def add_illformed_lemma(
+    base_path: str,
+    goal_name: str,
+    lemma: str,
+    reason: str,
+    *,
+    kind: str = "parse_error",
+) -> None:
+    """Record a syntax/type failure; never write mathematical ``invalid_lemmas``."""
+    gate = kind if kind in ILLFORMED_SCREEN_GATES else "parse_error"
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    records = failed_data.setdefault("illformed_lemmas", [])
+    key = normalize_lemma_formula(lemma) if lemma else ""
+    for item in records:
+        stored = item.get("lemma") if isinstance(item, dict) else item
+        if key and normalize_lemma_formula(str(stored or "")) == key:
+            return
+    records.append({"lemma": lemma, "reason": reason, "kind": gate})
+    failed_data["illformed_lemmas"] = records[-40:]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info("记录格式/类型错误引理到%s: %s - %s...", goal_name, gate, (lemma or "")[:50])
+    log_exp("illformed_lemma", goal=goal_name, kind=gate, reason=reason)
+
+
+def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str],
+                            meta: Optional[dict] = None):
+    """添加无用引理组合记录（可附带 Vampire 失败元信息）"""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    record: Any = lemma_group
+    if meta:
+        record = {"lemmas": lemma_group, **meta}
+    # Avoid exact duplicates (compare lemma lists)
+    existing = failed_data["useless_lemma_groups"]
+    for item in existing:
+        lemmas = item if isinstance(item, list) else item.get("lemmas", [])
+        if lemmas == lemma_group:
+            return
+    existing.append(record)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录无用引理组合到{goal_name}: {len(lemma_group)}条引理")
+    log_exp(
+        "useless_group",
+        goal=goal_name,
+        n_lemmas=len(lemma_group),
+        status=(meta or {}).get("status") if meta else None,
+        hint=(meta or {}).get("hint_kind") if meta else None,
+    )
+
+
+def save_last_screen(
+    base_path: str,
+    goal_name: str,
+    dropped: Sequence[Tuple[str, str, str]],
+) -> None:
+    """Overwrite the latest static-screen drops for the next LLM prompt."""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["last_screen"] = last_screen_records(dropped)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+def add_progress_lemma(base_path: str, goal_name: str, lemma: str,
+                       score: float, signals: List[str],
+                       *, profile: Optional[str] = None,
+                       profile_scores: Optional[dict] = None):
+    """记录对卡住目标有“进展”但尚未证出的引理（供下一轮优先复用/强化）。
+
+    暂时弃用 with ``FEEDBACK_PROGRESS`` (default off): no-op.
+    """
+    if not progress_feedback_enabled():
+        return
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    record = {"lemma": lemma, "score": score, "signals": signals}
+    if profile:
+        record["best_profile"] = profile
+    if profile_scores:
+        record["profile_scores"] = profile_scores
+    # Replace existing entry for same lemma
+    failed_data["progress_lemmas"] = [
+        r for r in failed_data["progress_lemmas"] if r.get("lemma") != lemma
+    ]
+    failed_data["progress_lemmas"].append(record)
+    # Keep top-N by score
+    failed_data["progress_lemmas"].sort(key=lambda r: r.get("score", 0), reverse=True)
+    failed_data["progress_lemmas"] = failed_data["progress_lemmas"][:_MAX_PROGRESS_LEMMAS]
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    logging.info(f"记录进展引理到{goal_name}: score={score:.2f} signals={signals}")
+    log_exp("progress_lemma", goal=goal_name, score=score, signals=signals, profile=profile)
+
+def _compact_repair_hints(hints: List[dict]) -> List[dict]:
+    """Keep the latest hint per kind; keep a short window of subgoal_failed."""
+    latest: Dict[str, dict] = {}
+    order: List[str] = []
+    subgoal_failed: List[dict] = []
+    for hint in hints:
+        kind = str(hint.get("kind") or "")
+        if kind == "subgoal_failed":
+            subgoal_failed.append(hint)
+            continue
+        if kind in latest:
+            order = [k for k in order if k != kind]
+        latest[kind] = hint
+        order.append(kind)
+    unique = [latest[k] for k in order]
+    return unique + subgoal_failed[-_MAX_SUBGOAL_FAILED_HINTS:]
+
+
+def add_repair_hints(base_path: str, goal_name: str, hints: List[dict]):
+    """追加 solver-guided repair hints（去重、截断）"""
+    if not repair_hints_enabled() or not hints:
+        return
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["repair_hints"] = _compact_repair_hints(
+        list(failed_data["repair_hints"]) + list(hints)
+    )
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    kinds = [str(h.get("kind") or "") for h in hints if h.get("kind")]
+    log_exp("repair_hints", goal=goal_name, kinds=kinds, n=len(kinds))
+
+def add_unproved_lemma(base_path: str, goal_name: str, lemma: str, meta: Optional[dict] = None):
+    """Lemma was useful for the parent but its own proof failed — not invalid."""
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data.setdefault("unproved_lemmas", [])
+    if lemma_known_unproved(lemma, failed_data["unproved_lemmas"]):
+        return
+    record = {"lemma": lemma, **(meta or {})}
+    failed_data["unproved_lemmas"].append(record)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    log_exp(
+        "unproved_lemma",
+        goal=goal_name,
+        status=(meta or {}).get("status"),
+        blocking=(meta or {}).get("blocking_subgoal"),
+    )
+
+
+def _set_node_outcome(
+    base_path: str, goal_name: str, *, kind: str, reason: str, source: str = ""
+) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["node_outcome"] = {
+        "kind": kind,
+        "reason": reason,
+        "source": source,
+    }
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    log_exp("node_outcome", goal=goal_name, kind=kind, reason=reason, source=source)
+
+
+def _store_last_llm_reason(base_path: str, goal_name: str, reason: Optional[str]) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["last_llm_reason"] = reason or ""
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _store_last_llm_ce_smt(base_path: str, goal_name: str, ce_smt: Optional[str]) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["last_llm_ce_smt"] = (ce_smt or "").strip()
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _accept_llm_invalid_diagnosis(
+    base_path: str,
+    goal_name: str,
+    reason: str,
+    *,
+    source: str,
+) -> Tuple[bool, str]:
+    """Accept LLM INVALID_GOAL: early-stop and optionally hard-invalid.
+
+    With ``LLM_INVALID_ONLY_STOP`` (default on): write ``kind=stopped`` and
+    return success so the child exits early, without parent hard INVALID.
+    With the flag off: write ``kind=invalid`` (optionally gated by CE verify).
+
+    Returns ``(accepted, reject_detail)``. ``reject_detail`` is non-empty when CE
+    verify rejected the claim (for optional same-slot CE retry).
+    """
+    text = (reason or "").strip()
+    if not text or not is_invalid_diagnosis_reason(text):
+        return False, ""
+    if llm_invalid_only_stop_enabled():
+        _set_node_outcome(
+            base_path, goal_name, kind="stopped", reason=text, source=source,
+        )
+        log_exp(
+            "llm_invalid_only_stop",
+            goal=goal_name,
+            source=source,
+            reason=text[:160],
+        )
+        return True, ""
+    if not llm_invalid_ce_verify_enabled():
+        _set_node_outcome(
+            base_path, goal_name, kind="invalid", reason=text, source=source,
+        )
+        return True, ""
+    ce = str(load_failed_lemmas(base_path, goal_name).get("last_llm_ce_smt") or "").strip()
+    if not ce:
+        log_exp(
+            "llm_invalid_ce_reject",
+            goal=goal_name,
+            source=source,
+            reason="missing_ce_smt",
+        )
+        logging.info("子目标 %s LLM invalid 缺 CE_SMT，不写入硬 invalid", goal_name)
+        return False, "missing_ce_smt"
+    smt_path = Path(base_path) / f"{goal_name}.smt2"
+    if not smt_path.exists():
+        log_exp(
+            "llm_invalid_ce_reject",
+            goal=goal_name,
+            source=source,
+            reason="missing_smt",
+        )
+        return False, "missing_smt"
+    ok, cex_reason = verify_llm_goal_counterexample(smt_path, ce)
+    if not ok:
+        detail = cex_reason or "ce_unverified"
+        log_exp(
+            "llm_invalid_ce_reject",
+            goal=goal_name,
+            source=source,
+            reason=detail,
+        )
+        logging.info(
+            "子目标 %s LLM CE 未通过求解器校验 (%s)，不写入硬 invalid",
+            goal_name,
+            detail,
+        )
+        return False, detail
+    combined = text
+    if cex_reason and cex_reason not in text:
+        combined = f"{text} | {cex_reason}"
+    if len(combined) > 600:
+        combined = combined[:597] + "..."
+    _set_node_outcome(
+        base_path, goal_name, kind="invalid", reason=combined, source=source,
+    )
+    log_exp(
+        "llm_invalid_ce_ok",
+        goal=goal_name,
+        source=source,
+        reason=combined[:160],
+    )
+    return True, ""
+
+
+def _record_blocking_lemma(
+    base_path: str, goal_name: str, lemma: str, meta: Optional[dict] = None
+) -> None:
+    """Situation A: useful for the parent, own proof failed.
+
+    With ``UNPROVED_NOT_INVALID`` on (default), record in ``unproved_lemmas``
+    (USEFUL BUT UNPROVED) and also ``revival_lemmas`` (diagnoser pool,
+    origin=situation_a). Never mark invalid.
+    With the flag off — or ``INVALID_LEMMAS=paper`` — keep the old
+    ``invalid_lemmas`` path (original LLM4Ind).
+    """
+    status = (meta or {}).get("status") or "useful_but_unproved"
+    use_unproved = unproved_not_invalid_enabled() and not invalid_lemmas_paper_mode()
+    if use_unproved:
+        add_unproved_lemma(base_path, goal_name, lemma, meta)
+        add_revival_lemma(
+            base_path, goal_name, lemma,
+            origin=REVIVAL_ORIGIN_SITUATION_A,
+            source_goal=goal_name,
+            status=status,
+            blocking_subgoal=(meta or {}).get("blocking_subgoal"),
+            load_failed_lemmas=load_failed_lemmas,
+            save_failed_lemmas=save_failed_lemmas,
+        )
+        return
+    blocking = (meta or {}).get("blocking_subgoal") or ""
+    reason = f"Subgoal proof failed ({blocking or status})"
+    add_invalid_lemma(base_path, goal_name, lemma, reason)
+
+
+def _lemmas_in_useless_groups(failed_data: dict) -> set:
+    members = set()
+    for group in failed_data.get("useless_lemma_groups") or []:
+        lemmas = group if isinstance(group, list) else group.get("lemmas", [])
+        members.update(lemmas)
+    return members
+
+
+def _lemma_for_blocking_subgoal(
+    parent_goal_name: str,
+    subgoal: str,
+    parent_lemmas: List[str],
+) -> Optional[str]:
+    """Map template_k / parent_k to the k-th parent lemma (1-based)."""
+    prefix = f"{parent_goal_name}_"
+    if not subgoal.startswith(prefix):
+        return None
+    rest = subgoal[len(prefix):]
+    if not rest.isdigit():
+        return None
+    idx = int(rest)
+    if 1 <= idx <= len(parent_lemmas):
+        return parent_lemmas[idx - 1]
+    return None
+
+
+def _current_goal_formula(base_path: str, goal_name: str) -> Optional[str]:
+    path = Path(base_path) / f"{goal_name}.smt2"
+    if not path.exists():
+        return None
+    try:
+        _assert, formula = extract_original_goal(
+            solver_smt_content(path.read_text(encoding="utf-8"), base_path)
+        )
+        return formula
+    except Exception:
+        return None
+
+
+def _promote_child_pending(
+    base_path: str,
+    parent_goal_name: str,
+    subgoal: str,
+    *,
+    blocking: Optional[str],
+) -> None:
+    n = promote_child_pending_lemmas(
+        base_path, parent_goal_name, subgoal,
+        blocking_lemma=blocking,
+        current_goal=_current_goal_formula(base_path, parent_goal_name),
+        library=load_lemma_library(base_path) if lemma_library_enabled() else [],
+        load_failed_lemmas=load_failed_lemmas,
+        save_failed_lemmas=save_failed_lemmas,
+    )
+    if n:
+        log_exp(
+            "revival_child_pending",
+            goal=parent_goal_name,
+            source=subgoal,
+            n=n,
+        )
+
+
+def _record_obligation_attempt(
+    base_path: str,
+    goal_name: str,
+    kind: str,
+    tree: Optional[dict] = None,
+) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data.setdefault("exp_attempts", [])
+    failed_data["exp_attempts"].append({
+        "kind": kind,
+        "has_tree": bool(tree),
+        "n_children": len((tree or {}).get("children") or []) if tree else 0,
+    })
+    if obligation_tree_enabled():
+        failed_data["obligation"] = append_attempt(
+            failed_data.get("obligation"), kind, tree
+        )
+    save_failed_lemmas(base_path, goal_name, failed_data)
+    log_exp("attempt_outcome", goal=goal_name, kind=kind, has_tree=bool(tree))
+    if tree:
+        log_subgoal_split(base_path, goal_name, tree.get("children") or [])
+
+
+def _child_obligation_node(
+    base_path: str,
+    subgoal: str,
+    formula: Optional[str],
+    status: str,
+    *,
+    depth: int = 0,
+    attempt: int = 0,
+) -> dict:
+    """Pin proved lemmas; nest last_normal_tree only when OBLIGATION_TREE is on.
+
+    When the flag is off, skip disk nest / failed-status remap.
+    Remap only changes the tree node's shown status
+    (failed/cancelled → invalid if this child is SAT / diagnosed invalid).
+    ``add_proved_lemma`` still runs — the library is independent of the tree.
+    """
+    children: List[dict] = []
+    lib_id = None
+    tree_status = status
+    tree_reason = None
+    if status == "proved" and formula:
+        lib_id = add_proved_lemma(
+            base_path, formula, origin=subgoal, attempt=attempt, depth=depth,
+            role="pin",
+        )
+    if obligation_tree_enabled():
+        if status == "proved" and formula:
+            nested = last_normal_tree(
+                load_failed_lemmas(base_path, subgoal).get("obligation")
+            )
+            if nested:
+                children = list(nested.get("children") or [])
+        elif status in ("failed", "cancelled"):
+            child_data = load_failed_lemmas(base_path, subgoal)
+            nested = last_normal_tree(child_data.get("obligation"))
+            if nested:
+                children = list(nested.get("children") or [])
+            remapped, remapped_reason = tree_status_from_child_data(child_data)
+            if remapped == "invalid":
+                tree_status, tree_reason = remapped, remapped_reason
+            elif status == "failed":
+                tree_status, tree_reason = remapped, remapped_reason
+    return make_child_node(
+        node_id=subgoal,
+        formula=formula,
+        status=tree_status,
+        lib=lib_id,
+        reason=tree_reason,
+        children=children,
+    )
+
+
+def _record_subgoal_split(
+    base_path: str,
+    base_name: str,
+    *,
+    proved: bool,
+    order: Sequence[str],
+    pre_proved: dict,
+    rec_nodes: Sequence[dict],
+    formula: Optional[str] = None,
+) -> None:
+    """Log the split attempt; assemble/store a tree only when OBLIGATION_TREE is on."""
+    if not obligation_tree_enabled():
+        _record_obligation_attempt(base_path, base_name, "obligation_tree")
+        return
+    rec_map = {node.get("id"): node for node in rec_nodes}
+    children = []
+    for name in order:
+        if name in pre_proved:
+            children.append(make_child_node(
+                node_id=name,
+                formula=(pre_proved.get(name) or {}).get("formula"),
+                status="proved",
+                lib=(pre_proved.get(name) or {}).get("lib"),
+            ))
+        elif name in rec_map:
+            children.append(rec_map[name])
+    if not children:
+        children = list(rec_nodes)
+    _record_obligation_attempt(
+        base_path,
+        base_name,
+        "obligation_tree",
+        tree=make_goal_tree(base_name, children, proved=proved, formula=formula),
+    )
+
+
+def load_routing_state(base_path: str, goal_name: str) -> GoalSearchState:
+    return GoalSearchState.from_dict(load_failed_lemmas(base_path, goal_name).get("routing"))
+
+def save_routing_state(base_path: str, goal_name: str, state: GoalSearchState) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["routing"] = state.to_dict()
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+def _diag_profile(base_path: str, goal_name: str) -> Optional[str]:
+    return load_routing_state(base_path, goal_name).active_profile
+
+
+def _compact_vampire_diag(result: VampireResult) -> dict:
+    return {
+        "proved": result.proved,
+        "status": result.status,
+        "elapsed": result.elapsed,
+        "strategy": result.strategy,
+        "stats": dict(result.stats or {}),
+        "induction_focus": list(result.induction_focus or []),
+        "induction_formulas": list(result.induction_formulas or []),
+        "induction_schemas": list(result.induction_schemas or []),
+        "induction_obligations": list(result.induction_obligations or []),
+        "portfolio_results": dict(result.portfolio_results or {}),
+    }
+
+
+def _vampire_diag_from_compact(data: Optional[dict]) -> Optional[VampireResult]:
+    if not isinstance(data, dict) or "status" not in data:
+        return None
+    return VampireResult(
+        proved=bool(data.get("proved", False)),
+        status=str(data.get("status", "unknown")),
+        elapsed=float(data.get("elapsed", 0.0) or 0.0),
+        strategy=str(data.get("strategy", "")),
+        stats=dict(data.get("stats") or {}),
+        induction_focus=list(data.get("induction_focus") or []),
+        induction_formulas=list(data.get("induction_formulas") or []),
+        induction_schemas=[
+            dict(item) for item in (data.get("induction_schemas") or [])
+            if isinstance(item, dict)
+        ],
+        induction_obligations=list(data.get("induction_obligations") or []),
+        portfolio_results=dict(data.get("portfolio_results") or {}),
+    )
+
+
+def _load_cached_diag(base_path: str, goal_name: str, key: str) -> Optional[VampireResult]:
+    return _vampire_diag_from_compact(load_failed_lemmas(base_path, goal_name).get(key))
+
+
+def _store_cached_diag(base_path: str, goal_name: str, key: str, result: VampireResult) -> None:
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data[key] = _compact_vampire_diag(result)
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+
+def _compact_harvest_diag(result: Any) -> Optional[dict]:
+    """JSON-safe harvest A⊢cᵢ dump for a skipped child initial prove."""
+    if not isinstance(result, VampireResult) or result.proved:
+        return None
+    return _compact_vampire_diag(result)
+
+
+def _record_failed_prove_diagnostics(
+    base_path: str,
+    goal_name: str,
+    result: VampireResult,
+    *,
+    context: str = "initial_goal",
+) -> None:
+    """Cache a failed goal-only prove as this node's progress/repair baseline."""
+    _set_goal_only_baseline(
+        base_path, goal_name, result, context=context, replace=False,
+    )
+
+
+def _set_goal_only_baseline(
+    base_path: str,
+    goal_name: str,
+    result: Optional[VampireResult],
+    *,
+    context: str,
+    replace: bool = False,
+) -> None:
+    """Store A ∪ Lib ⊢ G (no current C). Refresh when the library changed.
+
+    Do not use a usefulness mix as baseline: that run already contains candidate
+    lemmas, so progress signals would compare C_new against C_old.
+    """
+    if result is None or result.proved:
+        return
+    existing = _load_cached_diag(base_path, goal_name, "baseline_diag")
+    if existing is not None and not replace:
+        return
+    _store_cached_diag(base_path, goal_name, "baseline_diag", result)
+    add_repair_hints(
+        base_path, goal_name, derive_repair_hints(result, context=context),
+    )
+    if result.induction_focus:
+        logging.info("归纳焦点 (%s): %s", context, result.induction_focus[:4])
+
+
+def _record_subgoal_failure_feedback(
+    base_path: str,
+    parent_goal_name: str,
+    subgoal: str,
+    parent_lemmas: List[str],
+) -> None:
+    """Invalid child lemmas go on the parent. Situation A goes to unproved_lemmas
+    and the diagnoser revival pool; the child's revival pool may be promoted
+    as child_pending (not into USEFUL BUT UNPROVED).
+    """
+    child_profile = load_routing_state(base_path, subgoal).active_profile
+    blocking = _lemma_for_blocking_subgoal(parent_goal_name, subgoal, parent_lemmas)
+    child_data = load_failed_lemmas(base_path, subgoal)
+    tree_status, tree_reason = tree_status_from_child_data(child_data)
+    if blocking is not None:
+        if tree_status == "invalid":
+            add_invalid_lemma(
+                base_path, parent_goal_name, blocking,
+                tree_reason or f"Subgoal refuted ({subgoal})",
+            )
+        else:
+            _record_blocking_lemma(
+                base_path, parent_goal_name, blocking,
+                {
+                    "status": "useful_but_unproved",
+                    "blocking_subgoal": subgoal,
+                    "profile": child_profile,
+                },
+            )
+    _promote_child_pending(base_path, parent_goal_name, subgoal, blocking=blocking)
+    parent_state = load_routing_state(base_path, parent_goal_name)
+    child_state = load_routing_state(base_path, subgoal)
+    if child_state.active_profile:
+        parent_state = record_profile_history(
+            parent_state,
+            child_state.active_profile or "unknown",
+            status="subgoal_failed",
+            utility=0.0,
+            signals=["subgoal_failed"],
+        )
+        save_routing_state(base_path, parent_goal_name, parent_state)
+
+
+def _progress_singleton_lemmas(asserts: List[str]) -> List[str]:
+    """Lemmas to score after a failed usefulness check: skip tautologies, cap count."""
+    out: List[str] = []
+    for lemma in asserts:
+        if _is_trivial_equational_lemma(lemma):
+            continue
+        out.append(lemma)
+        if len(out) >= _MAX_PROGRESS_DIAG_LEMMAS:
+            break
+    return out
+
+def _result_has_stats(result: VampireResult) -> bool:
+    return any(int(v or 0) > 0 for v in (result.stats or {}).values())
+
+
+def _usefulness_has_mix_signal(result: VampireResult) -> bool:
+    """True when the failed A∧C→P run can yield a mix / focus hint."""
+    if result.proved:
+        return False
+    if _result_has_stats(result):
+        return True
+    return bool(
+        result.induction_focus
+        or result.induction_formulas
+        or result.induction_schemas
+        or result.induction_obligations
+    )
+
+
+def _record_failed_usefulness_mix(
+    base_path: str,
+    goal_name: str,
+    result: VampireResult,
+    lemmas: Optional[List[str]] = None,
+) -> None:
+    """Single-run mix from the failed full-timeout A∧C→P prove, not the 3s sidecar."""
+    if not _usefulness_has_mix_signal(result):
+        return
+    add_repair_hints(
+        base_path, goal_name,
+        attach_source_lemmas(
+            derive_repair_hints(result, context="usefulness_check"),
+            lemmas,
+            context="usefulness_check",
+        ),
+    )
+
+
+def record_solver_attempt(
+    base_path: Optional[str],
+    goal_name: Optional[str],
+    *,
+    prompt_strategy: Optional[str],
+    selected_profile: Optional[str],
+    result: VampireResult,
+) -> None:
+    """Persist one prompt/profile outcome for routing and experiment telemetry."""
+    if not base_path or not goal_name:
+        return
+    state = load_routing_state(base_path, goal_name)
+    has_stats = _result_has_stats(result)
+    hint_kinds = []
+    if has_stats:
+        hint_kinds = [
+            h.get("kind", "")
+            for h in derive_repair_hints(result, context="attempt")
+            if h.get("kind")
+        ]
+    fallback_used = bool(
+        result.strategy
+        and result.strategy in state.fallback_profiles
+        and result.strategy not in state.candidate_profiles
+    )
+    state = record_pair_attempt(
+        state,
+        prompt_strategy=prompt_strategy,
+        profile=selected_profile or state.active_profile,
+        status=result.status,
+        proved=result.proved,
+        elapsed=result.elapsed,
+        utility=None,
+        signals=hint_kinds,
+        fallback_used=fallback_used,
+        winner_profile=result.strategy if result.proved else None,
+    )
+    save_routing_state(base_path, goal_name, state)
+    if result.status != "invalid_lemma":
+        add_solver_time(base_path, result.elapsed, fallback=fallback_used)
+        log_exp(
+            "solver_run",
+            goal=goal_name,
+            status=result.status,
+            proved=result.proved,
+            elapsed=result.elapsed,
+            strategy=result.strategy,
+            fallback=fallback_used,
+            prompt=prompt_strategy,
+        )
+
+def format_solver_feedback_for_prompt(
+    failed_data: dict,
+    base_path: str = None,
+    depth: int = 0,
+    *,
+    current_formula: Optional[str] = None,
+    include_obligation: bool = True,
+) -> str:
+    """把 Vampire 失败/进展信号格式化进下一轮 LLM prompt。
+
+    Dynamic trial-and-error first; obligation/library only when
+    *include_obligation* (``create_prompt`` usually injects it earlier).
+    """
+    parts: List[str] = []
+
+    invalid_recs = invalid_lemma_records(failed_data)
+    if invalid_recs:
+        if invalid_lemmas_paper_mode():
+            parts.append(
+                "\n\n; IMPORTANT: The following lemmas are INVALID or CANNOT be "
+                "verified. DO NOT generate these lemmas:"
+            )
+            for i, record in enumerate(invalid_recs, 1):
+                parts.append(
+                    f"; Invalid lemma {i} ({record['reason']}): {record['lemma']}"
+                )
+        else:
+            parts.append(
+                "\n\nINVALID: The following lemmas are INVALID or CANNOT be verified. "
+                "Do not generate these lemmas, and do not weaken them; use the reason:"
+            )
+            for i, record in enumerate(invalid_recs, 1):
+                parts.append(
+                    f"  Invalid lemma {i} ({record['reason']}): {record['lemma']}"
+                )
+
+    soft_txt = format_soft_rejected_prompt(failed_data)
+    if soft_txt:
+        parts.append(soft_txt)
+
+    useless_members = _lemmas_in_useless_groups(failed_data)
+
+    attempt_txt = format_attempt_feedback_for_prompt(
+        failed_data,
+        backend="vampire",
+        include_stuck=repair_hints_enabled(),
+        current_goal=current_formula,
+    )
+    if attempt_txt:
+        parts.append(attempt_txt)
+
+    if progress_feedback_enabled() and failed_data.get("progress_lemmas"):
+        parts.append(
+            "\nSOLVER PROGRESS SIGNALS: singleton search changes vs control. "
+            "This is NOT proof of usefulness; a lemma here can still belong to a "
+            "failed combination. Prefer refining these, but do not resend the same group:"
+        )
+        for i, record in enumerate(failed_data["progress_lemmas"], 1):
+            signals = ", ".join(record.get("signals", []))
+            profile = record.get("best_profile")
+            profile_bit = f", profile={profile}" if profile else ""
+            in_group = (
+                ", in the last attempt: you may keep it"
+                if record.get("lemma") in useless_members else ""
+            )
+            parts.append(
+                f"  Progress lemma {i} (score={record.get('score', 0):.2f}; {signals}{profile_bit}{in_group}): "
+                f"{record['lemma']}"
+            )
+
+    if (
+        unproved_not_invalid_enabled()
+        and not invalid_lemmas_paper_mode()
+        and failed_data.get("unproved_lemmas")
+    ):
+        parts.append(
+            "\nUSEFUL BUT UNPROVED: these lemmas helped the parent goal but their "
+            "own proofs did not succeed. Do not discard them; generate weaker variants "
+            "or bridging lemmas for them:"
+        )
+        for i, record in enumerate(failed_data["unproved_lemmas"], 1):
+            parts.append(
+                f"  Unproved lemma {i} [{record.get('status', 'unknown')}]: {record.get('lemma')}"
+            )
+
+    if should_append_proof_shape_hint(failed_data):
+        parts.append(PROOF_SHAPE_HINT_BLOCK)
+
+    if routing_enabled():
+        routing_txt = format_routing_for_prompt(
+            GoalSearchState.from_dict(failed_data.get("routing"))
+        )
+        if routing_txt:
+            parts.append(routing_txt)
+
+    if include_obligation and base_path and (
+        lemma_library_enabled() or obligation_tree_enabled()
+    ):
+        lib_items = load_lemma_library(base_path)
+        try:
+            from induction_scheme.mate_glue import library_for_prompt
+
+            lib_items = library_for_prompt(lib_items, failed_data)
+        except Exception as exc:
+            logging.warning("INDUCTION_SCHEME library filter failed: %s", exc)
+        obligation_txt = format_obligation_prompt(
+            lib_items,
+            failed_data.get("obligation"),
+            depth=depth,
+        )
+        if obligation_txt:
+            parts.append(obligation_txt)
+
+    return "\n".join(parts)
+
+def create_prompt(
+    smt_file_content: str,
+    prompt_mode: str,
+    base_path: str = None,
+    goal_name: str = None,
+    folder_path: str = None,
+    depth: int = 0,
+    diagnosis_only: bool = False,
+    *,
+    ancestor_stack: AncestorStack = (),
+    current_formula: Optional[str] = None,
+) -> Tuple[list, str]:
+    """创建用于 LLM 的结构化消息列表。返回 (messages, 本轮追加的反馈文本)。"""
+    if folder_path is None:
+        raise ValueError("folder path of prompts must be provided")
+
+    with open(f"{folder_path}/{prompt_mode}/system_prompt.txt", "r", encoding="utf-8") as file:
+        system_prompt_content = apply_advice_system_instruction(file.read())
+    with open(f"{folder_path}/{prompt_mode}/user_prompt.txt", "r", encoding="utf-8") as file:
+        user_prompt_content = file.read()
+    # Order: SMT → profiler → obligation/library → ancestor → dynamic feedback → PROOF_SHAPE.
+    failed_info = ""
+    failed_data: dict = {}
+    if base_path and goal_name:
+        failed_data = load_failed_lemmas(base_path, goal_name)
+
+    if diagnosis_only:
+        if failed_data:
+            failed_info = format_diagnosis_invalid_prompt(failed_data)
+            log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
+    else:
+        if should_inject_problem_profiler(failed_data):
+            try:
+                from problem_profiler import (
+                    attempt_lemmas_from_failed_data,
+                    profile_prompt_block_for_smt,
+                )
+
+                library_items = []
+                if base_path and lemma_library_enabled():
+                    library_items = load_lemma_library(base_path)
+                attempt_lemmas = attempt_lemmas_from_failed_data(failed_data)
+                block = profile_prompt_block_for_smt(
+                    smt_file_content,
+                    problem_id=goal_name or "",
+                    current_goal=current_formula,
+                    library_items=library_items,
+                    attempt_lemmas=attempt_lemmas,
+                    cache_ns=base_path or goal_name or "",
+                )
+                if block:
+                    failed_info += block
+                    attempts_done = len(failed_data.get("exp_attempts") or [])
+                    log_exp(
+                        "problem_profiler_inject",
+                        goal=goal_name or "",
+                        n_chars=len(block),
+                        n_library=len(library_items),
+                        n_attempt_lemmas=len(attempt_lemmas),
+                        trigger=problem_profiler_trigger(),
+                        attempt=attempts_done + 1,
+                    )
+            except Exception as exc:
+                logging.warning("PROBLEM_PROFILER inject failed: %s", exc)
+        if induction_scheme_enabled():
+            try:
+                from induction_scheme.mate_glue import scheme_prompt_suffix
+
+                scheme_block = scheme_prompt_suffix(failed_data, goal_name=goal_name)
+                if scheme_block:
+                    failed_info += scheme_block
+            except Exception as exc:
+                logging.warning("INDUCTION_SCHEME prompt inject failed: %s", exc)
+        if base_path and (lemma_library_enabled() or obligation_tree_enabled()):
+            lib_items = load_lemma_library(base_path)
+            try:
+                from induction_scheme.mate_glue import library_for_prompt
+
+                lib_items = library_for_prompt(
+                    lib_items, failed_data, goal_name=goal_name,
+                )
+            except Exception as exc:
+                logging.warning("INDUCTION_SCHEME library filter failed: %s", exc)
+            obligation_txt = format_obligation_prompt(
+                lib_items,
+                failed_data.get("obligation"),
+                depth=depth,
+            )
+            if obligation_txt:
+                failed_info += obligation_txt
+        if ancestor_prompt_enabled():
+            path_txt = format_proof_path_goals_for_prompt(
+                current_id=goal_name or "",
+                current_depth=depth,
+                current_formula=current_formula or "",
+                stack=ancestor_stack,
+            )
+            if path_txt:
+                failed_info += path_txt
+        if base_path and goal_name:
+            failed_info += format_solver_feedback_for_prompt(
+                failed_data, base_path=base_path, depth=depth,
+                current_formula=current_formula,
+                include_obligation=False,
+            )
+            log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
+    
+    # 构建结构化消息列表
+    user_content = user_prompt_content.format(smt_file_content=smt_file_content) + failed_info
+    if diagnosis_only:
+        user_content += FINAL_DIAGNOSIS_PROMPT_SUFFIX
+    elif should_append_diagnosis_suffix(depth):
+        user_content += DIAGNOSIS_PROMPT_SUFFIX
+    
+    messages = [
+        {"role": "system", "content": system_prompt_content},
+        {"role": "user", "content": user_content}
+    ]
+    
+    return messages, failed_info
+
+def extract_balanced_forall(assert_not_content: str) -> Optional[str]:
+    """提取平衡的 forall 表达式"""
+    # 首先定位到 forall 的开始位置
+    start_match = re.search(r'\(\s*forall', assert_not_content)
+    if not start_match:
+        return None
+    
+    start_pos = start_match.start()
+    balance = 0
+    end_pos = start_pos
+    
+    # 从 forall 开始处扫描，找到平衡的右括号
+    for i, c in enumerate(assert_not_content[start_pos:]):
+        if c == '(':
+            balance += 1
+        elif c == ')':
+            balance -= 1
+            if balance == 0:
+                end_pos = start_pos + i + 1
+                break
+    
+    return assert_not_content[start_pos:end_pos]
+
+def parse_llm_response(
+    response: str, *, depth: int = 0, diagnosis_only: bool = False
+) -> List[str]:
+    """解析LLM输出，提取有效断言。"""
+    return parse_llm_lemmas(response, depth=depth, diagnosis_only=diagnosis_only)
+
+def _write_combined_smt(
+    original_assert: re.Match,
+    asserts: List[str],
+    original_content: str,
+    output_path: Path,
+    *,
+    named: bool = False,
+) -> None:
+    """Write SMT file with lemmas inserted into the proof-goal block."""
+    if named:
+        combined_asserts = "\n".join(
+            f"(assert (! {a} :named lemma_{i}))" for i, a in enumerate(asserts, 1)
+        )
+    else:
+        combined_asserts = "\n".join(f"(assert {a})" for a in asserts)
+
+    new_asserts_block = combined_asserts + "\n" + original_assert.group(1)
+    new_content = re.sub(
+        r'; proof goal\s*\(assert.*?\)\s*; proof goal end',
+        f'; proof goal\n{new_asserts_block}\n; proof goal end',
+        original_content,
+        flags=re.DOTALL,
+    )
+    output_path.write_text(new_content)
+
+
+def _first_datatype_name(smt_content: str) -> Optional[str]:
+    m = re.search(r'\(declare-datatypes\s*\(\s*\(\s*(\w+)', smt_content)
+    return m.group(1) if m else None
+
+
+def _control_lemma(smt_content: str) -> str:
+    """Build a well-typed tautological control for ADT or arithmetic goals."""
+    sort = _first_datatype_name(smt_content)
+    if sort is None:
+        if re.search(r"\bInt\b", smt_content):
+            sort = "Int"
+        elif re.search(r"\bReal\b", smt_content):
+            sort = "Real"
+    if sort:
+        return f"(forall ((x {sort})) (= x x))"
+    return "(= true true)"
+
+
+def _extract_binary_args(compact: str, op: str) -> Optional[Tuple[str, str]]:
+    m = re.search(rf"\(\s*{re.escape(op)}\s*", compact)
+    if not m:
+        return None
+    start = m.start()
+    bal = 0
+    end = None
+    for i, ch in enumerate(compact[start:], start):
+        if ch == "(":
+            bal += 1
+        elif ch == ")":
+            bal -= 1
+            if bal == 0:
+                end = i + 1
+                break
+    if end is None:
+        return None
+    inner = compact[m.end():end - 1].strip()
+    bal = 0
+    parts: List[str] = []
+    cur: List[str] = []
+    for ch in inner:
+        if ch == "(":
+            bal += 1
+            cur.append(ch)
+        elif ch == ")":
+            bal -= 1
+            cur.append(ch)
+        elif ch == " " and bal == 0:
+            if cur:
+                parts.append("".join(cur).strip())
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _is_trivial_equational_lemma(lemma: str) -> bool:
+    """Skip tautologies: (= t t), (=> P P), and (forall ((x T)) (= x x))."""
+    compact = re.sub(r"\s+", " ", lemma.strip())
+    for op in ("=", "=>"):
+        args = _extract_binary_args(compact, op)
+        if args and args[0] == args[1]:
+            return True
+    return bool(re.search(
+        r"\(\s*forall\s*\(\s*\(\s*\w+\s+\w+\s*\)\s*\)\s*\(\s*=\s*(\w+)\s+\1\s*\)\s*\)",
+        compact,
+    ))
+
+
+def _cached_diag_for_profile(cached, profile: Optional[str], *, resolver) -> Optional[object]:
+    """Reuse a 3s cache only when it was produced by the same diagnostic strategy."""
+    want = resolver(profile)
+    if cached is None or (cached.strategy or "") != want:
+        return None
+    return cached
+
+
+def analyze_lemma_progress(
+    original_assert: re.Match,
+    asserts: List[str],
+    original_content: str,
+    work_dir: Path,
+    goal_name: str,
+    base_path: str,
+) -> Tuple[List[str], VampireResult]:
+    """Failure sidecar: score singleton lemmas vs a 3s goal-only baseline (not the 60s prove).
+
+    暂时弃用 with ``FEEDBACK_PROGRESS`` (default off): no extra diagnostics.
+    """
+    if not progress_feedback_enabled():
+        return [], VampireResult(status="unknown")
+    diag = _diag_profile(base_path, goal_name)
+    want = vampire_diagnostic_profile(diag)
+    hint_baseline = _load_cached_diag(base_path, goal_name, "baseline_diag")
+    progress_baseline = _cached_diag_for_profile(
+        _load_cached_diag(base_path, goal_name, "baseline_diag_short"),
+        diag,
+        resolver=vampire_diagnostic_profile,
+    )
+    if progress_baseline is None:
+        stale = _load_cached_diag(base_path, goal_name, "baseline_diag_short")
+        if stale is not None:
+            logging.info(
+                "Vampire 3s baseline profile %s → %s，重跑 short diagnostic",
+                stale.strategy or "?",
+                want,
+            )
+        baseline_path = work_dir / f"{goal_name}_diag_baseline.smt2"
+        baseline_path.write_text(original_content)
+        progress_baseline = run_vampire_diagnostic(
+            baseline_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True, profile=diag
+        )
+        add_solver_time(base_path, progress_baseline.elapsed)
+        _store_cached_diag(base_path, goal_name, "baseline_diag_short", progress_baseline)
+        if hint_baseline is None:
+            _store_cached_diag(base_path, goal_name, "baseline_diag", progress_baseline)
+            hint_baseline = progress_baseline
+        else:
+            logging.info("Vampire progress 使用 3s short baseline；mix 来自失败的 60s A∧C→P")
+    else:
+        logging.info("复用缓存的 Vampire 3s progress baseline (profile=%s)", want)
+    if hint_baseline is None:
+        hint_baseline = progress_baseline
+
+    control = _cached_diag_for_profile(
+        _load_cached_diag(base_path, goal_name, "control_diag"),
+        diag,
+        resolver=vampire_diagnostic_profile,
+    )
+    if control is None:
+        control_lemma = _control_lemma(original_content)
+        control_path = work_dir / f"{goal_name}_diag_control.smt2"
+        _write_combined_smt(
+            original_assert, [control_lemma], original_content, control_path, named=False
+        )
+        control = run_vampire_diagnostic(
+            control_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True, profile=diag
+        )
+        add_solver_time(base_path, control.elapsed)
+        _store_cached_diag(base_path, goal_name, "control_diag", control)
+
+    progressive: List[Tuple[float, str, List[str]]] = []
+    observed_signals: List[str] = []
+    for idx, lemma in enumerate(_progress_singleton_lemmas(asserts), 1):
+        cand_path = work_dir / f"{goal_name}_diag_lemma_{idx}.smt2"
+        _write_combined_smt(original_assert, [lemma], original_content, cand_path, named=False)
+        cand = run_vampire_diagnostic(
+            cand_path, timeout=_DIAGNOSTIC_TIMEOUT, show_induction=True, profile=diag
+        )
+        add_solver_time(base_path, cand.elapsed)
+        score, signals = compute_progress_score(progress_baseline, cand, control=control)
+        observed_signals.extend(signals)
+        logging.info(
+            "诊断单条#%d score=%.2f signals=%s",
+            idx, score, signals,
+        )
+        if score >= _PROGRESS_SCORE_THRESHOLD:
+            progressive.append((score, lemma, signals))
+            add_progress_lemma(
+                base_path, goal_name, lemma, score, signals, profile=diag
+            )
+
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    failed_data["progress_routing_signals"] = collect_feedback_signal_kinds(
+        extra=observed_signals
+    )
+    save_failed_lemmas(base_path, goal_name, failed_data)
+
+    seen = set()
+    ordered: List[str] = []
+    for score, lemma, _ in sorted(progressive, key=lambda x: -x[0]):
+        if lemma not in seen:
+            seen.add(lemma)
+            ordered.append(lemma)
+    return ordered, hint_baseline
+
+
+def verify_combined_lemmas(
+    original_assert: re.Match,
+    asserts: List[str],
+    original_content: str,
+    output_path: Path,
+    *,
+    base_path: str = None,
+    goal_name: str = None,
+    prompt_strategy: Optional[str] = None,
+    solver_profile: Optional[str] = None,
+    decision_source: Optional[str] = None,
+) -> Tuple[bool, List[str], Optional[VampireResult]]:
+    """
+    有用性检查，对齐原文：只做一次整组 A∧C→P。
+    成功时保留全部引理（不做 ucore 剪枝）。
+    失败后用这次满超时 prove 的统计写 mix hint；不二次满超时、不枚举子集。
+    """
+    combined_timeout = usefulness_timeout_s(
+        int(config['COMBINED_CVC_TIMEOUT']),
+        serial_policy=bool(config.get("LLM_SERIAL_PROVE_BUDGET")),
+    )
+    work_dir = output_path.parent
+    gname = goal_name or output_path.stem
+
+    _write_combined_smt(original_assert, asserts, original_content, output_path, named=False)
+    state = load_routing_state(base_path, gname) if base_path else GoalSearchState()
+    if solver_profile:
+        set_routing_candidates(
+            state,
+            [solver_profile],
+            active_profile=solver_profile,
+            active_prompt=prompt_strategy,
+        )
+        state.decision_source = decision_source or state.decision_source
+        if base_path:
+            save_routing_state(base_path, gname, state)
+    want_artifacts = vampire_collect_feedback_artifacts()
+    useful_result = run_vampire_routed(
+        output_path,
+        timeout=combined_timeout,
+        state=state,
+        collect_stats=want_artifacts,
+        collect_ucore=False,
+        show_induction=want_artifacts,
+    )
+    record_solver_attempt(
+        base_path,
+        gname,
+        prompt_strategy=prompt_strategy,
+        selected_profile=solver_profile or state.active_profile,
+        result=useful_result,
+    )
+
+    log_exp(
+        "usefulness",
+        goal=gname,
+        proved=useful_result.proved,
+        status=useful_result.status,
+        elapsed=useful_result.elapsed,
+        strategy=useful_result.strategy,
+        n_lemmas=len(asserts),
+        n_kept=len(asserts) if useful_result.proved else 0,
+        profile=solver_profile or state.active_profile,
+    )
+    if useful_result.proved:
+        logging.info(
+            "组合引理证出目标；保留全部 %d 条引理（不做 ucore 剪枝）",
+            len(asserts),
+        )
+        return True, list(asserts), useful_result
+
+    progressive: List[str] = []
+    if base_path and goal_name:
+        meta = {"status": useful_result.status}
+        _record_failed_usefulness_mix(base_path, gname, useful_result, asserts)
+        if progress_feedback_enabled():
+            progressive, _baseline = analyze_lemma_progress(
+                original_assert, asserts, original_content, work_dir, gname, base_path
+            )
+            hint_kind = "partial_progress" if progressive else "no_progress"
+            meta["hint_kind"] = hint_kind
+            meta["progressive_count"] = len(progressive)
+            add_repair_hints(base_path, goal_name, attach_source_lemmas([{
+                "kind": hint_kind,
+                "context": "usefulness_check",
+                "detail": (
+                    "The full lemma group did not help Vampire prove the goal. "
+                    + (
+                        f"{len(progressive)} lemma(s) showed partial rewrite/induction progress; "
+                        "refine them or add bridging lemmas."
+                        if progressive else
+                        "No lemma showed measurable progress; try a different lemma shape "
+                        "(generalization / rewrite bridge)."
+                    )
+                ),
+                "induction_focus": useful_result.induction_focus[:6],
+                "progress_signals": load_failed_lemmas(
+                    base_path, goal_name
+                ).get("progress_routing_signals") or [],
+                "suggested_actions": [
+                    "Build on progress lemmas if any are listed above",
+                    "Target induction focus terms reported by Vampire",
+                    "Do not emit the exact same set unchanged; you may keep members and add lemmas.",
+                ],
+            }], asserts, context="usefulness_check"))
+        snapshot = compact_repair_snapshot(
+            load_failed_lemmas(base_path, goal_name).get("repair_hints") or []
+        )
+        if snapshot:
+            meta["repair_hints"] = snapshot
+        add_useless_lemma_group(
+            base_path,
+            goal_name,
+            asserts,
+            meta=meta,
+        )
+
+    return False, progressive, useful_result
+
+
+def perform_initial_verification(
+    goal_smt_file: Path,
+    *,
+    base_path: Optional[str] = None,
+    goal_name: Optional[str] = None,
+    log_event: str = "initial_prove",
+    timeout: Optional[int] = None,
+) -> bool:
+    """执行初始验证检查。timeout 仅覆盖本次调用，默认仍是 DEFAULT_CVC_TIMEOUT。"""
+    default_timeout = config['DEFAULT_CVC_TIMEOUT'] if timeout is None else int(timeout)
+    logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
+    routing_state = load_routing_state(str(goal_smt_file.parent), goal_smt_file.stem)
+    smt_path = goal_smt_file
+    if base_path and lemma_library_enabled():
+        n_lib = len(load_lemma_library(base_path))
+        log_library_inject(base_path, goal_name, n_lib, log_event)
+        smt_path = materialize_smt_with_library(goal_smt_file, base_path)
+    want_artifacts = vampire_collect_feedback_artifacts()
+    result = run_vampire_routed(
+        smt_path,
+        default_timeout,
+        collect_stats=want_artifacts,
+        show_induction=want_artifacts,
+        state=routing_state,
+    )
+    if log_event == "initial_prove" and routing_enabled() and base_path and goal_name:
+        record_solver_attempt(
+            base_path,
+            goal_name,
+            prompt_strategy=routing_state.active_prompt,
+            selected_profile=routing_state.active_profile,
+            result=result,
+        )
+    elif log_event == "initial_prove" and base_path:
+        add_solver_time(base_path, result.elapsed)
+        log_exp(
+            "solver_run",
+            goal=goal_name or goal_smt_file.stem,
+            status=result.status,
+            proved=result.proved,
+            elapsed=result.elapsed,
+            strategy=result.strategy,
+            fallback=False,
+            prompt="initial_prove",
+        )
+    elif base_path:
+        add_solver_time(base_path, result.elapsed)
+    log_exp(
+        log_event,
+        goal=goal_name or goal_smt_file.stem,
+        proved=result.proved,
+        status=result.status,
+        elapsed=result.elapsed,
+        strategy=result.strategy,
+        profile=routing_state.active_profile,
+    )
+    if result.proved:
+        logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
+        return True
+
+    if base_path and goal_name:
+        if log_event == "initial_prove":
+            _set_goal_only_baseline(
+                base_path, goal_name, result, context="initial_goal", replace=False,
+            )
+            logging.error(
+                "Vampire验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
+                result.status, result.elapsed, result.strategy,
+            )
+        elif log_event == "harvest_retry":
+            _set_goal_only_baseline(
+                base_path, goal_name, result,
+                context="harvest_retry", replace=True,
+            )
+            logging.info(
+                "再证当前目标未通过 (status=%s elapsed=%.2fs)；已用当前引理库刷新 baseline",
+                result.status, result.elapsed,
+            )
+        elif log_event == "root_finish_prove":
+            _set_goal_only_baseline(
+                base_path, goal_name, result,
+                context="root_finish_prove", replace=True,
+            )
+            logging.info(
+                "根节点收尾再证未通过 (status=%s elapsed=%.2fs)；已用当前引理库刷新 baseline",
+                result.status, result.elapsed,
+            )
+        else:
+            logging.info(
+                "再证当前目标未通过 (status=%s elapsed=%.2fs)",
+                result.status, result.elapsed,
+            )
+    return False
+
+
+def maybe_root_finish_prove(
+    base_path: str,
+    goal_name: str,
+    *,
+    depth: int,
+) -> bool:
+    """After root LLM attempts fail: one longer re-prove of the current goal."""
+    if int(depth) != 0:
+        return False
+    cap = root_finish_prove_timeout_s()
+    if cap <= 0:
+        log_exp(
+            "root_finish_prove_skip",
+            goal=goal_name,
+            reason="disabled",
+        )
+        return False
+    timeout = int(cap)
+    rem = remaining_task_s()
+    if rem is not None:
+        timeout = min(timeout, max(0, int(rem)))
+    if timeout < 1:
+        log_exp(
+            "root_finish_prove_skip",
+            goal=goal_name,
+            reason="no_time_budget",
+            remaining_s=rem,
+        )
+        return False
+    goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
+    logging.info(
+        "根节点 attempt 用尽，收尾再证 timeout=%ss (cap=%s)",
+        timeout, cap,
+    )
+    return perform_initial_verification(
+        goal_smt_file,
+        base_path=base_path,
+        goal_name=goal_name,
+        log_event="root_finish_prove",
+        timeout=timeout,
+    )
+
+
+def seed_baseline_repair_hints(
+    base_path: str,
+    goal_name: str,
+    goal_smt_file: Path,
+    *,
+    parent_goal_name: Optional[str] = None,
+) -> None:
+    """首次求助于 LLM 前：理论分流、短 probe。repair hints 来自首次 60s prove。"""
+    content = goal_smt_file.read_text(encoding="utf-8")
+    features = analyze_smt(content)
+    log_exp("theory_features", goal=goal_name, summary=features.summary())
+    parent_profile = None
+    if parent_goal_name:
+        parent_profile = load_routing_state(base_path, parent_goal_name).active_profile
+
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    hints = failed_data.get("repair_hints") or []
+    ranked_state = build_search_state(
+        "vampire",
+        features,
+        hints,
+        parent_profile=parent_profile,
+    )
+
+    if routing_enabled() and probes_enabled() and not llm_selector_enabled():
+        probe_names = recommend_profiles(
+            "vampire",
+            features,
+            hints,
+            parent_profile=parent_profile,
+        )[0][:probe_profile_count()]
+        probes = run_vampire_probe(goal_smt_file, probe_names, timeout=probe_timeout_s())
+        utilities: Dict[str, float] = {}
+        history = []
+        reference_name = next(
+            (
+                name for name in ("induction_portfolio", "struct_induction", "struct_induction_tip")
+                if name in probes
+            ),
+            next(iter(probes), None),
+        )
+        reference = probes.get(reference_name) if reference_name else None
+        for name, res in probes.items():
+            if res.proved:
+                util, signals = (100.0, ["proved"])
+            elif name == reference_name or reference is None:
+                util, signals = (0.0, ["reference_profile"])
+            else:
+                util, signals = profile_utility_from_stats(
+                    backend="vampire",
+                    proved=res.proved,
+                    status=res.status,
+                    stats=res.stats,
+                    elapsed=res.elapsed,
+                    reference_stats=reference.stats,
+                    reference_elapsed=reference.elapsed,
+                )
+            utilities[name] = util
+            history.append({
+                "profile": name,
+                "status": res.status,
+                "utility": round(util, 3),
+                "signals": signals[:6],
+            })
+            logging.info(
+                "vampire probe %s utility=%.2f status=%s signals=%s",
+                name, util, res.status, signals,
+            )
+            add_solver_time(base_path, res.elapsed)
+        state = build_search_state(
+            "vampire",
+            features,
+            hints,
+            parent_profile=parent_profile,
+            utilities=utilities,
+            history=history,
+        )
+    elif llm_selector_enabled():
+        ranked_profiles, reasons = recommend_profiles(
+            "vampire",
+            features,
+            hints,
+            parent_profile=parent_profile,
+        )
+        decision = choose_joint_action(
+            llm=llm,
+            backend="vampire",
+            features=features,
+            candidate_profiles=ranked_profiles,
+            prompt_strategies=[
+                "prove_prompt_equational_reasoning",
+                "prove_prompt_term_rewrite",
+            ],
+            hints=hints,
+        )
+        state = ranked_state
+        state.routing_reasons = reasons
+        set_routing_candidates(
+            state,
+            [decision.profile],
+            active_profile=decision.profile,
+            active_prompt=decision.prompt_strategy,
+        )
+        state.decision_mode = "llm"
+        state.decision_source = decision.source
+        state.decision_confidence = decision.confidence
+        state.routing_reasons.append(f"decision:{decision.reason}")
+        log_exp(
+            "llm_selector",
+            goal=goal_name,
+            profile=decision.profile,
+            prompt=decision.prompt_strategy,
+            source=decision.source,
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+    else:
+        state = ranked_state
+
+    save_routing_state(base_path, goal_name, state)
+    logging.info(
+        "vampire routing: active=%s candidates=%s reasons=%s",
+        state.active_profile, state.candidate_profiles, state.routing_reasons,
+    )
+    log_exp(
+        "routing_seed",
+        goal=goal_name,
+        profile=state.active_profile,
+        candidates=state.candidate_profiles,
+        mode=state.decision_mode,
+        reasons=state.routing_reasons,
+    )
+
+
+def select_attempt_action(
+    base_path: str,
+    goal_name: str,
+    prompt_strategies: List[str],
+    *,
+    parent_goal_name: Optional[str] = None,
+    preferred_prompt: Optional[str] = None,
+) -> Tuple[GoalSearchState, object]:
+    """Select the next prompt/profile pair after the latest feedback."""
+    goal_file = Path(base_path) / f"{goal_name}.smt2"
+    content = goal_file.read_text(encoding="utf-8")
+    features = analyze_smt(content)
+    failed_data = load_failed_lemmas(base_path, goal_name)
+    state = GoalSearchState.from_dict(failed_data.get("routing"))
+    parent_profile = state.parent_profile
+    if not parent_profile and parent_goal_name:
+        parent_profile = load_routing_state(base_path, parent_goal_name).active_profile
+    state.backend = "vampire"
+    state.theory_features = features.to_dict()
+    state.parent_profile = parent_profile
+    if not state.fallback_profiles:
+        state.fallback_profiles = fallback_profiles_for("vampire")
+    hints = failed_data.get("repair_hints") or []
+    utilities = {
+        item.get("profile"): float(item.get("utility"))
+        for item in state.profile_history
+        if item.get("profile") and item.get("utility") is not None
+    }
+    sidecar = progress_feedback_enabled()
+    ranked, candidates, reasons = rank_profiles_for_attempt(
+        "vampire",
+        features,
+        hints,
+        parent_profile=parent_profile,
+        current_profile=state.active_profile,
+        progress_lemmas=(failed_data.get("progress_lemmas") or []) if sidecar else [],
+        extra_signals=(failed_data.get("progress_routing_signals") or []) if sidecar else [],
+        probe_utilities=utilities or None,
+    )
+    if llm_selector_enabled():
+        decision = choose_joint_action(
+            llm=llm,
+            backend="vampire",
+            features=features,
+            candidate_profiles=ranked,
+            prompt_strategies=prompt_strategies,
+            hints=hints,
+            history=state.pair_history,
+            current_profile=state.active_profile,
+            current_prompt=preferred_prompt or state.active_prompt,
+        )
+        state = set_routing_candidates(
+            state,
+            [decision.profile],
+            active_profile=decision.profile,
+            active_prompt=decision.prompt_strategy,
+        )
+        state.decision_mode = "llm"
+    else:
+        decision = choose_joint_action(
+            llm=None,
+            backend="vampire",
+            features=features,
+            candidate_profiles=candidates,
+            prompt_strategies=prompt_strategies,
+            hints=hints,
+            history=state.pair_history,
+            current_profile=state.active_profile,
+            current_prompt=preferred_prompt or state.active_prompt,
+        )
+        state = set_routing_candidates(
+            state,
+            candidates,
+            active_profile=decision.profile,
+            active_prompt=decision.prompt_strategy,
+        )
+        state.decision_mode = "relative"
+    state.routing_reasons = (state.routing_reasons + reasons)[-8:]
+    state.decision_source = getattr(decision, "source", "static")
+    state.decision_confidence = getattr(decision, "confidence", 0.0)
+    save_routing_state(base_path, goal_name, state)
+    log_exp(
+        "attempt_action",
+        goal=goal_name,
+        prompt=getattr(decision, "prompt_strategy", None) or preferred_prompt,
+        profile=getattr(decision, "profile", None) or state.active_profile,
+        source=state.decision_source,
+        mode=state.decision_mode,
+        confidence=state.decision_confidence,
+        reasons=state.routing_reasons[-4:],
+        parent_profile=parent_profile,
+    )
+    return state, decision
+
+
+def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
+    """提取原始目标断言和forall表达式"""
+    original_assert = re.search(
+        r'; proof goal\s*(\(assert.*?\))\s*; proof goal end',
+        smt_content,
+        flags=re.DOTALL
+    )
+    original_forall = extract_balanced_forall(original_assert.group(1))
+    logging.info(f"提取到原始目标: {original_assert.group(1)}, forall 表达式: {original_forall}")
+    return original_assert, original_forall
+
+def generate_lemmas_with_llm(
+    smt_content: str,
+    prompt_strategy: str,
+    goal_smt_file: Path,
+    base_path: str,
+    goal_name: str,
+    folder_path: str,
+    depth: int = 0,
+    diagnosis_only: bool = False,
+    *,
+    ancestor_stack: AncestorStack = (),
+    current_formula: Optional[str] = None,
+    extra_user: Optional[str] = None,
+    skip_hint_refresh: bool = False,
+) -> List[str]:
+    """使用LLM生成引理。diagnosis_only 时只鉴定当前目标是否 invalid。
+
+    格式解析失败时在同一次 attempt 内按 LLM_PARSE_RETRIES 再请求，不立刻消耗下一轮 attempt。
+    extra_user 追加一轮用户说明（静态筛 kept=0 重生）；skip_hint_refresh 保留与 CVC 对齐。
+    """
+    logging.info(
+        "即将使用LLM%s, 目标文件: %s, 提示策略: %s",
+        "鉴定当前目标" if diagnosis_only else "生成引理",
+        goal_smt_file,
+        prompt_strategy,
+    )
+    formula = current_formula
+    if formula is None and not diagnosis_only:
+        try:
+            _assert, formula = extract_original_goal(smt_content)
+        except Exception:
+            formula = None
+    messages, feedback = create_prompt(
+        smt_content, prompt_strategy, base_path, goal_name, folder_path,
+        depth=depth, diagnosis_only=diagnosis_only,
+        ancestor_stack=ancestor_stack,
+        current_formula=formula,
+    )
+    if extra_user:
+        messages = list(messages) + [{"role": "user", "content": extra_user}]
+    system_text = (messages[0].get("content") if messages else "") or ""
+    extra_retries = 0 if diagnosis_only else llm_parse_retries()
+    call_messages = list(messages)
+    extracted_asserts: List[str] = []
+    raw = ""
+    strategy_name = (
+        f"{prompt_strategy}|final_diagnosis" if diagnosis_only else prompt_strategy
+    )
+
+    for call_i in range(1 + extra_retries):
+        started = time.time()
+        parse_error = None
+        extracted_asserts = []
+        raw = ""
+        user_text = "\n\n".join(
+            str(item.get("content") or "")
+            for item in call_messages
+            if str(item.get("role") or "") == "user"
+        )
+        try:
+            response, budget = invoke_configured_chat(llm, call_messages, config)
+            if budget.apply:
+                log_exp(
+                    "llm_budget",
+                    goal=goal_name,
+                    timeout_s=budget.timeout_s,
+                    http_retries=budget.max_retries,
+                    usefulness_reserve_s=budget.usefulness_reserve_s,
+                    remaining_s=remaining_task_s(),
+                )
+            raw = getattr(response, "content", "") or ""
+            try:
+                extracted_asserts = parse_llm_response(
+                    raw, depth=depth, diagnosis_only=diagnosis_only
+                )
+            except ValueError as exc:
+                if allow_unmarked_lemma_output(
+                    raw, diagnosis_only=diagnosis_only, depth=depth
+                ):
+                    extracted_asserts = []
+                else:
+                    parse_error = str(exc)
+        except Exception as exc:
+            parse_error = str(exc)
+            elapsed = time.time() - started
+            add_llm_time(base_path, elapsed)
+            record_llm_generation(
+                base_path,
+                goal=goal_name,
+                strategy=strategy_name,
+                prompt_folder=folder_path,
+                smt_file=str(goal_smt_file),
+                system_text=system_text,
+                user_text=user_text,
+                feedback=feedback,
+                lemmas=extracted_asserts,
+                elapsed=elapsed,
+                parse_error=parse_error,
+                raw=raw,
+            )
+            raise
+
+        elapsed = time.time() - started
+        add_llm_time(base_path, elapsed)
+        record_llm_generation(
+            base_path,
+            goal=goal_name,
+            strategy=strategy_name,
+            prompt_folder=folder_path,
+            smt_file=str(goal_smt_file),
+            system_text=system_text,
+            user_text=user_text,
+            feedback=feedback,
+            lemmas=extracted_asserts,
+            elapsed=elapsed,
+            parse_error=parse_error,
+            raw=raw,
+        )
+        if parse_error:
+            remaining = extra_retries - call_i
+            if remaining > 0:
+                logging.warning(
+                    "LLM 输出无法解析，同一次 attempt 再请求 (%d 次剩余): %s",
+                    remaining,
+                    parse_error,
+                )
+                log_exp(
+                    "parse_retry",
+                    goal=goal_name,
+                    retry=call_i + 1,
+                    remaining=remaining,
+                    max_retries=extra_retries,
+                )
+                call_messages = with_parse_retry_hint(messages, raw)
+                continue
+            logging.warning("LLM 输出无法解析，重试已用尽: %s", parse_error)
+            log_exp(
+                "parse_retry_exhausted",
+                goal=goal_name,
+                retry=call_i + 1,
+                max_retries=extra_retries,
+            )
+            raise ValueError(parse_error)
+
+        if diagnosis_only:
+            verdict, reason = parse_final_diagnosis(raw)
+            _store_last_llm_reason(
+                base_path, goal_name,
+                (reason or "invalid") if verdict == "invalid" else "failed",
+            )
+            _store_last_llm_ce_smt(
+                base_path, goal_name,
+                parse_llm_counterexample_smt(raw) if verdict == "invalid" else None,
+            )
+        elif extracted_asserts:
+            _store_last_llm_reason(base_path, goal_name, None)
+            _store_last_llm_ce_smt(base_path, goal_name, None)
+        elif should_accept_in_loop_invalid_goal(depth):
+            _store_last_llm_reason(base_path, goal_name, parse_llm_reason(raw))
+            _store_last_llm_ce_smt(
+                base_path, goal_name, parse_llm_counterexample_smt(raw),
+            )
+        return extracted_asserts
+
+    return extracted_asserts
+
+def normalize_formula(formula: str) -> str:
+    """增强的公式标准化函数"""
+    # 1. 清理空白字符
+    formula = re.sub(r'\s+', ' ', formula.strip())
+    
+    # 2. 查找forall关键字
+    forall_pos = formula.find('forall')
+    if forall_pos == -1:
+        return formula
+    
+    # 3. 手动解析变量定义部分
+    ptr = forall_pos + len('forall')
+    while ptr < len(formula) and formula[ptr] in ' \t\n':
+        ptr += 1
+    
+    if ptr >= len(formula) or formula[ptr] != '(':
+        return formula
+    
+    # 找到变量定义部分的结束位置
+    balance = 0
+    var_def_start = ptr
+    for i in range(ptr, len(formula)):
+        if formula[i] == '(':
+            balance += 1
+        elif formula[i] == ')':
+            balance -= 1
+            if balance == 0:
+                var_def_end = i + 1
+                break
+    else:
+        return formula
+    
+    # 提取变量定义和公式体
+    var_section = formula[var_def_start+1:var_def_end-1]
+    body_start = var_def_end
+    while body_start < len(formula) and formula[body_start] in ' \t\n':
+        body_start += 1
+    
+    # 找到公式体
+    balance = 0
+    body_end = len(formula)
+    for i in range(body_start, len(formula)):
+        if formula[i] == '(':
+            balance += 1
+        elif formula[i] == ')':
+            balance -= 1
+            if balance == 0:
+                body_end = i + 1
+                break
+    
+    body = formula[body_start:body_end]
+    
+    # 4. 解析变量定义
+    var_defs = re.findall(r'\(\s*(\w+)\s+(\w+)\s*\)', var_section)
+    if not var_defs:
+        return formula
+    
+    # 5. 创建变量映射
+    var_map = {var: f'a{i}' for i, (var, _) in enumerate(var_defs)}
+    
+    # 6. 替换变量
+    normalized_body = body
+    for old_var, new_var in sorted(var_map.items(), key=lambda x: -len(x[0])):
+        normalized_body = re.sub(rf'\b{re.escape(old_var)}\b', new_var, normalized_body)
+    
+    # 7. 重构公式
+    normalized_vars = ' '.join(f'({var_map[var]} {typ})' for var, typ in var_defs)
+    return f'(forall ({normalized_vars}) {normalized_body})'
+
+def extract_equality_parts(formula: str):
+    """提取等式的左右两部分"""
+    # 查找最外层的等式
+    eq_start = formula.rfind('(=')
+    if eq_start == -1:
+        return None, None
+    
+    # 找到等式的结束位置
+    balance = 0
+    eq_end = len(formula)
+    for i in range(eq_start, len(formula)):
+        if formula[i] == '(':
+            balance += 1
+        elif formula[i] == ')':
+            balance -= 1
+            if balance == 0:
+                eq_end = i + 1
+                break
+    
+    # 提取等式内容（去掉 "(= " 和 ")"）
+    eq_content = formula[eq_start + 3:eq_end - 1].strip()
+    
+    # 手动解析左右两部分
+    balance = 0
+    parts = []
+    current_part = ""
+    
+    for char in eq_content:
+        if char == '(':
+            balance += 1
+            current_part += char
+        elif char == ')':
+            balance -= 1
+            current_part += char
+        elif char == ' ' and balance == 0:
+            if current_part.strip():
+                parts.append(current_part.strip())
+                current_part = ""
+        else:
+            current_part += char
+    
+    if current_part.strip():
+        parts.append(current_part.strip())
+    
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return None, None
+
+def normalize_equality_order(formula: str) -> str:
+    """标准化等式的左右顺序"""
+    # 提取等式的左右部分
+    left, right = extract_equality_parts(formula)
+    if left is None or right is None:
+        return formula
+    
+    # 按字典序排序，确保相同的等式有统一的顺序
+    if left <= right:
+        return formula  # 已经是标准顺序
+    else:
+        # 交换左右顺序 - 需要找到并替换完整的等式部分
+        eq_start = formula.rfind('(=')
+        if eq_start == -1:
+            return formula
+            
+        # 找到等式的结束位置
+        balance = 0
+        eq_end = len(formula)
+        for i in range(eq_start, len(formula)):
+            if formula[i] == '(':
+                balance += 1
+            elif formula[i] == ')':
+                balance -= 1
+                if balance == 0:
+                    eq_end = i + 1
+                    break
+        
+        # 构造新的等式
+        new_equality = f'(= {right} {left})'
+        return formula[:eq_start] + new_equality + formula[eq_end:]
+
+def are_formulas_equivalent(formula1: str, formula2: str) -> bool:
+    """增强的公式等价性检查"""
+    try:
+        # 1. 标准化两个公式
+        norm1 = normalize_formula(formula1)
+        norm2 = normalize_formula(formula2)
+        
+        # 2. 标准化等式顺序
+        norm1 = normalize_equality_order(norm1)
+        norm2 = normalize_equality_order(norm2)
+        
+        # 3. 比较标准化后的公式（含 α 换元）
+        return norm1 == norm2 or lemma_same_as_goal(norm1, norm2)
+        
+    except Exception as e:
+        print(f"标准化过程出错: {e}，回退到简单比较")
+        return formula1.strip() == formula2.strip() or lemma_same_as_goal(
+            formula1, formula2
+        )
+
+
+def validate_lemmas_against_original(extracted_asserts: List[str], original_forall: str, base_path: str, goal_name: str) -> List[str]:
+    """Drop members that restated the goal. Empty means the group cannot continue."""
+    kept, dropped = drop_failing_members(
+        extracted_asserts,
+        lambda lemma: (
+            "Same as original goal"
+            if are_formulas_equivalent(lemma, original_forall)
+            else None
+        ),
+    )
+    for assert_stmt, _reason in dropped:
+        logging.error("引理与原目标相同，已排除: %s", assert_stmt[:80])
+        add_soft_rejected_lemma(
+            base_path, goal_name, assert_stmt, "Same as original goal",
+            gate="same_as_goal",
+        )
+    if dropped and kept:
+        log_exp(
+            "lemma_filter_drop",
+            goal=goal_name,
+            gate="same_as_goal",
+            dropped=len(dropped),
+            kept=len(kept),
+        )
+    return kept
+
+
+def create_validation_files(extracted_asserts: List[str], smt_content: str, 
+                          smt_file_path: Path, goal_smt_name: str) -> List[Path]:
+    """创建引理有效性验证文件"""
+    valid_check_paths = []
+    for i, assert_stmt in enumerate(extracted_asserts, 1):
+        valid_content = re.sub(
+            r'; proof goal\s*\(assert.*?\)\s*; proof goal end',
+            f'; proof goal\n(assert {assert_stmt})\n; proof goal end',
+            smt_content,
+            flags=re.DOTALL
+        )
+        valid_path = smt_file_path / f"{goal_smt_name}_valid_{i}.smt2"
+        valid_path.write_text(valid_content)
+        valid_check_paths.append(valid_path)
+    return valid_check_paths
+
+
+def verify_single_lemma(valid_path: Path) -> Tuple[Path, VampireResult]:
+    """验证单个引理的有效性（assert lemma 若 unsat ⇒ 与公理矛盾 ⇒ invalid）"""
+    logging.info(f"开始检查有效性: {valid_path.name}")
+    result = run_vampire(valid_path, timeout=1, collect_stats=False)
+    add_solver_time(str(valid_path.parent), result.elapsed)
+    logging.info(
+        f"检查有效性: {valid_path.name} 结束，proved={result.proved} status={result.status}"
+    )
+    return valid_path, result
+
+
+def validate_lemmas_parallel(
+    valid_check_paths: List[Path],
+    lemmas: Sequence[str],
+    base_path: str,
+    goal_name: str,
+) -> List[str]:
+    """1s 有效性：与公理矛盾 / error 的成员记 invalid 并丢掉。
+
+    ``LEMMA_FILTER_DROP`` 开启时返回其余成员；关闭时任一失败则返回空列表。
+    """
+    lemma_by_path = {
+        path: lemma for path, lemma in zip(valid_check_paths, lemmas)
+    }
+    bad = set()
+    max_workers = min(len(valid_check_paths), 4) if valid_check_paths else 1
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {executor.submit(verify_single_lemma, path): path 
+                         for path in valid_check_paths}
+        
+        for future in as_completed(future_to_path):
+            try:
+                valid_path, result = future.result()
+                lemma_content = lemma_by_path.get(valid_path) or extract_lemma_from_file(valid_path)
+                if result.proved:
+                    logging.warning(f"发现无效引理: {valid_path.name}")
+                    bad.add(valid_path)
+                    if lemma_content:
+                        add_invalid_lemma(
+                            base_path, goal_name, lemma_content,
+                            f"contradicts axioms (vampire={result.status})",
+                        )
+                elif result.status == "error":
+                    err = (result.error or "").strip() or extract_vampire_error_message(
+                        getattr(result, "stdout", "") or "",
+                        getattr(result, "stderr", "") or "",
+                    ) or "unknown"
+                    logging.error(f"引理检查出错: {valid_path.name}: {err}")
+                    bad.add(valid_path)
+                    if lemma_content:
+                        add_soft_rejected_lemma(
+                            base_path, goal_name, lemma_content,
+                            f"vampire error: {err}",
+                            gate="solver_error",
+                        )
+                else:
+                    logging.info(
+                        f"1s 未证伪，进入有用性: {valid_path.name} (status={result.status})"
+                    )
+            except Exception as e:
+                path = future_to_path[future]
+                logging.error(f"验证引理 {path.name} 时发生异常: {e}")
+                bad.add(path)
+                lemma_content = lemma_by_path.get(path) or extract_lemma_from_file(path)
+                if lemma_content:
+                    add_soft_rejected_lemma(
+                        base_path, goal_name, lemma_content, f"验证异常: {e}",
+                        gate="verify_exception",
+                    )
+    
+    if bad and not lemma_filter_drop_enabled():
+        logging.error("存在不合法引理，需要重新生成")
+        return []
+    kept = [lemma_by_path[path] for path in valid_check_paths if path not in bad]
+    if bad and kept:
+        log_exp(
+            "lemma_filter_drop",
+            goal=goal_name,
+            gate="validity_1s",
+            dropped=len(bad),
+            kept=len(kept),
+        )
+    return kept
+
+def extract_lemma_from_file(file_path: Path) -> str:
+    """从验证文件中提取引理内容"""
+    try:
+        content = file_path.read_text()
+        match = re.search(r'; proof goal\s*\(assert\s+(.+?)\)\s*; proof goal end', content, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    except Exception as e:
+        logging.error(f"提取引理内容失败: {e}")
+    return None
+
+
+def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
+                        smt_file_path: Path, goal_smt_name: str) -> List[str]:
+    """生成正式验证文件（取反的引理）"""
+    generated_files = []
+    for i, assert_stmt in enumerate(extracted_asserts, 1):
+        lemma_content = re.sub(
+            r'; proof goal\s*\(assert.*?\)\s*; proof goal end',
+            f'; proof goal\n(assert (not {assert_stmt}))\n; proof goal end',
+            smt_content,
+            flags=re.DOTALL
+        )
+        lemma_path = smt_file_path / f"{goal_smt_name}_{i}.smt2"
+        lemma_path.write_text(lemma_content)
+        generated_files.append(lemma_path.name.split('.')[0])
+        logging.info(f"生成验证文件: {lemma_path.name}")
+    return generated_files
+
+
+def _harvest_direct_prove(smt_path: Path, base_path: str):
+    """Direct-prove A⊢cᵢ with the same prove policy as usefulness / node prove."""
+    want_artifacts = vampire_collect_feedback_artifacts()
+    result = run_vampire_routed(
+        smt_path,
+        config["DEFAULT_CVC_TIMEOUT"],
+        collect_stats=want_artifacts,
+        collect_ucore=False,
+        show_induction=want_artifacts,
+    )
+    add_solver_time(base_path, result.elapsed)
+    log_exp(
+        "direct_prove",
+        goal=Path(smt_path).stem,
+        proved=result.proved,
+        status=result.status,
+        elapsed=result.elapsed,
+        strategy=result.strategy,
+    )
+    return result
+
+
+def _store_harvest_dispatch(base_path: str, goal_name: str, payload: dict) -> None:
+    data = load_failed_lemmas(base_path, goal_name)
+    data[HARVEST_DISPATCH_KEY] = payload
+    save_failed_lemmas(base_path, goal_name, data)
+
+
+def _pop_harvest_dispatch(base_path: str, goal_name: str) -> dict:
+    data = load_failed_lemmas(base_path, goal_name)
+    payload = data.pop(HARVEST_DISPATCH_KEY, None) or {}
+    save_failed_lemmas(base_path, goal_name, data)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _log_harvest_lemma(slot, role: str) -> None:
+    result = slot.result
+    log_exp(
+        "harvest_lemma",
+        goal=slot.name,
+        index=slot.index,
+        proved=bool(getattr(result, "proved", False)),
+        status=getattr(result, "status", None),
+        elapsed=getattr(result, "elapsed", None),
+        role=role,
+    )
+
+
+def _finish_usefulness_unsat(
+    *,
+    selected_lemmas: List[str],
+    slots,
+    extracted_asserts: List[str],
+    smt_content: str,
+    smt_file_path: Path,
+    goal_smt_name: str,
+    base_path: str,
+    depth: int,
+) -> Tuple[bool, List[str], List[str]]:
+    generated = generate_formal_proof_files(
+        selected_lemmas, smt_content, smt_file_path, goal_smt_name
+    )
+    slot_by_index = {slot.index: slot for slot in slots}
+    skip_initial: List[str] = []
+    skip_initial_diag: Dict[str, dict] = {}
+    pre_proved: Dict[str, dict] = {}
+    recurse: List[str] = []
+    order: List[str] = []
+    for i, formula in enumerate(selected_lemmas, 1):
+        name = generated[i - 1] if i <= len(generated) else f"{goal_smt_name}_{i}"
+        order.append(name)
+        slot = slot_by_index.get(i)
+        kind = harvest_slot_kind(slot) if slot is not None else "not_started"
+        if kind == "proved":
+            lib_id = add_proved_lemma(
+                base_path, formula, origin=name, attempt=0, depth=depth + 1,
+                role="pin",
+            )
+            _log_harvest_lemma(slot, "pin")
+            pre_proved[name] = {"formula": formula, "lib": lib_id}
+        elif kind == "exhausted":
+            recurse.append(name)
+            skip_initial.append(name)
+            compact = _compact_harvest_diag(getattr(slot, "result", None) if slot else None)
+            if compact:
+                skip_initial_diag[name] = compact
+        else:
+            recurse.append(name)
+    _store_harvest_dispatch(base_path, goal_smt_name, {
+        "order": order,
+        "pre_proved": pre_proved,
+        "skip_initial": skip_initial,
+        "skip_initial_diag": skip_initial_diag,
+    })
+    logging.info(
+        "lemmas有用，保留 %d/%d 条用于子目标生成 (direct_proved=%d recurse=%d)",
+        len(selected_lemmas), len(extracted_asserts),
+        len(pre_proved), len(recurse),
+    )
+    return True, recurse, selected_lemmas
+
+
+def _finish_usefulness_timeout(
+    *,
+    slots,
+    extracted_asserts: List[str],
+    goal_smt_file: Path,
+    base_path: str,
+    goal_smt_name: str,
+    depth: int,
+) -> Tuple[bool, List[str], List[str]]:
+    n_local = 0
+    for slot in slots:
+        if harvest_slot_kind(slot) != "proved":
+            continue
+        # Reloads the live library under the lock (siblings may have pinned
+        # during the 60s usefulness window) and α-dedups before inserting.
+        add_proved_lemma(
+            base_path, slot.formula, origin=slot.name, attempt=0, depth=depth + 1,
+            role="local",
+        )
+        _log_harvest_lemma(slot, "local")
+        n_local += 1
+    if n_local:
+        ok = perform_initial_verification(
+            goal_smt_file, base_path=base_path, goal_name=goal_smt_name,
+            log_event="harvest_retry",
+            timeout=harvest_retry_timeout_s(),
+        )
+        if ok:
+            logging.info("timeout 收获 %d 条 local 后证出当前目标", n_local)
+            return True, [], extracted_asserts
+        logging.info("timeout 收获 %d 条 local 后仍未证出当前目标", n_local)
+    else:
+        logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
+    return False, [], extracted_asserts
+
+
+def quick_run(
+    base_path: str,
+    goal_smt_name: str,
+    prompt_strategy: str,
+    folder_path: str,
+    baseline_only: bool = False,
+    *,
+    solver_profile: Optional[str] = None,
+    decision_source: Optional[str] = None,
+    depth: int = 0,
+    ancestor_stack: AncestorStack = (),
+    seed_extra_user: Optional[str] = None,
+    scheme_nest_budget: int = 1,
+) -> Tuple[bool, List[str], List[str]]:
+    """快速运行函数, 返回验证结果、子目标文件和生成的引理"""
+    smt_file_path = Path(base_path)
+    goal_smt_file = smt_file_path / f"{goal_smt_name}.smt2"
+    smt_content = goal_smt_file.read_text()
+    solver_content = solver_smt_content(smt_content, base_path)
+    _store_harvest_dispatch(base_path, goal_smt_name, {})
+    if base_path and lemma_library_enabled():
+        log_library_inject(
+            base_path, goal_smt_name, len(load_lemma_library(base_path)), "attempt_smt"
+        )
+
+    # 步骤1: 初始验证检查
+    if baseline_only:
+        # 在baseline模式下，使用task_timeout作为超时时间
+        task_timeout = config['TASK_TIMEOUT']
+        logging.info(f"🔍 Baseline模式: 执行初始验证检查，超时时间: {task_timeout}秒")
+        result = run_vampire(
+            goal_smt_file,
+            task_timeout,
+            collect_stats=vampire_collect_feedback_artifacts(),
+        )
+        add_solver_time(base_path, result.elapsed)
+        if result.proved:
+            logging.info("✅ Baseline模式: 初始验证成功!")
+        else:
+            logging.info("❌ Baseline模式: 初始验证失败 (status=%s)", result.status)
+        return result.proved, [], []
+    
+    # 步骤2: 提取原始目标
+    original_assert, original_forall = extract_original_goal(solver_content)
+
+    # 步骤2.5: 首次求助 LLM 前写入 Vampire 诊断反馈 / 理论分流
+    failed_data = load_failed_lemmas(base_path, goal_smt_name)
+    if routing_enabled() and not failed_data.get("routing"):
+        seed_baseline_repair_hints(base_path, goal_smt_name, goal_smt_file)
+    if solver_profile:
+        state = load_routing_state(base_path, goal_smt_name)
+        set_routing_candidates(
+            state,
+            [solver_profile],
+            active_profile=solver_profile,
+            active_prompt=prompt_strategy,
+        )
+        if decision_source:
+            state.decision_source = decision_source
+        save_routing_state(base_path, goal_smt_name, state)
+
+    # InductionScheme: overlap short prove with this attempt's LLM/usefulness.
+    # Vampire short-prove uses serial tip→portfolio[+Int] (same family as usefulness).
+    scheme_session = None
+    if induction_scheme_enabled():
+        try:
+            from induction_scheme.mate_glue import (
+                maybe_start_scheme_session,
+                scheme_prove_kwargs_for_backend,
+            )
+
+            _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
+            scheme_session = maybe_start_scheme_session(
+                failed_data=failed_data,
+                smt_content=solver_content,
+                goal_name=goal_smt_name,
+                work_dir=smt_file_path,
+                depth=depth,
+                max_depth=int(config.get("MAX_RECURSION_DEPTH") or 3),
+                current_goal=original_forall,
+                nest_budget=scheme_nest_budget,
+                scheme_only=False,
+                **_scheme_prove,
+            )
+        except Exception as exc:
+            logging.warning("INDUCTION_SCHEME start failed: %s", exc)
+            scheme_session = None
+
+    # Attach last scheme μ prelude so LLM lemmas using __scheme_* parse under
+    # the same background as the scheme prompt (and validity / usefulness).
+    try:
+        from induction_scheme.ledger import latest_scheme_attempt
+
+        _att = latest_scheme_attempt(failed_data, goal_name=goal_smt_name)
+        if _att and (_att.measure_prelude or "").strip():
+            solver_content = merge_scheme_prelude_into_smt(
+                solver_content, _att.measure_prelude,
+            )
+    except Exception as exc:
+        logging.debug("scheme prelude merge skipped: %s", exc)
+
+    def _scheme_fin(usefulness_ok: bool):
+        if scheme_session is None:
+            return
+        try:
+            from induction_scheme.mate_glue import barrier_and_finalize
+
+            barrier_and_finalize(
+                scheme_session,
+                load_failed=lambda: load_failed_lemmas(base_path, goal_smt_name),
+                save_failed=lambda d: save_failed_lemmas(base_path, goal_smt_name, d),
+                usefulness_succeeded=usefulness_ok,
+                base_path=base_path,
+                depth=depth,
+            )
+        except Exception as exc:
+            logging.warning("INDUCTION_SCHEME finalize failed: %s", exc)
+
+    def _scheme_pending_success() -> bool:
+        try:
+            from induction_scheme.constants import SCHEME_PENDING_KEY
+            data = load_failed_lemmas(base_path, goal_smt_name)
+            return bool(data.get(SCHEME_PENDING_KEY))
+        except Exception:
+            return False
+    
+    # 步骤3: 使用LLM生成引理；静态筛 kept=0 时同 attempt 最多再生成 LLM_SCREEN_RETRIES 次
+    library_items = load_lemma_library(base_path) if lemma_library_enabled() else []
+    extra_user: Optional[str] = seed_extra_user
+    skip_hint_refresh = bool(seed_extra_user)
+    generated_asserts: List[str] = []
+    dropped: List[Tuple[str, str, str]] = []
+    extracted_asserts: List[str] = []
+    screen_budget = llm_screen_retries()
+
+    for screen_round in range(1 + screen_budget):
+        extracted_asserts = generate_lemmas_with_llm(
+            smt_content, prompt_strategy, goal_smt_file, base_path, goal_smt_name,
+            folder_path, depth=depth,
+            ancestor_stack=ancestor_stack,
+            current_formula=original_forall,
+            extra_user=extra_user,
+            skip_hint_refresh=skip_hint_refresh,
+        )
+        if not extracted_asserts:
+            if screen_round == 1:
+                logging.info("大模型未返回引理，跳过本 attempt（不加时）")
+                _scheme_fin(False)
+                if _scheme_pending_success():
+                    return True, [], []
+                return False, [], []
+            extracted_asserts = []
+            break
+
+        generated_asserts = list(extracted_asserts)
+        extracted_asserts, dropped = apply_static_lemma_screen(
+            extracted_asserts,
+            original_forall=original_forall,
+            smt=solver_content,
+            invalid_records=invalid_lemma_records(failed_data),
+            soft_rejected_records=soft_rejected_lemma_records(failed_data),
+            same_as_goal=are_formulas_equivalent,
+            library_items=library_items,
+            ancestor_stack=ancestor_stack,
+        )
+        save_last_screen(base_path, goal_smt_name, dropped)
+        for lemma, reason, gate in dropped:
+            if gate == "same_as_ancestor":
+                log_exp(
+                    "ancestor_cycle",
+                    goal=goal_smt_name,
+                    reason=reason,
+                    lemma=(lemma or "")[:160],
+                )
+                continue
+            if gate in BENIGN_SCREEN_GATES:
+                continue
+            if gate in ILLFORMED_SCREEN_GATES:
+                add_illformed_lemma(
+                    base_path, goal_smt_name, lemma, reason, kind=gate,
+                )
+                continue
+            if gate in SOFT_SCREEN_GATES:
+                add_soft_rejected_lemma(
+                    base_path, goal_smt_name, lemma, reason, gate=gate,
+                )
+                continue
+            add_invalid_lemma(base_path, goal_smt_name, lemma, reason)
+        if dropped:
+            known_n = sum(1 for _lemma, _reason, gate in dropped if gate == "known_invalid")
+            if known_n:
+                log_exp("known_invalid", goal=goal_smt_name, n=known_n, kept=len(extracted_asserts))
+            logging.info(
+                "筛选排除 %d 条 (gates=%s)，保留 %d 条",
+                len(dropped),
+                [gate for _lemma, _reason, gate in dropped],
+                len(extracted_asserts),
+            )
+            log_exp(
+                "lemma_filter_drop",
+                goal=goal_smt_name,
+                dropped=len(dropped),
+                kept=len(extracted_asserts),
+                gates=",".join(gate for _lemma, _reason, gate in dropped),
+            )
+        if extracted_asserts:
+            break
+        extra_user = format_screen_retry_user(dropped)
+        skip_hint_refresh = True
+        if screen_round > screen_budget:
+            break
+        log_exp(
+            "lemma_screen_retry",
+            goal=goal_smt_name,
+            round=screen_round,
+            dropped=len(dropped),
+            gates=",".join(gate for _lemma, _reason, gate in dropped),
+        )
+        logging.info(
+            "静态筛选全灭，同 attempt 再生成一次 (round=%s, gates=%s)",
+            screen_round,
+            [gate for _lemma, _reason, gate in dropped],
+        )
+        failed_data = load_failed_lemmas(base_path, goal_smt_name)
+
+    if not extracted_asserts:
+        if dropped and all(gate in BENIGN_SCREEN_GATES for _lemma, _reason, gate in dropped):
+            if any(gate == "same_as_library" for _lemma, _reason, gate in dropped):
+                ok = perform_initial_verification(
+                    goal_smt_file, base_path=base_path, goal_name=goal_smt_name,
+                    log_event="library_retry",
+                    timeout=harvest_retry_timeout_s(),
+                )
+                if ok:
+                    logging.info("筛选后引理已在库中，用当前库证出当前目标")
+                    _scheme_fin(True)
+                    return True, [], generated_asserts
+            _scheme_fin(False)
+            if _scheme_pending_success():
+                return True, [], generated_asserts
+            return False, [], generated_asserts
+        illformed_only = bool(dropped) and all(
+            gate in ILLFORMED_SCREEN_GATES or gate in BENIGN_SCREEN_GATES
+            for _lemma, _reason, gate in dropped
+        ) and any(gate in ILLFORMED_SCREEN_GATES for _lemma, _reason, gate in dropped)
+        attempt_status = "parse_error" if illformed_only else "invalid_lemma"
+        record_solver_attempt(
+            base_path,
+            goal_smt_name,
+            prompt_strategy=prompt_strategy,
+            selected_profile=solver_profile or load_routing_state(
+                base_path, goal_smt_name
+            ).active_profile,
+            result=VampireResult(
+                status=attempt_status,
+                strategy=solver_profile or "",
+            ),
+        )
+        _scheme_fin(False)
+        if _scheme_pending_success():
+            return True, [], generated_asserts
+        return False, [], generated_asserts
+
+    # 步骤5: 创建验证文件并并行验证引理有效性
+    valid_check_paths = create_validation_files(extracted_asserts, solver_content, smt_file_path, goal_smt_name)
+    extracted_asserts = validate_lemmas_parallel(
+        valid_check_paths, extracted_asserts, base_path, goal_smt_name,
+    )
+    if not extracted_asserts:
+        record_solver_attempt(
+            base_path,
+            goal_smt_name,
+            prompt_strategy=prompt_strategy,
+            selected_profile=solver_profile or load_routing_state(
+                base_path, goal_smt_name
+            ).active_profile,
+            result=VampireResult(
+                status="invalid_lemma",
+                strategy=solver_profile or "",
+            ),
+        )
+        _scheme_fin(False)
+        if _scheme_pending_success():
+            return True, [], generated_asserts
+        return False, [], generated_asserts
+
+
+    # 步骤6: 一次整组有用性检查；失败则用 60s A∧C→P 写 mix（可选 sidecar 只打 progress）
+    combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
+    harvest_on = local_lemma_harvest_enabled()
+    slots = []
+    if harvest_on:
+        slots = make_harvest_slots(
+            extracted_asserts, solver_content, smt_file_path, goal_smt_name,
+        )
+
+    def _usefulness():
+        return verify_combined_lemmas(
+            original_assert,
+            extracted_asserts,
+            solver_content,
+            combined_path,
+            base_path=base_path,
+            goal_name=goal_smt_name,
+            prompt_strategy=prompt_strategy,
+            solver_profile=solver_profile,
+            decision_source=decision_source,
+        )
+
+    useful, selected_lemmas, vres = run_usefulness_with_delayed_harvest(
+        usefulness_fn=_usefulness,
+        slots=slots,
+        prove_fn=lambda path: _harvest_direct_prove(path, base_path),
+        goal=goal_smt_name,
+        delay_s=usefulness_harvest_delay_s(),
+        enabled=harvest_on,
+        profiles=HARVEST_VAMPIRE_PROFILES,
+    )
+    if useful:
+        _scheme_fin(True)
+        return _finish_usefulness_unsat(
+            selected_lemmas=selected_lemmas or list(extracted_asserts),
+            slots=slots,
+            extracted_asserts=extracted_asserts,
+            smt_content=smt_content,
+            smt_file_path=smt_file_path,
+            goal_smt_name=goal_smt_name,
+            base_path=base_path,
+            depth=depth,
+        )
+    status = str(getattr(vres, "status", "") or "").lower()
+    if harvest_on and usefulness_fail_allows_local_harvest(status):
+        _scheme_fin(False)
+        result = _finish_usefulness_timeout(
+            slots=slots,
+            extracted_asserts=extracted_asserts,
+            goal_smt_file=goal_smt_file,
+            base_path=base_path,
+            goal_smt_name=goal_smt_name,
+            depth=depth,
+        )
+        if result[0]:
+            return result
+        if _scheme_pending_success():
+            return True, [], extracted_asserts
+        return result
+    logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
+    _scheme_fin(False)
+    if _scheme_pending_success():
+        return True, [], extracted_asserts
+    return False, [], extracted_asserts
+
+def prove_subgoals_parallel(
+    base_path: str,
+    subgoals: List[str],
+    depth: int = 0,
+    strategy_mode: str = "default",
+    baseline_only: bool = False,
+    parent_lemmas: List[str] = None,
+    parent_goal_name: str = None,
+    attempt: int = 0,
+    skip_initial_for: Optional[Set[str]] = None,
+    skip_initial_diag: Optional[Dict[str, dict]] = None,
+    *,
+    ancestor_stack: AncestorStack = (),
+    parent_formula: Optional[str] = None,
+) -> Tuple[bool, List[dict]]:
+    """并行验证子目标。已证兄弟写入引理库；取消的标 cancelled。"""
+    if not subgoals:
+        return True, []
+
+    logging.info(f"🚀 开始并行验证 {len(subgoals)} 个子目标: {subgoals} (递归深度: {depth})")
+    parent_lemmas = parent_lemmas or []
+    skip_initial_for = skip_initial_for or set()
+    skip_initial_diag = skip_initial_diag or {}
+    snapshots: Dict[str, dict] = {}
+    formula = parent_formula
+    if formula is None and parent_goal_name:
+        parent_path = Path(base_path) / f"{parent_goal_name}.smt2"
+        if parent_path.exists():
+            try:
+                _a, formula = extract_original_goal(
+                    solver_smt_content(parent_path.read_text(encoding="utf-8"), base_path)
+                )
+            except Exception:
+                formula = None
+    child_stack = extend_ancestors(
+        ancestor_stack,
+        parent_goal_name or "",
+        depth,
+        formula or "",
+    )
+
+    def _formula(sg: str) -> Optional[str]:
+        if parent_goal_name:
+            return _lemma_for_blocking_subgoal(parent_goal_name, sg, parent_lemmas)
+        return None
+
+    def _snap(sg: str, status: str) -> dict:
+        return _child_obligation_node(
+            base_path, sg, _formula(sg), status,
+            depth=depth + 1, attempt=attempt,
+        )
+
+    def _ordered(status_for_missing: str = "cancelled") -> List[dict]:
+        return [
+            snapshots.get(sg, _snap(sg, status_for_missing))
+            for sg in subgoals
+        ]
+
+    def _collect_remaining(*, record_failures: bool) -> None:
+        """Cancel unstarted siblings; wait for in-flight ones so invalid/reason is kept."""
+        for f, sg in future_to_subgoal.items():
+            if sg in snapshots:
+                continue
+            if not f.done():
+                f.cancel()
+            try:
+                ok = f.result()
+            except Exception:
+                snapshots[sg] = _snap(sg, "cancelled")
+                continue
+            status = "proved" if ok else "failed"
+            if (
+                record_failures
+                and not ok
+                and parent_lemmas
+                and parent_goal_name
+            ):
+                _record_subgoal_failure_feedback(
+                    base_path, parent_goal_name, sg, parent_lemmas
+                )
+            snapshots[sg] = _snap(sg, status)
+
+    with ThreadPoolExecutor(max_workers=min(len(subgoals), 4)) as executor:
+        future_to_subgoal = {
+            executor.submit(
+                prove_run,
+                base_path,
+                subgoal,
+                depth + 1,
+                strategy_mode,
+                baseline_only,
+                parent_goal_name,
+                skip_initial=subgoal in skip_initial_for,
+                skip_initial_diag=skip_initial_diag.get(subgoal),
+                ancestor_stack=child_stack,
+            ): subgoal
+            for subgoal in subgoals
+        }
+
+        try:
+            for future in as_completed(future_to_subgoal):
+                subgoal = future_to_subgoal[future]
+                try:
+                    result = future.result()
+                    if not result:
+                        logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
+                        if parent_lemmas and parent_goal_name:
+                            _record_subgoal_failure_feedback(
+                                base_path, parent_goal_name, subgoal, parent_lemmas
+                            )
+                        snapshots[subgoal] = _snap(subgoal, "failed")
+                        _collect_remaining(record_failures=True)
+                        return False, _ordered()
+                    snapshots[subgoal] = _snap(subgoal, "proved")
+                    logging.info(f"✅ 子目标 {subgoal} 验证成功")
+                except Exception as e:
+                    logging.error(f"💥 子目标 {subgoal} 执行异常: {e}，终止所有并行任务")
+                    if parent_lemmas and parent_goal_name:
+                        blocking = _lemma_for_blocking_subgoal(
+                            parent_goal_name, subgoal, parent_lemmas
+                        )
+                        if blocking is not None:
+                            _record_blocking_lemma(
+                                base_path, parent_goal_name, blocking,
+                                {"status": "error", "blocking_subgoal": subgoal, "error": str(e)},
+                            )
+                        _promote_child_pending(
+                            base_path, parent_goal_name, subgoal, blocking=blocking,
+                        )
+                    snapshots[subgoal] = _snap(subgoal, "failed")
+                    _collect_remaining(record_failures=True)
+                    return False, _ordered()
+
+            logging.info(f"🌟 所有 {len(subgoals)} 个子目标并行验证通过")
+            return True, _ordered("proved")
+
+        except KeyboardInterrupt:
+            logging.warning("收到中断信号，取消所有并行任务")
+            for f in future_to_subgoal:
+                if not f.done():
+                    f.cancel()
+            return False, _ordered("cancelled")
+
+
+def _run_final_goal_diagnosis(
+    base_path: str,
+    base_name: str,
+    depth: int,
+    pack: Dict[str, Any],
+    prompt_strategy: Optional[str],
+) -> bool:
+    """After child attempts fail, one extra LLM call: is the CURRENT goal invalid?
+
+    Uses accumulated ``invalid_lemmas`` (child write-back), not the obligation
+    tree. Skip when that list is empty — same evidence as in-loop diagnosis.
+    """
+    if not should_run_final_diagnosis(depth):
+        return False
+    failed_data = load_failed_lemmas(base_path, base_name)
+    existing = failed_data.get("node_outcome") or {}
+    if str(existing.get("kind") or "") == "invalid":
+        return True
+    invalid = [
+        item for item in invalid_lemma_records(failed_data)
+        if isinstance(item, dict) and str(item.get("lemma") or "").strip()
+    ]
+    if not should_run_final_diagnosis(depth, has_invalid=bool(invalid)):
+        logging.info("子目标 %s 无 INVALID 子引理，跳过最终鉴定", base_name)
+        log_exp("final_diagnosis_skip", goal=base_name, depth=depth, reason="no_invalid")
+        return False
+    smt_path = Path(base_path) / f"{base_name}.smt2"
+    if not smt_path.exists():
+        return False
+    strat = prompt_strategy or (pack.get("strategies") or [None])[0]
+    if not strat:
+        return False
+    logging.info("子目标 %s attempts 用尽，额外鉴定当前目标是否 invalid", base_name)
+    log_exp("final_diagnosis", goal=base_name, depth=depth, n_invalid=len(invalid))
+    try:
+        generate_lemmas_with_llm(
+            smt_path.read_text(encoding="utf-8"),
+            strat,
+            smt_path,
+            base_path,
+            base_name,
+            pack.get("folder_path"),
+            depth=depth,
+            diagnosis_only=True,
+        )
+    except Exception as exc:
+        logging.warning("最终鉴定调用失败: %s", exc)
+        return False
+    reason = load_failed_lemmas(base_path, base_name).get("last_llm_reason")
+    if not is_invalid_diagnosis_reason(reason):
+        logging.info("最终鉴定为 failed: %s", reason or "empty")
+        return False
+    ok, _reject = _accept_llm_invalid_diagnosis(
+        base_path, base_name, str(reason or ""), source="llm_final",
+    )
+    if not ok:
+        logging.info("子目标 %s 最终鉴定未通过 CE 校验，保持 open", base_name)
+        return False
+    logging.info("子目标 %s 最终鉴定不可证: %s", base_name, reason)
+    return True
+
+
+def prove_run(
+    base_path: str,
+    base_name: str,
+    depth: int = 0,
+    strategy_mode: str = "default",
+    baseline_only: bool = False,
+    parent_goal_name: Optional[str] = None,
+    skip_initial: bool = False,
+    ancestor_stack: AncestorStack = (),
+    *,
+    skip_initial_diag: Optional[dict] = None,
+    scheme_only: bool = False,
+    scheme_nest_budget: int = 1,
+) -> bool:
+    """提示策略的递归验证函数 主程序入口"""
+    outcome = {"proved": False, "reason": "attempts_exhausted"}
+
+    def _done(ok: bool, reason: str) -> bool:
+        outcome["proved"] = bool(ok)
+        outcome["reason"] = reason
+        return bool(ok)
+
+    try:
+        return _prove_run_body(
+            base_path, base_name, depth, strategy_mode, baseline_only,
+            parent_goal_name, skip_initial, _done,
+            ancestor_stack=ancestor_stack or empty_ancestor_stack(),
+            skip_initial_diag=skip_initial_diag,
+            scheme_only=scheme_only,
+            scheme_nest_budget=scheme_nest_budget,
+        )
+    finally:
+        if depth == 0:
+            try:
+                finalize_root_task(
+                    base_path,
+                    proved=outcome["proved"],
+                    exit_reason=outcome["reason"],
+                    baseline_only=baseline_only,
+                    strategy_mode=strategy_mode,
+                )
+            except Exception as exc:
+                logging.warning("failed to write experiment summary: %s", exc)
+            set_task_deadline(None)
+
+
+def _prove_run_body(
+    base_path: str,
+    base_name: str,
+    depth: int,
+    strategy_mode: str,
+    baseline_only: bool,
+    parent_goal_name: Optional[str],
+    skip_initial: bool,
+    _done,
+    *,
+    ancestor_stack: AncestorStack = (),
+    skip_initial_diag: Optional[dict] = None,
+    scheme_only: bool = False,
+    scheme_nest_budget: int = 1,
+) -> bool:
+    """提示策略的递归验证函数 主程序入口"""
+    # 检查递归深度限制
+    max_depth = config['MAX_RECURSION_DEPTH']
+    if depth >= max_depth:
+        logging.warning(f"🚫 达到最大递归深度 {max_depth}，停止处理 {base_name}")
+        log_exp("max_depth", goal=base_name, depth=depth, max_depth=max_depth)
+        return _done(False, "max_depth")
+
+    arm_task_deadline(depth, config.get("TASK_TIMEOUT"))
+    
+    if depth == 0:
+        log_run_config(
+            backend="vampire",
+            strategy_mode=strategy_mode,
+            baseline=baseline_only,
+            task_timeout=config.get("TASK_TIMEOUT"),
+            extra={
+                "goal": base_name,
+                "prompt_pack": resolve_prompt_pack(
+                    strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"]
+                )["mode"],
+            },
+        )
+
+    # 如果是baseline模式，直接调用quick_run进行初始验证
+    if baseline_only:
+        logging.info(f"🎯 Baseline模式: 开始处理 {base_name}")
+        result, _, _ = quick_run(base_path, base_name, "", "", baseline_only=True)
+        return _done(result, "baseline_prove" if result else "baseline_fail")
+    
+    logging.info(f"开始处理 Path: {base_path}, Name: {base_name} (递归深度: {depth})")
+    log_exp("node_enter", goal=base_name, depth=depth, parent=parent_goal_name)
+
+    goal_smt_file = Path(base_path) / f"{base_name}.smt2"
+    current_formula: Optional[str] = None
+    try:
+        _a, current_formula = extract_original_goal(
+            solver_smt_content(goal_smt_file.read_text(encoding="utf-8"), base_path)
+        )
+    except Exception:
+        current_formula = None
+    if routing_enabled() and not load_failed_lemmas(base_path, base_name).get("routing"):
+        seed_baseline_repair_hints(
+            base_path, base_name, goal_smt_file, parent_goal_name=parent_goal_name
+        )
+
+    # Scheme-only NEST children: no LLM. Short-prove uses Vampire profiles.
+    if scheme_only and induction_scheme_enabled():
+        if skip_initial:
+            log_exp("skip_initial_prove", goal=base_name, because="scheme_nest")
+        elif perform_initial_verification(
+            goal_smt_file, base_path=base_path, goal_name=base_name
+        ):
+            return _done(True, "direct_prove")
+        try:
+            from induction_scheme.mate_glue import (
+                run_scheme_only_node,
+                scheme_prove_kwargs_for_backend,
+            )
+
+            solver_content = solver_smt_content(
+                goal_smt_file.read_text(encoding="utf-8"),
+                base_path,
+            )
+            _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
+
+            def _child_prove(
+                child_name, *, depth, nest_budget, skip_initial, scheme_only, mode,
+            ):
+                return prove_run(
+                    base_path,
+                    child_name,
+                    depth=depth,
+                    strategy_mode=strategy_mode,
+                    baseline_only=False,
+                    parent_goal_name=base_name,
+                    skip_initial=skip_initial,
+                    ancestor_stack=ancestor_stack,
+                    scheme_only=scheme_only,
+                    scheme_nest_budget=nest_budget,
+                )
+
+            ok = run_scheme_only_node(
+                smt_content=solver_content,
+                goal_name=base_name,
+                work_dir=Path(base_path),
+                depth=depth,
+                max_depth=max_depth,
+                nest_budget=scheme_nest_budget,
+                skip_initial=skip_initial,
+                current_goal=current_formula,
+                load_failed=lambda: load_failed_lemmas(base_path, base_name),
+                save_failed=lambda d: save_failed_lemmas(base_path, base_name, d),
+                set_outcome=lambda **kw: _set_node_outcome(
+                    base_path, base_name, **kw
+                ),
+                child_prove_fn=_child_prove,
+                **_scheme_prove,
+            )
+            return _done(ok, "scheme" if ok else "scheme_fail")
+        except Exception as exc:
+            logging.warning("scheme_only node failed: %s", exc)
+            return _done(False, "scheme_fail")
+
+    # 执行初始验证检查
+    if skip_initial:
+        log_exp("skip_initial_prove", goal=base_name, because="harvest_exhausted")
+        harvested = skip_initial_diag
+        if not isinstance(harvested, VampireResult):
+            harvested = _vampire_diag_from_compact(harvested)
+        _set_goal_only_baseline(
+            base_path, base_name, harvested,
+            context="harvest_exhausted", replace=False,
+        )
+    elif perform_initial_verification(
+        goal_smt_file, base_path=base_path, goal_name=base_name
+    ):
+        return _done(True, "direct_prove")
+    if (
+        not skip_initial
+        and depth >= 1
+        and subgoal_sat_abort_enabled()
+    ):
+        diag = _load_cached_diag(base_path, base_name, "baseline_diag")
+        if diag is not None and str(diag.status).lower() == "sat":
+            _set_node_outcome(
+                base_path, base_name, kind="invalid", reason="solver:sat", source="solver"
+            )
+            logging.info("子目标 %s 为 sat，停止 LLM", base_name)
+            return _done(False, "refuted")
+
+    pack = resolve_prompt_pack(strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"])
+    strategies = pack["strategies"]
+    total_attempts, max_attempts_per_prompt = node_attempt_plan(depth, pack)
+    retarget = prompt_retarget_active(len(strategies))
+    fixed_no_retarget = pack.get("no_retarget_prompt")
+    if retarget:
+        hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
+        current_prompt = select_generation_prompt(strategies, hint_list)
+        # v2: start signature is sentinel so the first HD/no_hd update can retarget.
+        kind_signature = (
+            V2_START_SIGNATURE
+            if is_v2_strategy_mode(str(pack.get("mode") or ""))
+            else prompt_kind_signature(hint_list)
+        )
+    else:
+        current_prompt = fixed_no_retarget or paper_schedule_prompt(
+            strategies, 0, max_attempts_per_prompt
+        )
+        kind_signature = "none"
+    consecutive_no_help = 0
+    log_exp(
+        "prompt_schedule",
+        goal=base_name,
+        retarget=retarget,
+        start_prompt=current_prompt,
+        total_attempts=total_attempts,
+        strategy_mode=pack["mode"],
+        prompt_folder=pack["folder_path"],
+        hint_signature=kind_signature,
+    )
+
+    # Shared 2N budget. default/zero_shot: ours templates. naive: prompt_naive
+    # 2N times (retarget off; same as PROMPT_RETARGET=off). With retarget on
+    # (Vampire): hint family picks the template. With retarget off: paper
+    # order, N attempts per template. v2: always lemma_general (2N); retarget
+    # on/off does not change the template.
+    for attempt in range(total_attempts):
+        if not retarget:
+            current_prompt = fixed_no_retarget or paper_schedule_prompt(
+                strategies, attempt, max_attempts_per_prompt
+            )
+        prompt_strategy = current_prompt
+        solver_profile = None
+        decision_source = None
+        if routing_enabled():
+            state, decision = select_attempt_action(
+                base_path,
+                base_name,
+                [current_prompt] if current_prompt else strategies,
+                parent_goal_name=parent_goal_name,
+                preferred_prompt=current_prompt,
+            )
+            solver_profile = decision.profile
+            decision_source = decision.source
+        logging.info(
+            "[主阶段] 处理 %s - 第%d/%d次尝试(prompt=%s, profile=%s)",
+            base_name,
+            attempt + 1,
+            total_attempts,
+            prompt_strategy,
+            solver_profile or "paper_portfolio",
+        )
+        log_exp(
+            "attempt_start",
+            goal=base_name,
+            attempt=attempt + 1,
+            total=total_attempts,
+            prompt=prompt_strategy,
+            profile=solver_profile or "paper_portfolio",
+            source=decision_source,
+        )
+        try:
+            seed_extra: Optional[str] = None
+            ce_rounds = 0
+            ce_budget = (
+                llm_invalid_ce_retries()
+                if (
+                    llm_invalid_ce_verify_enabled()
+                    and depth >= 1
+                    and should_accept_in_loop_invalid_goal(depth)
+                )
+                else 0
+            )
+            while True:
+                ret, new_subgoals, extracted_asserts = quick_run(
+                    base_path,
+                    base_name,
+                    prompt_strategy,
+                    pack["folder_path"],
+                    baseline_only=False,
+                    solver_profile=solver_profile,
+                    decision_source=decision_source,
+                    depth=depth,
+                    ancestor_stack=ancestor_stack,
+                    seed_extra_user=seed_extra,
+                    scheme_nest_budget=scheme_nest_budget,
+                )
+                if ret or extracted_asserts:
+                    break
+                if not (
+                    depth >= 1 and should_accept_in_loop_invalid_goal(depth)
+                ):
+                    break
+                reason = load_failed_lemmas(base_path, base_name).get(
+                    "last_llm_reason"
+                )
+                if not reason:
+                    break
+                ok, reject = _accept_llm_invalid_diagnosis(
+                    base_path, base_name, str(reason), source="llm",
+                )
+                if ok:
+                    logging.info(
+                        "子目标 %s LLM 判定不可证: %s", base_name, reason,
+                    )
+                    return _done(False, "llm_invalid")
+                if not reject or ce_rounds >= ce_budget:
+                    logging.info(
+                        "子目标 %s LLM INVALID_GOAL 未通过 CE 校验，继续 attempt",
+                        base_name,
+                    )
+                    break
+                ce_rounds += 1
+                failed_now = load_failed_lemmas(base_path, base_name)
+                seed_extra = format_ce_retry_user(
+                    reject,
+                    ce_smt=str(failed_now.get("last_llm_ce_smt") or ""),
+                )
+                log_exp(
+                    "llm_invalid_ce_retry",
+                    goal=base_name,
+                    source="llm",
+                    retry=ce_rounds,
+                    max_retries=ce_budget,
+                    reason=reject[:160],
+                )
+                logging.info(
+                    "子目标 %s CE 校验失败 (%s)，同 attempt 再生成引理 (%d/%d)",
+                    base_name,
+                    reject,
+                    ce_rounds,
+                    ce_budget,
+                )
+            # After attempt: scheme may close parent (waited until attempt ended).
+            if induction_scheme_enabled():
+                try:
+                    from induction_scheme.mate_glue import (
+                        scheme_prove_kwargs_for_backend,
+                        try_scheme_close_after_attempt,
+                        try_scheme_nest_after_attempt,
+                    )
+
+                    _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
+                    if try_scheme_close_after_attempt(
+                        load_failed=lambda: load_failed_lemmas(base_path, base_name),
+                        save_failed=lambda d: save_failed_lemmas(
+                            base_path, base_name, d
+                        ),
+                        set_outcome=lambda **kw: _set_node_outcome(
+                            base_path, base_name, **kw
+                        ),
+                        goal_name=base_name,
+                    ):
+                        return _done(True, "scheme")
+                    if not ret:
+                        solver_content = solver_smt_content(
+                            goal_smt_file.read_text(encoding="utf-8"),
+                            base_path,
+                        )
+
+                        def _nest_child(
+                            child_name, *, depth, nest_budget, skip_initial,
+                            scheme_only, mode,
+                        ):
+                            return prove_run(
+                                base_path,
+                                child_name,
+                                depth=depth,
+                                strategy_mode=strategy_mode,
+                                parent_goal_name=base_name,
+                                skip_initial=skip_initial,
+                                ancestor_stack=ancestor_stack,
+                                scheme_only=True,
+                                scheme_nest_budget=nest_budget,
+                            )
+
+                        if try_scheme_nest_after_attempt(
+                            load_failed=lambda: load_failed_lemmas(
+                                base_path, base_name
+                            ),
+                            save_failed=lambda d: save_failed_lemmas(
+                                base_path, base_name, d
+                            ),
+                            parent_smt_content=solver_content,
+                            parent_goal=base_name,
+                            work_dir=Path(base_path),
+                            depth=depth,
+                            max_depth=max_depth,
+                            child_prove_fn=_nest_child,
+                            set_outcome=lambda **kw: _set_node_outcome(
+                                base_path, base_name, **kw
+                            ),
+                            **_scheme_prove,
+                        ):
+                            return _done(True, "scheme_nest")
+                except Exception as exc:
+                    logging.warning("scheme post-attempt failed: %s", exc)
+            # ret为True代表发现了可能会有用的子目标 不代表证明成功
+            # lemma 被quick filtering了
+            # lemma 是useful的情况下 但是lemma本身没有被验证成功 就给5次
+            if ret:
+                consecutive_no_help = 0
+                logging.info(f"🎯 策略 {prompt_strategy} 第{attempt+1}次尝试搜寻可能有用的引理成功！")
+                dispatch = _pop_harvest_dispatch(base_path, base_name)
+                pre_proved = dispatch.get("pre_proved") or {}
+                order = list(dispatch.get("order") or new_subgoals)
+                skip_for = set(dispatch.get("skip_initial") or [])
+                skip_diag = dispatch.get("skip_initial_diag") or {}
+
+                # 成功证明的情况，没有subgoal了
+                if not new_subgoals:
+                    if pre_proved:
+                        _record_subgoal_split(
+                            base_path, base_name, proved=True,
+                            order=order, pre_proved=pre_proved, rec_nodes=[],
+                            formula=current_formula,
+                        )
+                    logging.info(f"🏆 子目标 {base_name} 完成证明！")
+                    return _done(True, "llm_no_subgoals")
+
+                # 处理子目标 - 使用并行执行
+                logging.info(f"🔍 发现子目标: {new_subgoals}")
+                current_lemmas = extracted_asserts
+                subgoal_result = prove_subgoals_parallel(
+                    base_path, new_subgoals, depth, strategy_mode, baseline_only,
+                    current_lemmas, base_name, attempt=attempt + 1,
+                    skip_initial_for=skip_for,
+                    skip_initial_diag=skip_diag,
+                    ancestor_stack=ancestor_stack,
+                    parent_formula=current_formula,
+                )
+                if isinstance(subgoal_result, tuple):
+                    ok, rec_nodes = subgoal_result
+                else:
+                    ok, rec_nodes = bool(subgoal_result), []
+                _record_subgoal_split(
+                    base_path, base_name, proved=ok,
+                    order=order, pre_proved=pre_proved, rec_nodes=rec_nodes,
+                    formula=current_formula,
+                )
+                if ok:
+                    logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")
+                    return _done(True, "llm_subgoals")
+                logging.warning(f"💥 子目标验证失败，继续尝试下一次生成")
+                log_exp("subgoals_failed", goal=base_name, attempt=attempt + 1, n=len(new_subgoals))
+                continue
+
+            _record_obligation_attempt(
+                base_path,
+                base_name,
+                classify_failed_attempt(
+                    extracted_asserts, load_failed_lemmas(base_path, base_name)
+                ),
+            )
+            consecutive_no_help += 1
+            if retarget:
+                hint_list = load_failed_lemmas(base_path, base_name).get("repair_hints") or []
+                nxt, consecutive_no_help, kind_signature, why = retarget_generation_prompt(
+                    strategies,
+                    hint_list,
+                    current_prompt,
+                    consecutive_no_help,
+                    kind_signature,
+                )
+                if why == "consecutive":
+                    logging.info(
+                        "连续空/无效/无用达到%d次，切换 prompt %s → %s",
+                        NO_HELP_PROMPT_SWITCH,
+                        current_prompt,
+                        nxt,
+                    )
+                if why != "keep":
+                    log_exp(
+                        "prompt_retarget",
+                        goal=base_name,
+                        why=why,
+                        from_prompt=current_prompt,
+                        to_prompt=nxt,
+                    )
+                current_prompt = nxt
+
+        except TimeoutError:
+            logging.warning(f"策略 {prompt_strategy} 第{attempt+1}次尝试超时")
+            consecutive_no_help = 0
+            continue
+        except Exception as e:
+            logging.error(f"策略 {prompt_strategy} 第{attempt+1}次尝试出错: {e}")
+            consecutive_no_help = 0
+            continue
+
+    # 所有策略和尝试都失败了
+    logging.error(f"🚫 {base_name} 所有策略均失败")
+    # InductionScheme frontier backup: only prove, no nest/LLM.
+    if induction_scheme_enabled():
+        try:
+            from induction_scheme.mate_glue import (
+                scheme_prove_kwargs_for_backend,
+                try_frontier_backup_at_node_end,
+            )
+            from induction_scheme.ledger import latest_scheme_attempt
+
+            def _had_success_child() -> bool:
+                data = load_failed_lemmas(base_path, base_name)
+                att = latest_scheme_attempt(data, goal_name=base_name)
+                if att is not None and any(
+                    o.status == "proved" for o in att.obligations
+                ):
+                    return True
+                tree = data.get("obligation") or {}
+                return _obligation_tree_has_proved_child(tree)
+
+            solver_content = solver_smt_content(
+                goal_smt_file.read_text(encoding="utf-8"),
+                base_path,
+            )
+            _scheme_prove = scheme_prove_kwargs_for_backend("vampire")
+            if try_frontier_backup_at_node_end(
+                load_failed=lambda: load_failed_lemmas(base_path, base_name),
+                save_failed=lambda d: save_failed_lemmas(base_path, base_name, d),
+                smt_content=solver_content,
+                goal_name=base_name,
+                work_dir=Path(base_path),
+                had_success_child=_had_success_child(),
+                set_outcome=lambda **kw: _set_node_outcome(
+                    base_path, base_name, **kw
+                ),
+                base_path=base_path,
+                depth=depth,
+                **_scheme_prove,
+            ):
+                return _done(True, "scheme_frontier")
+        except Exception as exc:
+            logging.warning("scheme frontier backup failed: %s", exc)
+    if maybe_root_finish_prove(base_path, base_name, depth=depth):
+        return _done(True, "root_finish_prove")
+    if _run_final_goal_diagnosis(
+        base_path, base_name, depth, pack, current_prompt,
+    ):
+        return _done(False, "llm_invalid")
+    return _done(False, "attempts_exhausted")
+
+
+def _obligation_tree_has_proved_child(node) -> bool:
+    if not isinstance(node, dict):
+        return False
+    children = node.get("children") or node.get("nodes") or []
+    if not isinstance(children, list):
+        children = []
+    for ch in children:
+        if not isinstance(ch, dict):
+            continue
+        if str(ch.get("status") or "") == "proved":
+            return True
+        if _obligation_tree_has_proved_child(ch):
+            return True
+    return False
+
+
+# def _retry_original_after_llm_exhausted(base_path: str, goal_name: str) -> bool:
+#     """After every LLM attempt on this node failed, retry the original goal once."""
+#     goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
+#     retry_timeout = config["RETRY_CVC_TIMEOUT"]
+#     logging.info("全部 LLM attempt 失败，加时一次再证原目标 timeout=%s", retry_timeout)
+#     retry = run_vampire_routed(
+#         goal_smt_file,
+#         retry_timeout,
+#         collect_stats=True,
+#         state=load_routing_state(base_path, goal_name),
+#     )
+#     record_solver_attempt(
+#         base_path,
+#         goal_name,
+#         prompt_strategy=None,
+#         selected_profile=load_routing_state(base_path, goal_name).active_profile,
+#         result=retry,
+#     )
+#     if retry.proved:
+#         logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
+#         return True
+#     return False

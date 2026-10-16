@@ -1,0 +1,33 @@
+.env
+运行说明.md
+.DS_Store
+
+# 个例实验：配置含密钥，结果目录内容不入库
+experiments/configs/*.env
+experiments/results/**
+!experiments/results/.gitkeep
+
+# 本地 AI / IDE 元数据
+.codex/
+.cursor/
+.claude/
+.idea/
+.vscode/
+
+# 生成的演示文稿及其检查产物
+.codex_artifacts/
+*.pptx
+*.pptx.inspect.ndjson
+
+__pycache__/
+*.pyc
+
+# cvc5 静态库（只保留 bin/cvc5 可执行文件）
+cvc/cvc5-Linux-x86_64-static/include/
+cvc/cvc5-Linux-x86_64-static/lib/
+cvc/cvc5-Linux-x86_64-static/licenses/
+cvc/cvc5-Linux-x86_64-static/AUTHORS
+cvc/cvc5-Linux-x86_64-static/COPYING
+
+# 本地论文稿件与投稿模板，不纳入版本控制
+/paper/

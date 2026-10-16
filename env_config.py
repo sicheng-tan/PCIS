@@ -1,0 +1,368 @@
+import os
+import logging
+from pathlib import Path
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+
+_ROOT = Path(__file__).resolve().parent
+DEFAULT_EXPERIMENT_ENV = _ROOT / "experiments" / "configs" / "case.env"
+DEFAULT_OPENAI_API_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_OPENAI_MODEL = "openai/gpt-5"
+
+
+def load_runtime_env():
+    """Load project .env, then optional experiment env.
+
+    Existing OS environment variables win, except when ``DOTENV_PATH`` is set
+    (that file overrides). ``case.env`` is used only when no API key is present
+    yet, so unit tests that inject ``OPENAI_API_KEY`` are not affected.
+    """
+    load_dotenv()
+    dotenv_path = os.getenv("DOTENV_PATH")
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=True)
+        return
+    if not os.getenv("OPENAI_API_KEY") and DEFAULT_EXPERIMENT_ENV.exists():
+        load_dotenv(DEFAULT_EXPERIMENT_ENV, override=False)
+
+
+def setup_environment():
+    """环境变量和代理配置函数"""
+    load_runtime_env()
+    
+    # 统一加载所有需要的环境变量
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    deepseek_api_key = os.getenv('DEEPSEEK_API_KEY')
+    qwen_api_key = os.getenv('QWEN_API_KEY')
+    gemini_api_key = os.getenv('GEMINI_API_KEY')
+    http_proxy = os.getenv('HTTP_PROXY')
+    https_proxy = os.getenv('HTTPS_PROXY')
+    model_type = os.getenv('MODEL_TYPE', 'gpt-4o')  # 默认为 gpt-4o
+    openai_api_base = os.getenv('OPENAI_API_BASE', DEFAULT_OPENAI_API_BASE)
+    openai_model = os.getenv('OPENAI_MODEL')
+    if not openai_model:
+        if model_type in ('gpt-5.5', 'gpt-5'):
+            openai_model = model_type
+        else:
+            openai_model = DEFAULT_OPENAI_MODEL
+    cvc5_binary = os.getenv('CVC5_BINARY', './cvc/cvc5-Linux-x86_64-static/bin/cvc5')  # CVC5二进制文件路径
+    cvc4_binary = os.getenv('CVC4_BINARY', './cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt')  # CVC4二进制文件路径
+    vampire_binary = os.getenv('VAMPIRE_BINARY', './vampire/vampire')  # Vampire二进制文件路径
+    max_attempts_per_prompt = int(os.getenv('MAX_ATTEMPTS_PER_PROMPT', '3'))  # 每个prompt策略的最大尝试次数
+    default_cvc_timeout = int(os.getenv('DEFAULT_CVC_TIMEOUT', '60'))  # 默认CVC5超时时间(初始验证检查)
+    # Unused while post-LLM 100s retry is commented out in Mate_new*.py.
+    retry_cvc_timeout = int(os.getenv('RETRY_CVC_TIMEOUT', '100'))  # 原实现：加时再证原目标；论文无此步
+    combined_cvc_timeout = int(os.getenv('COMBINED_CVC_TIMEOUT', '60'))  # 带引理的CVC5超时时间
+    max_recursion_depth = int(os.getenv('MAX_RECURSION_DEPTH', '3'))  # 最大递归深度限制
+    task_timeout = int(os.getenv('TASK_TIMEOUT', '1200'))  # 单个任务的超时时间（秒）
+    max_parallel_tasks = int(os.getenv('MAX_PARALLEL_TASKS', '20'))  # 最大并行任务数
+    solver_routing = os.getenv('SOLVER_ROUTING', 'on')
+    solver_routing_decider = os.getenv('SOLVER_ROUTING_DECIDER', 'relative')
+    solver_routing_probes = os.getenv('SOLVER_ROUTING_PROBES', 'on')
+    solver_routing_llm_min_confidence = float(
+        os.getenv('SOLVER_ROUTING_LLM_MIN_CONFIDENCE', '0.55')
+    )
+    lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
+    obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
+    # off | on (hard+soft) | paper (LLM4Ind hard invalid + all useless groups).
+    invalid_lemmas = os.getenv('INVALID_LEMMAS', 'on')
+    lemma_library_local = os.getenv('LEMMA_LIBRARY_LOCAL', 'on')
+    usefulness_harvest_delay_s = os.getenv('USEFULNESS_HARVEST_DELAY_S', '2')
+    harvest_retry_timeout = os.getenv('HARVEST_RETRY_TIMEOUT', '2')
+    # Root finish re-prove after LLM attempts (default 120s); 0/off disables.
+    root_finish_prove_timeout = os.getenv('ROOT_FINISH_PROVE_TIMEOUT', '120')
+    feedback_repair_hints = os.getenv('FEEDBACK_REPAIR_HINTS', 'on')
+    # Default off: -o lemmas samples next to difficulty (opt-in ablation).
+    feedback_formula_evidence = os.getenv('FEEDBACK_FORMULA_EVIDENCE', 'off')
+    # Default off: LLM interprets difficulty observations before lemma generation.
+    feedback_llm_hints = os.getenv('FEEDBACK_LLM_HINTS', 'off')
+    # Default off: HD hotspots in the LLM diagnoser pack (+ usefulness dump).
+    feedback_llm_hints_hd = os.getenv('FEEDBACK_LLM_HINTS_HD', 'off')
+    # 暂时弃用 (default off): 3s sidecar + progress lemmas; do not enable casually.
+    feedback_progress = os.getenv('FEEDBACK_PROGRESS', 'off')
+    proof_shape_hint = os.getenv('PROOF_SHAPE_HINT', 'off')
+    problem_profiler = os.getenv('PROBLEM_PROFILER', 'off')
+    problem_profiler_min_attempt = os.getenv('PROBLEM_PROFILER_MIN_ATTEMPT', '1')
+    problem_profiler_trigger = os.getenv('PROBLEM_PROFILER_TRIGGER', 'always')
+    induction_scheme = os.getenv('INDUCTION_SCHEME', 'off')
+    induction_scheme_mode = os.getenv('INDUCTION_SCHEME_MODE', 'structural')
+    induction_scheme_trigger = os.getenv('INDUCTION_SCHEME_TRIGGER', 'after_useless')
+    induction_scheme_goal_gate = os.getenv('INDUCTION_SCHEME_GOAL_GATE', 'on')
+    induction_scheme_prompt = os.getenv('INDUCTION_SCHEME_PROMPT', 'on')
+    induction_scheme_nest = os.getenv('INDUCTION_SCHEME_NEST', 'cross_sort')
+    prompt_retarget = os.getenv('PROMPT_RETARGET', 'on')
+    prompt_advice = os.getenv('PROMPT_ADVICE', 'on')
+    unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
+    subgoal_sat_abort = os.getenv('SUBGOAL_SAT_ABORT', 'on')
+    lemma_defined_symbols = os.getenv('LEMMA_DEFINED_SYMBOLS', 'on')
+    lemma_filter_drop = os.getenv('LEMMA_FILTER_DROP', 'on')
+    llm_lemma_diagnosis = os.getenv('LLM_LEMMA_DIAGNOSIS', 'on')
+    llm_lemma_diagnosis_final_only = os.getenv('LLM_LEMMA_DIAGNOSIS_FINAL_ONLY', 'off')
+    llm_invalid_ce_verify = os.getenv('LLM_INVALID_CE_VERIFY', 'off')
+    llm_invalid_ce_retries = os.getenv('LLM_INVALID_CE_RETRIES', '1')
+    llm_invalid_only_stop = os.getenv('LLM_INVALID_ONLY_STOP', 'on')
+    child_llm_attempts = os.getenv('CHILD_LLM_ATTEMPTS', '2')
+    llm_parse_retries = os.getenv('LLM_PARSE_RETRIES', '2')
+    llm_screen_retries = os.getenv('LLM_SCREEN_RETRIES', '1')
+    raw_llm_timeout = os.getenv('LLM_TIMEOUT')
+    llm_timeout = float(raw_llm_timeout) if raw_llm_timeout else None
+    raw_llm_retries = os.getenv('LLM_MAX_RETRIES')
+    llm_max_retries = int(raw_llm_retries) if raw_llm_retries not in (None, '') else None
+    enable_thinking = _parse_optional_bool(os.getenv('ENABLE_THINKING'), 'ENABLE_THINKING')
+    reasoning_effort = _parse_optional_effort(
+        os.getenv('REASONING_EFFORT'), 'REASONING_EFFORT'
+    )
+    max_tokens = _parse_optional_int(os.getenv('MAX_TOKENS'), 'MAX_TOKENS')
+
+    # 代理配置
+    if http_proxy and https_proxy:
+        os.environ['http_proxy'] = http_proxy
+        os.environ['https_proxy'] = https_proxy
+        logging.info("代理已启用：%s", http_proxy)
+    else:
+        logging.info("没有找到代理配置，跳过代理设置。")
+    # logging.info("跳过代理设置。")
+
+    # 检查必需的 API 密钥是否存在
+    if not openai_api_key:
+        raise ValueError("OPENAI_API_KEY is not set in .env file.")
+    if model_type == 'deepseek' and not deepseek_api_key:
+        raise ValueError("DEEPSEEK_API_KEY is not set in .env file for DeepSeek model.")
+    if model_type == 'qwen' and not qwen_api_key:
+        raise ValueError("QWEN_API_KEY is not set in .env file for Qwen model.")
+    if model_type == 'gemini' and not gemini_api_key:
+        raise ValueError("GEMINI_API_KEY is not set in .env file for Gemini model.")
+    
+    return {
+        'OPENAI_API_KEY': openai_api_key,
+        'DEEPSEEK_API_KEY': deepseek_api_key,
+        'QWEN_API_KEY': qwen_api_key,
+        'GEMINI_API_KEY': gemini_api_key,
+        'MODEL_TYPE': model_type,
+        'OPENAI_API_BASE': openai_api_base,
+        'OPENAI_MODEL': openai_model,
+        'CVC5_BINARY': cvc5_binary,
+        'CVC4_BINARY': cvc4_binary,
+        'VAMPIRE_BINARY': vampire_binary,
+        'MAX_ATTEMPTS_PER_PROMPT': max_attempts_per_prompt,
+        'DEFAULT_CVC_TIMEOUT': default_cvc_timeout,
+        'RETRY_CVC_TIMEOUT': retry_cvc_timeout,
+        'COMBINED_CVC_TIMEOUT': combined_cvc_timeout,
+        'MAX_RECURSION_DEPTH': max_recursion_depth,
+        'TASK_TIMEOUT': task_timeout,
+        'MAX_PARALLEL_TASKS': max_parallel_tasks,
+        'SOLVER_ROUTING': solver_routing,
+        'SOLVER_ROUTING_DECIDER': solver_routing_decider,
+        'SOLVER_ROUTING_PROBES': solver_routing_probes,
+        'SOLVER_ROUTING_LLM_MIN_CONFIDENCE': solver_routing_llm_min_confidence,
+        'LEMMA_LIBRARY': lemma_library,
+        'OBLIGATION_TREE': obligation_tree,
+        'INVALID_LEMMAS': invalid_lemmas,
+        'LEMMA_LIBRARY_LOCAL': lemma_library_local,
+        'USEFULNESS_HARVEST_DELAY_S': usefulness_harvest_delay_s,
+        'HARVEST_RETRY_TIMEOUT': harvest_retry_timeout,
+        'ROOT_FINISH_PROVE_TIMEOUT': root_finish_prove_timeout,
+        'FEEDBACK_REPAIR_HINTS': feedback_repair_hints,
+        'FEEDBACK_FORMULA_EVIDENCE': feedback_formula_evidence,
+        'FEEDBACK_LLM_HINTS': feedback_llm_hints,
+        'FEEDBACK_LLM_HINTS_HD': feedback_llm_hints_hd,
+        'FEEDBACK_PROGRESS': feedback_progress,
+        'PROOF_SHAPE_HINT': proof_shape_hint,
+        'PROBLEM_PROFILER': problem_profiler,
+        'PROBLEM_PROFILER_MIN_ATTEMPT': problem_profiler_min_attempt,
+        'PROBLEM_PROFILER_TRIGGER': problem_profiler_trigger,
+        'INDUCTION_SCHEME': induction_scheme,
+        'INDUCTION_SCHEME_MODE': induction_scheme_mode,
+        'INDUCTION_SCHEME_TRIGGER': induction_scheme_trigger,
+        'INDUCTION_SCHEME_GOAL_GATE': induction_scheme_goal_gate,
+        'INDUCTION_SCHEME_PROMPT': induction_scheme_prompt,
+        'INDUCTION_SCHEME_NEST': induction_scheme_nest,
+        'PROMPT_RETARGET': prompt_retarget,
+        'PROMPT_ADVICE': prompt_advice,
+        'UNPROVED_NOT_INVALID': unproved_not_invalid,
+        'SUBGOAL_SAT_ABORT': subgoal_sat_abort,
+        'LEMMA_DEFINED_SYMBOLS': lemma_defined_symbols,
+        'LEMMA_FILTER_DROP': lemma_filter_drop,
+        'LLM_LEMMA_DIAGNOSIS': llm_lemma_diagnosis,
+        'LLM_LEMMA_DIAGNOSIS_FINAL_ONLY': llm_lemma_diagnosis_final_only,
+        'LLM_INVALID_CE_VERIFY': llm_invalid_ce_verify,
+        'LLM_INVALID_CE_RETRIES': llm_invalid_ce_retries,
+        'LLM_INVALID_ONLY_STOP': llm_invalid_only_stop,
+        'CHILD_LLM_ATTEMPTS': child_llm_attempts,
+        'LLM_PARSE_RETRIES': llm_parse_retries,
+        'LLM_SCREEN_RETRIES': llm_screen_retries,
+        'LLM_TIMEOUT': llm_timeout,
+        'LLM_MAX_RETRIES': llm_max_retries,
+        'ENABLE_THINKING': enable_thinking,
+        'REASONING_EFFORT': reasoning_effort,
+        'MAX_TOKENS': max_tokens,
+    }
+
+
+_TRUE_VALUES = frozenset({"1", "true", "on", "yes"})
+_FALSE_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+def _parse_optional_bool(raw, name):
+    if raw is None or str(raw).strip() == "":
+        return None
+    key = str(raw).strip().lower()
+    if key in _TRUE_VALUES:
+        return True
+    if key in _FALSE_VALUES:
+        return False
+    raise ValueError(f"{name} must be true/false (got {raw!r})")
+
+
+def _parse_optional_int(raw, name):
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer (got {raw!r})") from exc
+
+
+# DeepSeek V4 Chat Completions: low / high / max. medium+xhigh map to high (API compat).
+_EFFORT_VALUES = frozenset({"low", "high", "max", "medium", "xhigh"})
+_EFFORT_ALIAS = {"medium": "high", "xhigh": "high"}
+
+
+def _parse_optional_effort(raw, name):
+    if raw is None or str(raw).strip() == "":
+        return None
+    key = str(raw).strip().lower()
+    if key not in _EFFORT_VALUES:
+        raise ValueError(
+            f"{name} must be low/high/max (got {raw!r}; medium/xhigh map to high)"
+        )
+    return _EFFORT_ALIAS.get(key, key)
+
+
+def thinking_api_style(config) -> str:
+    """Which thinking wire format to emit: ``deepseek_v4`` | ``qwen`` | ``none``.
+
+    - DeepSeek V4 (Flash/Pro): ``thinking.type`` + ``reasoning_effort``
+    - Qwen3 / ``MODEL_TYPE=qwen``: ``enable_thinking`` bool only
+    - Other providers: do not invent vendor-specific thinking fields
+    """
+    model_type = str(config.get("MODEL_TYPE") or "").strip().lower()
+    model_name = str(config.get("OPENAI_MODEL") or "").strip().lower()
+    blob = f"{model_type} {model_name}"
+
+    if "qwen" in blob:
+        return "qwen"
+    # V4 / V4.1 Flash|Pro (and gateway aliases like deepseek-ai/DeepSeek-V4-Flash).
+    if "deepseek-v4" in blob or "deepseek_v4" in blob or "deepseekv4" in blob:
+        return "deepseek_v4"
+    # Official deepseek-chat path and generic deepseek-* model ids on OpenAI-compat
+    # gateways use the same V4 thinking object when thinking is configured.
+    if model_type == "deepseek" or model_name.startswith("deepseek"):
+        return "deepseek_v4"
+    return "none"
+
+
+def _llm_call_kwargs(config):
+    """Optional ChatOpenAI request knobs: timeout, retries, max_tokens, thinking.
+
+    Thinking fields are vendor-specific (see ``thinking_api_style``):
+    - DeepSeek V4: ``extra_body.thinking.type`` (+ ``reasoning_effort`` when on).
+      Provider default is thinking **on** at high effort; we default to
+      **disabled** unless ``ENABLE_THINKING=true`` (or only ``REASONING_EFFORT``
+      is set, which opts into enabled + that effort, defaulting effort to low).
+    - Qwen: ``extra_body.enable_thinking`` bool only; ``REASONING_EFFORT`` ignored
+    - Other: no thinking fields (even if ENABLE_THINKING is set)
+    """
+    kwargs = {}
+    timeout = config.get('LLM_TIMEOUT')
+    if timeout:
+        kwargs['timeout'] = timeout
+    retries = config.get('LLM_MAX_RETRIES')
+    if retries is not None:
+        kwargs['max_retries'] = retries
+    max_tokens = config.get('MAX_TOKENS')
+    if max_tokens is not None:
+        kwargs['max_tokens'] = max_tokens
+
+    thinking = config.get('ENABLE_THINKING')
+    effort = config.get('REASONING_EFFORT')
+    style = thinking_api_style(config)
+    if style == "none":
+        return kwargs
+
+    extra = dict(kwargs.get('extra_body') or {})
+    if style == "qwen":
+        # Qwen3 OpenAI-compat: boolean only. Effort is a DeepSeek-V4 knob.
+        if thinking is None:
+            return kwargs
+        extra['enable_thinking'] = bool(thinking)
+    else:
+        # deepseek_v4 — default off (provider would otherwise use high thinking).
+        if thinking is True or (thinking is None and effort is not None):
+            extra['thinking'] = {'type': 'enabled'}
+            extra['reasoning_effort'] = effort or 'low'
+        else:
+            # False, or both unset → explicitly disable.
+            extra['thinking'] = {'type': 'disabled'}
+    kwargs['extra_body'] = extra
+    return kwargs
+
+def setup_model(config):
+    """根据配置初始化模型"""
+    call_kwargs = _llm_call_kwargs(config)
+    if "max_tokens" in call_kwargs or "extra_body" in call_kwargs:
+        extra = call_kwargs.get("extra_body") or {}
+        thinking = extra.get("thinking") or {}
+        logging.info(
+            "LLM request knobs: style=%s max_tokens=%s thinking=%s "
+            "reasoning_effort=%s enable_thinking=%s",
+            thinking_api_style(config),
+            call_kwargs.get("max_tokens"),
+            thinking.get("type"),
+            extra.get("reasoning_effort"),
+            extra.get("enable_thinking"),
+        )
+    if config['MODEL_TYPE'] == 'deepseek':
+        llm = ChatOpenAI(
+            model='deepseek-chat',
+            openai_api_key=config['DEEPSEEK_API_KEY'],
+            openai_api_base='https://api.deepseek.com',
+            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
+        )
+        logging.info("使用 DeepSeek-chat 模型进行推理")
+    elif config['MODEL_TYPE'] == 'qwen':
+        llm = ChatOpenAI(
+            model='qwen/qwen3-235b-a22b-2507',
+            openai_api_key=config['QWEN_API_KEY'],
+            openai_api_base='https://openrouter.ai/api/v1',
+            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
+        )
+        logging.info("使用 Qwen 模型进行推理")
+    elif config['MODEL_TYPE'] == 'gemini':
+        llm = ChatOpenAI(
+            model='google/gemini-2.5-flash',
+            openai_api_key=config['GEMINI_API_KEY'],
+            openai_api_base='https://openrouter.ai/api/v1',
+            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
+        )
+        logging.info("使用 Gemini 模型进行推理")
+    else:
+        model_name = config.get('OPENAI_MODEL') or DEFAULT_OPENAI_MODEL
+        api_base = config.get('OPENAI_API_BASE') or DEFAULT_OPENAI_API_BASE
+        llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=config['OPENAI_API_KEY'],
+            openai_api_base=api_base,
+            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
+            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            **call_kwargs,
+        )
+        logging.info("使用 %s 模型进行推理 (base=%s).", model_name, api_base)
+    
+    return llm
