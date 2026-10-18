@@ -26,9 +26,7 @@ LIBRARY_END = "; proved lemma library end"
 
 NORMAL_KIND = "obligation_tree"
 
-# Kinds still emitted by derive_repair_hints and shown on the obligation tree.
-# Disabled / misleading kinds (need_stronger_lemma, need_induction_lemma,
-# induction_depth_limit, timeout, search_explosion-as-hint) are omitted.
+# Optional ATP guidance kinds that may appear on historical JSON nodes.
 GUIDANCE_HINT_KINDS = (
     "need_rewrite",
     "need_directed_rewrite",
@@ -720,7 +718,7 @@ def make_child_node(
         "lib": lib,
         "children": list(children or []),
     }
-    # ATP hints stay on the node prompt (FEEDBACK_REPAIR_HINTS), not the tree.
+    # Solver stuck/advice lines stay on the node prompt, not the tree.
     if reason and status == "invalid":
         node["reason"] = compact_formula(str(reason), MAX_FOCUS_CHARS * 2)
     return node

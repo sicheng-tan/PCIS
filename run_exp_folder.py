@@ -244,21 +244,12 @@ if __name__ == "__main__":
                             'default_simple 用 prompts_ours_compact（同两模板、精简 system）; '
                             'zero_shot 同 default; '
                             'naive 只用 prompt_naive 重复 2N 次')
-    parser.add_argument(
-        '--cvc-patterns',
-        choices=['on', 'off'],
-        default=None,
-        help='CVC 公理 :pattern 开关（暂弃用：即使 on 也不会开 6-way）。'
-             '默认 off，跟 CVC_PATTERNS',
-    )
     parser.add_argument('--result-dir', type=str, default=None,
                        help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
                             '未指定时副本在 result_files/，CSV 在 result_csv/')
     add_skip_file_argument(parser)
     args = parser.parse_args()
 
-    from exp_flags import apply_cvc_patterns_cli, cvc_patterns_enabled
-    apply_cvc_patterns_cli(args.cvc_patterns)    
     # 设置多进程启动方法（在某些系统上需要）
     multiprocessing.set_start_method('spawn', force=True)
     # 使用命令行参数设置原始文件夹路径
@@ -300,7 +291,6 @@ if __name__ == "__main__":
             print("   naive: 只用 prompt_naive，重复 2×MAX_ATTEMPTS_PER_PROMPT 次（关闭模板选择）")
         elif args.strategy_mode == "default_simple":
             print("   default_simple: 与 default 相同两模板，system 用 prompts_ours_compact")
-        print(f"📎 CVC patterns: {'on' if cvc_patterns_enabled() else 'off'}")
     
     # 存储所有结果
     results = []

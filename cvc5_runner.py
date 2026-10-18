@@ -1,5 +1,5 @@
 """
-CVC5/CVC4 runner with portfolio prove and difficulty dumps for PROMPT_ADVICE.
+CVC5/CVC4 runner with portfolio prove and optional difficulty dumps.
 
 Design notes vs Vampire:
 - Main prove path: multi-strategy portfolio. Optional --stats / difficulty

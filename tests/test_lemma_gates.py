@@ -17,8 +17,6 @@ os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from exp_flags import resolve_prompt_pack
 from lemma_gates import (
-    DIAGNOSIS_PROMPT_SUFFIX,
-    FINAL_DIAGNOSIS_PROMPT_SUFFIX,
     HD_AXIOM_GOAL_HINT,
     HD_DIFFICULTY_EXPLAIN,
     PARSE_ERR_EMPTY,
@@ -52,10 +50,7 @@ from lemma_gates import (
     parse_llm_counterexample_smt,
     llm_invalid_ce_verify_enabled,
     repair_hint_for_prompt,
-    should_append_diagnosis_suffix,
     should_accept_in_loop_invalid_goal,
-    should_run_final_diagnosis,
-    llm_lemma_diagnosis_final_only,
     undefined_symbols_in_lemma,
     tree_status_from_child_data,
     with_parse_retry_hint,
@@ -432,8 +427,6 @@ def test_parse_llm_reason() -> None:
     assert parse_final_diagnosis("; reason: plus has no axioms") == ("failed", None)
     assert parse_final_diagnosis("") == ("failed", None)
     with patch.dict(os.environ, {
-        "LLM_LEMMA_DIAGNOSIS": "on",
-        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
         "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
     }):
@@ -461,28 +454,20 @@ def test_parse_llm_reason() -> None:
         assert allow_unmarked_lemma_output(
             "thinking with no diagnosis line", diagnosis_only=True,
         )
-    with patch.dict(os.environ, {
-        "LLM_LEMMA_DIAGNOSIS": "on",
-        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
-    }):
-        assert not allow_unmarked_lemma_output(
-            "; INVALID_GOAL: plus has no axioms", diagnosis_only=False, depth=1,
-        )
-    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
-        assert not allow_unmarked_lemma_output(
-            "; INVALID_GOAL: plus has no axioms", diagnosis_only=False, depth=1,
-        )
+    # Child INVALID_GOAL is accepted by depth (system prompts), not a diagnosis flag.
+    assert allow_unmarked_lemma_output(
+        "; INVALID_GOAL: plus has no axioms", diagnosis_only=False, depth=1,
+    )
+    assert not allow_unmarked_lemma_output(
+        "; INVALID_GOAL: plus has no axioms", diagnosis_only=False, depth=0,
+    )
     assert is_invalid_diagnosis_reason("plus has no axioms")
     assert is_invalid_diagnosis_reason("invalid")
     assert not is_invalid_diagnosis_reason("still_open")
     assert not is_invalid_diagnosis_reason("failed")
     assert not is_invalid_diagnosis_reason(None)
-    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on"}):
-        assert should_run_final_diagnosis(1) is True
-        assert should_run_final_diagnosis(0) is False
-        assert should_run_final_diagnosis(1, has_invalid=False) is False
-    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
-        assert should_run_final_diagnosis(1) is False
+    assert should_accept_in_loop_invalid_goal(1) is True
+    assert should_accept_in_loop_invalid_goal(0) is False
     assert "CURRENT goal is also invalid" in format_diagnosis_invalid_prompt({
         "invalid_lemmas": [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}],
     })
@@ -524,8 +509,7 @@ def test_soft_vs_hard_rejected_lists() -> None:
         with patch.dict(os.environ, {
             "LEMMA_DEFINED_SYMBOLS": "off",
             "LEMMA_FILTER_DROP": "on",
-            "SOLVER_ROUTING": "off",
-            "LLM_SCREEN_RETRIES": "0",
+                        "LLM_SCREEN_RETRIES": "0",
             "LEMMA_WELLFORMED_CHECK": "off",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm", return_value=[soft_lemma]
@@ -676,8 +660,6 @@ def test_parse_llm_lemmas_xml_and_legacy() -> None:
         assert str(exc) == PARSE_ERR_EMPTY
     assert empty_raised
     with patch.dict(os.environ, {
-        "LLM_LEMMA_DIAGNOSIS": "on",
-        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
         "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
     }):
@@ -685,20 +667,11 @@ def test_parse_llm_lemmas_xml_and_legacy() -> None:
             "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
             depth=1,
         ) == []
-    with patch.dict(os.environ, {
-        "LLM_LEMMA_DIAGNOSIS": "on",
-        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
-    }):
-        final_only_raised = False
-        try:
-            parse_llm_lemmas(
-                "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
-                depth=1,
-            )
-        except ValueError as exc:
-            final_only_raised = True
-            assert str(exc) == PARSE_ERR_EMPTY
-        assert final_only_raised
+    # Child depth still accepts empty+INVALID_GOAL (early-stop); root does not.
+    assert parse_llm_lemmas(
+        "<output></output>\n; INVALID_GOAL: plus has no axioms\n",
+        depth=1,
+    ) == []
     root_invalid_raised = False
     try:
         parse_llm_lemmas(
@@ -885,8 +858,8 @@ def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
     assert "repair hints:" in txt
     assert "high-difficulty axiom:" in txt
     assert HD_DIFFICULTY_EXPLAIN in txt
-    assert "advice: TRIGGER" in txt
-    assert HD_AXIOM_GOAL_HINT not in txt
+    assert "advice:" not in txt
+    assert HD_AXIOM_GOAL_HINT in txt
     assert "rarely instantiated:" in txt
     assert "matching_weak:" not in txt
     assert "need_rewrite" not in txt
@@ -995,8 +968,7 @@ def test_quick_run_screen_retry_regenerates_once() -> None:
         with patch.dict(os.environ, {
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "on",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY_LOCAL": "off",
+                        "LEMMA_LIBRARY_LOCAL": "off",
             "LLM_SCREEN_RETRIES": "1",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm", side_effect=fake_gen,
@@ -1095,8 +1067,7 @@ def test_quick_run_rejects_undefined_plus() -> None:
         with patch.dict(os.environ, {
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "on",
-            "SOLVER_ROUTING": "off",
-            "LLM_SCREEN_RETRIES": "0",
+                        "LLM_SCREEN_RETRIES": "0",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm", return_value=[PLUS_LEMMA]
         ), patch("Mate_new_vampire.run_vampire") as vampire:
@@ -1122,8 +1093,7 @@ def test_quick_run_drops_undefined_keeps_snoc() -> None:
         with patch.dict(os.environ, {
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "on",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY_LOCAL": "off",
+                        "LEMMA_LIBRARY_LOCAL": "off",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm",
             return_value=[PLUS_LEMMA, SNOC_LEMMA],
@@ -1160,8 +1130,7 @@ def test_quick_run_library_duplicate_retries_goal_not_invalid() -> None:
             "LEMMA_LIBRARY_LOCAL": "off",
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "on",
-            "SOLVER_ROUTING": "off",
-            "LLM_SCREEN_RETRIES": "0",
+                        "LLM_SCREEN_RETRIES": "0",
         }):
             add_proved_lemma(tmp, SNOC_LEMMA, origin="seed")
             with patch(
@@ -1194,8 +1163,7 @@ def test_quick_run_filter_drop_off_aborts_whole_group() -> None:
         with patch.dict(os.environ, {
             "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "off",
-            "SOLVER_ROUTING": "off",
-            "LLM_SCREEN_RETRIES": "0",
+                        "LLM_SCREEN_RETRIES": "0",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm",
             return_value=[PLUS_LEMMA, SNOC_LEMMA],
@@ -1225,8 +1193,7 @@ def test_quick_run_skips_known_invalid_without_solver() -> None:
         data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
         mate.save_failed_lemmas(tmp, "template", data)
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "LEMMA_FILTER_DROP": "off",
+                        "LEMMA_FILTER_DROP": "off",
             "LLM_SCREEN_RETRIES": "0",
         }), patch(
             "Mate_new_vampire.generate_lemmas_with_llm",
@@ -1255,8 +1222,7 @@ def test_quick_run_drops_known_invalid_keeps_other() -> None:
         data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
         mate.save_failed_lemmas(tmp, "template", data)
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "LEMMA_DEFINED_SYMBOLS": "on",
+                        "LEMMA_DEFINED_SYMBOLS": "on",
             "LEMMA_FILTER_DROP": "on",
             "LEMMA_LIBRARY_LOCAL": "off",
         }), patch(
@@ -1289,8 +1255,7 @@ def test_quick_run_does_not_skip_unrelated_lemma() -> None:
         data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
         mate.save_failed_lemmas(tmp, "template", data)
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "LEMMA_DEFINED_SYMBOLS": "off",
+                        "LEMMA_DEFINED_SYMBOLS": "off",
             "LEMMA_WELLFORMED_CHECK": "off",
             "LLM_SCREEN_RETRIES": "0",
         }), patch(
@@ -1323,8 +1288,7 @@ def test_sat_aborts_child_without_llm() -> None:
         sat = VampireResult(status="sat", proved=False, elapsed=0.05)
         with patch.dict(os.environ, {
             "SUBGOAL_SAT_ABORT": "on",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
+                        "LEMMA_LIBRARY": "off",
         }), patch(
             "Mate_new_vampire.run_vampire_default", return_value=sat
         ), patch("Mate_new_vampire.generate_lemmas_with_llm") as gen:
@@ -1336,83 +1300,25 @@ def test_sat_aborts_child_without_llm() -> None:
         assert outcome.get("reason") == "solver:sat"
 
 
-def test_diagnosis_suffix_flag() -> None:
+def test_invalid_goal_accepted_by_depth_not_suffix() -> None:
+    """INVALID_GOAL early-stop is depth-gated; no extra diagnosis suffix is injected."""
     import Mate_new as mate
 
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
-            "LLM_INVALID_CE_VERIFY": "off",
-            "LLM_INVALID_ONLY_STOP": "off",
-        }):
-            root, _ = mate.create_prompt(
-                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-                "./prompts_ours", depth=0,
-            )
-            child, _ = mate.create_prompt(
-                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-                "./prompts_ours", depth=1,
-            )
-        assert "INVALID_GOAL: <short explanation>" not in root[1]["content"]
-        assert DIAGNOSIS_PROMPT_SUFFIX.strip() in child[1]["content"]
-        assert "; CE_SMT:" in child[1]["content"]
-        assert "emit <output></output>" in child[1]["content"]
-        assert "previously proposed child lemma is marked invalid" in child[1]["content"]
-        final, _ = mate.create_prompt(
+        root, _ = mate.create_prompt(
             _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-            "./prompts_ours", depth=1, diagnosis_only=True,
+            "./prompts_ours", depth=0,
         )
-        assert FINAL_DIAGNOSIS_PROMPT_SUFFIX.strip() in final[1]["content"]
-        assert "; CE_SMT:" in final[1]["content"]
-        assert "do not use <lemma> tags" in final[1]["content"]
-        assert "FINAL CHECK" in final[1]["content"]
-        assert "propose different lemmas" not in final[1]["content"]
-        assert "Using INVALID child lemmas" in final[1]["content"]
-        assert "output invalid" in final[1]["content"]
-        assert "output failed." in final[1]["content"]
-        assert "obligation tree" not in final[1]["content"]
-        assert "still_open" not in final[1]["content"]
-        assert "prior attempts" not in final[1]["content"]
-        with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
-        }):
-            child_final_only, _ = mate.create_prompt(
-                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-                "./prompts_ours", depth=1,
-            )
-        assert DIAGNOSIS_PROMPT_SUFFIX.strip() not in child_final_only[1]["content"]
-        assert "INVALID_GOAL: <short explanation>" not in child_final_only[1]["content"]
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
-            child_off, _ = mate.create_prompt(
-                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-                "./prompts_ours", depth=1,
-            )
-        assert "INVALID_GOAL: <short explanation>" not in child_off[1]["content"]
-
-
-def test_should_append_diagnosis_by_depth() -> None:
-    with patch.dict(os.environ, {
-        "LLM_LEMMA_DIAGNOSIS": "on",
-        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
-        "LLM_INVALID_CE_VERIFY": "off",
-            "LLM_INVALID_ONLY_STOP": "off",
-    }):
-        assert should_append_diagnosis_suffix(0) is False
-        assert should_append_diagnosis_suffix(1) is True
-        assert should_accept_in_loop_invalid_goal(1) is True
-    with patch.dict(os.environ, {
-        "LLM_LEMMA_DIAGNOSIS": "on",
-        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
-    }):
-        assert should_append_diagnosis_suffix(1) is False
-        assert should_accept_in_loop_invalid_goal(1) is False
-        assert llm_lemma_diagnosis_final_only() is True
-        assert should_run_final_diagnosis(1) is True
-    with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "off"}):
-        assert should_append_diagnosis_suffix(1) is False
+        child, _ = mate.create_prompt(
+            _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
+            "./prompts_ours", depth=1,
+        )
+    assert "FINAL CHECK" not in root[1]["content"]
+    assert "FINAL CHECK" not in child[1]["content"]
+    assert "emit <output></output>" not in child[1]["content"]
+    assert should_accept_in_loop_invalid_goal(0) is False
+    assert should_accept_in_loop_invalid_goal(1) is True
 
 
 def test_child_empty_reason_stops_attempts() -> None:
@@ -1427,15 +1333,12 @@ def test_child_empty_reason_stops_attempts() -> None:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         timeout = CvcResult(status="timeout", proved=False, elapsed=0.05)
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
+                        "LEMMA_LIBRARY": "off",
             "CHILD_LLM_ATTEMPTS": "2",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.generate_lemmas_with_llm", side_effect=fake_llm
         ) as gen:
             ok = mate.prove_run(tmp, "template", depth=1)
@@ -1493,16 +1396,13 @@ def test_llm_invalid_ce_verify_accepts_and_rejects() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(smt, encoding="utf-8")
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "on",
             "LLM_INVALID_ONLY_STOP": "off",
             "LLM_INVALID_CE_RETRIES": "0",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
+                        "LEMMA_LIBRARY": "off",
             "CHILD_LLM_ATTEMPTS": "2",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.generate_lemmas_with_llm", side_effect=fake_ok,
         ):
             ok = mate.prove_run(tmp, "template", depth=1)
@@ -1515,18 +1415,15 @@ def test_llm_invalid_ce_verify_accepts_and_rejects() -> None:
     with tempfile.TemporaryDirectory() as bad:
         (Path(bad) / "template.smt2").write_text(smt, encoding="utf-8")
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "on",
             "LLM_INVALID_ONLY_STOP": "off",
             "LLM_INVALID_CE_RETRIES": "0",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
+                        "LEMMA_LIBRARY": "off",
             "CHILD_LLM_ATTEMPTS": "2",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.generate_lemmas_with_llm", side_effect=fake_bad,
-        ) as gen, patch("Mate_new._run_final_goal_diagnosis", return_value=False):
+        ) as gen:
             ok2 = mate.prove_run(bad, "template", depth=1)
         assert ok2 is False
         assert gen.call_count == 2  # CE failed → continue attempts
@@ -1548,15 +1445,12 @@ def test_llm_invalid_only_stop_skips_hard_invalid() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "on",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
+                        "LEMMA_LIBRARY": "off",
             "CHILD_LLM_ATTEMPTS": "2",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.generate_lemmas_with_llm", side_effect=fake_gen,
         ) as gen:
             ok = mate.prove_run(tmp, "template", depth=1)
@@ -1604,16 +1498,13 @@ def test_llm_invalid_ce_retry_recovers_on_second_call() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(smt, encoding="utf-8")
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "on",
             "LLM_INVALID_ONLY_STOP": "off",
             "LLM_INVALID_CE_RETRIES": "1",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
+                        "LEMMA_LIBRARY": "off",
             "CHILD_LLM_ATTEMPTS": "2",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.generate_lemmas_with_llm", side_effect=fake,
         ) as gen:
             ok = mate.prove_run(tmp, "template", depth=1)
@@ -1624,7 +1515,8 @@ def test_llm_invalid_ce_retry_recovers_on_second_call() -> None:
         assert "Counterexample" in outcome.get("reason", "")
 
 
-def test_final_only_skips_in_loop_invalid_continues_attempts() -> None:
+def test_invalid_goal_early_stops_child() -> None:
+    """Empty INVALID_GOAL on a child ends the node (ONLY_STOP → kind=stopped)."""
     import Mate_new as mate
     from cvc5_runner import CvcResult
 
@@ -1636,23 +1528,19 @@ def test_final_only_skips_in_loop_invalid_continues_attempts() -> None:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         timeout = CvcResult(status="timeout", proved=False, elapsed=0.05)
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "on",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
             "LEMMA_LIBRARY": "off",
             "CHILD_LLM_ATTEMPTS": "2",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+            "LLM_INVALID_ONLY_STOP": "on",
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.generate_lemmas_with_llm", side_effect=fake_llm
-        ) as gen, patch(
-            "Mate_new._run_final_goal_diagnosis", return_value=False,
-        ) as final:
+        ) as gen:
             ok = mate.prove_run(tmp, "template", depth=1)
         assert ok is False
-        assert gen.call_count == 2
-        final.assert_called_once()
+        assert gen.call_count == 1
         outcome = mate.load_failed_lemmas(tmp, "template").get("node_outcome") or {}
-        assert outcome.get("kind") != "invalid" or outcome.get("source") != "llm"
+        assert outcome.get("kind") == "stopped"
+        assert "plus" in outcome.get("reason", "")
 
 
 class _InvalidGoalOnlyReply:
@@ -1682,8 +1570,6 @@ def _run_generate_lemmas(
         smt = Path(tmp) / "template.smt2"
         smt.write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
             "LLM_PARSE_RETRIES": retries,
@@ -1716,8 +1602,6 @@ def test_generate_reason_without_markers_stores_reason() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
             with patch.dict(os.environ, {
-                "LLM_LEMMA_DIAGNOSIS": "on",
-                "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
                 "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
                 "LLM_PARSE_RETRIES": "0",
@@ -1755,7 +1639,7 @@ def test_generate_unmarked_without_reason_still_raises() -> None:
     fake_llm.invoke.return_value = Fake()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
+        with patch.dict(os.environ, {"LLM_PARSE_RETRIES": "0"}), patch(
             "Mate_new.create_prompt",
             return_value=(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
@@ -1793,7 +1677,6 @@ def test_parse_retry_recovers_on_second_call() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
             with patch.dict(os.environ, {
-                "LLM_LEMMA_DIAGNOSIS": "on",
                 "LLM_PARSE_RETRIES": "1",
             }), patch(
                 f"{mod_name}.create_prompt",
@@ -1899,20 +1782,6 @@ def test_api_error_does_not_parse_retry() -> None:
     assert fake_llm.invoke.call_count == 1
 
 
-def test_final_diagnosis_does_not_parse_retry() -> None:
-    class Prose:
-        content = "not a structured verdict"
-
-    fake_llm = MagicMock()
-    fake_llm.invoke.return_value = Prose()
-    lemmas, stored = _run_generate_lemmas(
-        fake_llm, retries="2", diagnosis_only=True,
-    )
-    assert lemmas == []
-    assert stored == "failed"
-    assert fake_llm.invoke.call_count == 1
-
-
 def test_parse_retry_does_not_consume_extra_attempt() -> None:
     import Mate_new as mate
     from cvc5_runner import CvcResult
@@ -1939,16 +1808,13 @@ def test_parse_retry_does_not_consume_extra_attempt() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
             "LLM_PARSE_RETRIES": "1",
             "CHILD_LLM_ATTEMPTS": "2",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+                        "LEMMA_LIBRARY": "off",
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.llm", fake_llm
         ), patch("Mate_new.generate_lemmas_with_llm", counting):
             ok = mate.prove_run(tmp, "template", depth=1)
@@ -1989,7 +1855,7 @@ def test_generate_cot_reason_without_tag_still_raises() -> None:
     fake_llm.invoke.return_value = _CotReasonOnlyReply()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
+        with patch.dict(os.environ, {"LLM_PARSE_RETRIES": "0"}), patch(
             "Mate_new.create_prompt",
             return_value=(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
@@ -2028,7 +1894,7 @@ def test_empty_output_cot_reason_does_not_store_invalid() -> None:
     fake_llm.invoke.return_value = Fake()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {"LLM_LEMMA_DIAGNOSIS": "on", "LLM_PARSE_RETRIES": "0"}), patch(
+        with patch.dict(os.environ, {"LLM_PARSE_RETRIES": "0"}), patch(
             "Mate_new.create_prompt",
             return_value=(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
@@ -2080,12 +1946,9 @@ def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
         with patch.dict(os.environ, {
             "OBLIGATION_TREE": "on",
             "LEMMA_LIBRARY": "off",
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
-            "FEEDBACK_REPAIR_HINTS": "off",
-        }):
+                    }):
             root, root_extra = mate.create_prompt(
                 _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
                 "./prompts_ours", depth=0,
@@ -2094,20 +1957,13 @@ def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
                 _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
                 "./prompts_ours", depth=1,
             )
-            final, final_extra = mate.create_prompt(
-                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-                "./prompts_ours", depth=1, diagnosis_only=True,
-            )
         assert "L1  invalid [plus has no axioms]" in root_extra
         assert judge not in root[1]["content"]
         assert judge not in root_extra
-        assert judge in child_extra
-        assert judge in child[1]["content"]
-        assert "INVALID_GOAL: <short explanation>" in child[1]["content"]
-        assert "Invalid lemma 1 (plus has no axioms)" in final_extra
-        assert "Last obligation tree" not in final_extra
-        assert "INVALID_GOAL: <short explanation>" in final[1]["content"]
-        assert "Using INVALID child lemmas" in final[1]["content"]
+        assert "Invalid lemma 1 (plus has no axioms)" in child_extra
+        # INVALID_GOAL lives in the child system template (not a diagnosis suffix).
+        assert "INVALID_GOAL" in child[0]["content"]
+        # Child may still see INVALID write-back guidance; root must not.
 
 
 def test_cvc5_unmarked_reason_marks_child_invalid() -> None:
@@ -2120,15 +1976,12 @@ def test_cvc5_unmarked_reason_marks_child_invalid() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
             "LLM_INVALID_CE_VERIFY": "off",
             "LLM_INVALID_ONLY_STOP": "off",
             "SUBGOAL_SAT_ABORT": "off",
-            "SOLVER_ROUTING": "off",
-            "LEMMA_LIBRARY": "off",
+                        "LEMMA_LIBRARY": "off",
             "CHILD_LLM_ATTEMPTS": "2",
-        }), patch("Mate_new.run_cvc_routed", return_value=timeout), patch(
+        }), patch("Mate_new.run_cvc", return_value=timeout), patch(
             "Mate_new.create_prompt",
             return_value=(
                 [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
@@ -2221,8 +2074,6 @@ def test_prompt_invalid_not_unproved_and_drops_child_atp() -> None:
     assert "do not weaken" in txt
     assert "plus has no axioms" in txt
     assert "USEFUL BUT UNPROVED" not in txt
-    assert "root stuck" in txt
-    assert "root rewrite" not in txt
     assert "child stuck" not in txt
     assert "child induction" not in txt
 
@@ -2260,11 +2111,9 @@ def test_invalid_child_does_not_stop_parent_attempts() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "CHILD_LLM_ATTEMPTS": "2",
+                        "CHILD_LLM_ATTEMPTS": "2",
             "SUBGOAL_SAT_ABORT": "off",
             "LEMMA_LIBRARY": "off",
-            "LLM_LEMMA_DIAGNOSIS": "on",
             "OBLIGATION_TREE": "off",
         }), patch(
             "Mate_new_vampire.perform_initial_verification", return_value=False
@@ -2278,196 +2127,9 @@ def test_invalid_child_does_not_stop_parent_attempts() -> None:
             ok = mate.prove_run(tmp, "template", depth=1)
         assert ok is False
         assert calls["n"] == 2
-        assert diagnoses["n"] == 1
+        assert diagnoses["n"] == 0
         outcome = mate.load_failed_lemmas(tmp, "template").get("node_outcome") or {}
         assert outcome.get("kind") != "invalid"
-
-
-def test_final_diagnosis_prompt_is_invalid_only() -> None:
-    import Mate_new as mate
-    from obligation_tree import append_attempt, make_child_node, make_goal_tree
-
-    tree = make_goal_tree(
-        "template",
-        [
-            make_child_node(
-                node_id="template_1",
-                formula=PLUS_LEMMA,
-                status="invalid",
-                reason="plus has no axioms",
-            ),
-        ],
-        proved=False,
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        data = mate._empty_failed_data()
-        data["invalid_lemmas"] = [{"lemma": PLUS_LEMMA, "reason": "plus has no axioms"}]
-        data["unproved_lemmas"] = [{"lemma": SNOC_LEMMA, "status": "timeout"}]
-        data["repair_hints"] = [{
-            "kind": "need_rewrite",
-            "context": "initial_goal",
-            "detail": "root rewrite",
-            "suggested_actions": [],
-        }]
-        data["last_llm_reason"] = "previous empty"
-        data["obligation"] = append_attempt({}, "obligation_tree", tree)
-        mate.save_failed_lemmas(tmp, "template", data)
-        with patch.dict(os.environ, {
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "OBLIGATION_TREE": "on",
-            "LEMMA_LIBRARY": "on",
-            "FEEDBACK_REPAIR_HINTS": "on",
-            "UNPROVED_NOT_INVALID": "on",
-        }):
-            messages, extra = mate.create_prompt(
-                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-                "./prompts_ours", depth=1, diagnosis_only=True,
-            )
-            gen, gen_extra = mate.create_prompt(
-                _GOAL, "prove_prompt_equational_reasoning", tmp, "template",
-                "./prompts_ours", depth=1, diagnosis_only=False,
-            )
-        text = messages[1]["content"]
-        assert "FINAL CHECK" in text
-        assert "Using INVALID child lemmas" in text
-        assert "Invalid lemma 1 (plus has no axioms)" in extra
-        assert "The following lemmas are INVALID or CANNOT" in extra
-        assert "Last obligation tree" not in extra
-        assert "L1  invalid" not in extra
-        assert "USEFUL BUT UNPROVED" not in text
-        assert "USEFUL BUT UNPROVED" not in extra
-        assert "SOLVER-GUIDED REPAIR" not in extra
-        assert "root rewrite" not in extra
-        assert "Previous empty output reason" not in text
-        assert "Previous empty output reason" not in gen_extra
-        assert "The following lemmas are INVALID or CANNOT" in gen_extra
-        assert "Last obligation tree" in gen_extra
-
-
-def test_final_diagnosis_marks_goal_invalid() -> None:
-    import Mate_new_vampire as mate
-    from obligation_tree import make_child_node
-
-    child = make_child_node(
-        node_id="template_1",
-        formula=PLUS_LEMMA,
-        status="invalid",
-        reason="plus has no defining axioms",
-    )
-
-    def fake_quick(*_args, **_kwargs):
-        return True, ["template_1"], [PLUS_LEMMA]
-
-    def fake_parallel(base_path, *_args, **_kwargs):
-        mate.add_invalid_lemma(
-            base_path, "template", PLUS_LEMMA, "plus has no defining axioms",
-        )
-        return False, [child]
-
-    def fake_gen(*_args, diagnosis_only=False, **_kwargs):
-        if diagnosis_only:
-            mate._store_last_llm_reason(
-                _args[3], _args[4], "plus has no defining axioms",
-            )
-            return []
-        return []
-
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "CHILD_LLM_ATTEMPTS": "2",
-            "SUBGOAL_SAT_ABORT": "off",
-            "LEMMA_LIBRARY": "off",
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "LLM_INVALID_CE_VERIFY": "off",
-            "LLM_INVALID_ONLY_STOP": "off",
-            "OBLIGATION_TREE": "off",
-        }), patch(
-            "Mate_new_vampire.perform_initial_verification", return_value=False
-        ), patch(
-            "Mate_new_vampire.quick_run", side_effect=fake_quick
-        ), patch(
-            "Mate_new_vampire.prove_subgoals_parallel",
-            side_effect=fake_parallel,
-        ), patch(
-            "Mate_new_vampire.generate_lemmas_with_llm", side_effect=fake_gen
-        ):
-            ok = mate.prove_run(tmp, "template", depth=1)
-        assert ok is False
-        outcome = mate.load_failed_lemmas(tmp, "template")["node_outcome"]
-        assert outcome.get("kind") == "invalid"
-        assert "plus" in outcome.get("reason", "")
-        assert outcome.get("source") == "llm_final"
-
-
-def test_final_diagnosis_skipped_without_invalid() -> None:
-    import Mate_new_vampire as mate
-
-    diag = {"n": 0}
-
-    def fake_quick(*_args, **_kwargs):
-        return False, [], [
-            "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
-        ]
-
-    def fake_gen(*_args, diagnosis_only=False, **_kwargs):
-        if diagnosis_only:
-            diag["n"] += 1
-        return []
-
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "CHILD_LLM_ATTEMPTS": "2",
-            "SUBGOAL_SAT_ABORT": "off",
-            "LEMMA_LIBRARY": "off",
-            "LLM_LEMMA_DIAGNOSIS": "on",
-            "OBLIGATION_TREE": "off",
-        }), patch(
-            "Mate_new_vampire.perform_initial_verification", return_value=False
-        ), patch(
-            "Mate_new_vampire.quick_run", side_effect=fake_quick
-        ), patch(
-            "Mate_new_vampire.generate_lemmas_with_llm", side_effect=fake_gen
-        ):
-            ok = mate.prove_run(tmp, "template", depth=1)
-        assert ok is False
-        assert diag["n"] == 0
-        assert mate.load_failed_lemmas(tmp, "template").get("invalid_lemmas") in ([], None)
-        outcome = mate.load_failed_lemmas(tmp, "template").get("node_outcome") or {}
-        assert outcome.get("kind") != "invalid"
-
-
-def test_final_diagnosis_skipped_at_root() -> None:
-    import Mate_new_vampire as mate
-
-    gen = {"n": 0}
-
-    def fake_quick(*_args, **_kwargs):
-        return False, [], []
-
-    def fake_gen(*_args, diagnosis_only=False, **_kwargs):
-        gen["n"] += 1
-        return []
-
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "template.smt2").write_text(_GOAL, encoding="utf-8")
-        with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "LLM_LEMMA_DIAGNOSIS": "on",
-        }), patch(
-            "Mate_new_vampire.perform_initial_verification", return_value=False
-        ), patch(
-            "Mate_new_vampire.quick_run", side_effect=fake_quick
-        ), patch(
-            "Mate_new_vampire.generate_lemmas_with_llm", side_effect=fake_gen
-        ), patch.dict(mate.config, {"MAX_ATTEMPTS_PER_PROMPT": 1}):
-            ok = mate.prove_run(tmp, "template", depth=0)
-        assert ok is False
-        assert gen["n"] == 0
 
 
 def main() -> int:
@@ -2504,14 +2166,13 @@ def main() -> int:
     test_quick_run_skips_known_invalid_without_solver()
     test_quick_run_drops_known_invalid_keeps_other()
     test_sat_aborts_child_without_llm()
-    test_diagnosis_suffix_flag()
-    test_should_append_diagnosis_by_depth()
+    test_invalid_goal_accepted_by_depth_not_suffix()
     test_child_empty_reason_stops_attempts()
     test_parse_llm_counterexample_smt_block()
     test_llm_invalid_ce_verify_accepts_and_rejects()
     test_llm_invalid_only_stop_skips_hard_invalid()
     test_llm_invalid_ce_retry_recovers_on_second_call()
-    test_final_only_skips_in_loop_invalid_continues_attempts()
+    test_invalid_goal_early_stops_child()
     test_generate_reason_without_markers_stores_reason()
     test_generate_unmarked_without_reason_still_raises()
     test_parse_retry_recovers_on_second_call()
@@ -2520,7 +2181,6 @@ def main() -> int:
     test_empty_output_does_parse_retry()
     test_empty_output_with_invalid_goal_stores_reason()
     test_api_error_does_not_parse_retry()
-    test_final_diagnosis_does_not_parse_retry()
     test_parse_retry_does_not_consume_extra_attempt()
     test_lemma_prompt_xml_contract()
     test_generate_cot_reason_without_tag_still_raises()
@@ -2531,10 +2191,6 @@ def main() -> int:
     test_cancelled_invalid_child_keeps_reason()
     test_prompt_invalid_not_unproved_and_drops_child_atp()
     test_invalid_child_does_not_stop_parent_attempts()
-    test_final_diagnosis_prompt_is_invalid_only()
-    test_final_diagnosis_marks_goal_invalid()
-    test_final_diagnosis_skipped_without_invalid()
-    test_final_diagnosis_skipped_at_root()
     print("lemma gate tests passed")
     return 0
 

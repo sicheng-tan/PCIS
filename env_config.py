@@ -74,13 +74,10 @@ def setup_environment():
     induction_scheme_goal_gate = os.getenv('INDUCTION_SCHEME_GOAL_GATE', 'on')
     induction_scheme_prompt = os.getenv('INDUCTION_SCHEME_PROMPT', 'on')
     induction_scheme_nest = os.getenv('INDUCTION_SCHEME_NEST', 'cross_sort')
-    prompt_advice = os.getenv('PROMPT_ADVICE', 'on')
     unproved_not_invalid = os.getenv('UNPROVED_NOT_INVALID', 'on')
     subgoal_sat_abort = os.getenv('SUBGOAL_SAT_ABORT', 'on')
     lemma_defined_symbols = os.getenv('LEMMA_DEFINED_SYMBOLS', 'on')
     lemma_filter_drop = os.getenv('LEMMA_FILTER_DROP', 'on')
-    llm_lemma_diagnosis = os.getenv('LLM_LEMMA_DIAGNOSIS', 'on')
-    llm_lemma_diagnosis_final_only = os.getenv('LLM_LEMMA_DIAGNOSIS_FINAL_ONLY', 'off')
     llm_invalid_ce_verify = os.getenv('LLM_INVALID_CE_VERIFY', 'off')
     llm_invalid_ce_retries = os.getenv('LLM_INVALID_CE_RETRIES', '1')
     llm_invalid_only_stop = os.getenv('LLM_INVALID_ONLY_STOP', 'on')
@@ -150,13 +147,10 @@ def setup_environment():
         'INDUCTION_SCHEME_GOAL_GATE': induction_scheme_goal_gate,
         'INDUCTION_SCHEME_PROMPT': induction_scheme_prompt,
         'INDUCTION_SCHEME_NEST': induction_scheme_nest,
-        'PROMPT_ADVICE': prompt_advice,
         'UNPROVED_NOT_INVALID': unproved_not_invalid,
         'SUBGOAL_SAT_ABORT': subgoal_sat_abort,
         'LEMMA_DEFINED_SYMBOLS': lemma_defined_symbols,
         'LEMMA_FILTER_DROP': lemma_filter_drop,
-        'LLM_LEMMA_DIAGNOSIS': llm_lemma_diagnosis,
-        'LLM_LEMMA_DIAGNOSIS_FINAL_ONLY': llm_lemma_diagnosis_final_only,
         'LLM_INVALID_CE_VERIFY': llm_invalid_ce_verify,
         'LLM_INVALID_CE_RETRIES': llm_invalid_ce_retries,
         'LLM_INVALID_ONLY_STOP': llm_invalid_only_stop,

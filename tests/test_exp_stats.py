@@ -88,16 +88,17 @@ def test_summarize_artifacts_counts_attempts_and_library(tmp_path: Path) -> None
     assert summary["n_library_lemmas"] == 1
     assert summary["n_progress_lemmas"] == 1
     assert summary["n_unproved"] == 1
-    assert summary["theory"] == "adt"
+    # Routing removed: theory / profile fields stay empty for compatibility.
+    assert summary["theory"] == ""
+    assert summary["active_profile"] == ""
+    assert summary["winner_profile"] == ""
     assert summary["max_goal_depth"] == 2
-    assert "need_rewrite" in summary["hint_kinds"]
-    assert "need_arithmetic_lemma" in summary["hint_kinds"]
-    assert summary["winner_profile"] == "cvc5_inductive"
-    assert summary["active_profile"] == "adt_structural"
+    # repair_hints writers removed with Module-1 feedback; kinds stay empty.
+    assert summary["hint_kinds"] == []
     assert summary["n_cancelled"] == 1
     assert summary["n_subgoals_proved"] == 1
     assert summary["n_subgoals_failed"] == 1
-    assert summary["n_fallback"] == 1
+    assert summary["n_fallback"] == 0
     assert summary["n_goals_touched"] == 2
     assert summary["n_invalid"] == 0
     assert summary["n_invalid_lemmas"] == 0
@@ -146,10 +147,14 @@ def test_write_task_summary_and_csv(tmp_path: Path) -> None:
 def test_flags_compact_includes_ablation_keys() -> None:
     compact = flags_compact()
     assert "LEMMA_LIBRARY=" in compact
+    assert "OBLIGATION_TREE=" in compact
+    assert "INVALID_LEMMAS=" in compact
     assert "LEMMA_LIBRARY_LOCAL=" in compact
     assert "USEFULNESS_HARVEST_DELAY_S=" in compact
     assert "HARVEST_RETRY_TIMEOUT=" in compact
-    assert "PROMPT_ADVICE=" in compact
+    assert "ANCESTOR_CYCLE_FILTER=" in compact
+    assert "ANCESTOR_PROMPT=" in compact
+    assert "PROMPT_ADVICE=" not in compact
     assert "MODEL_TYPE=" in compact
     assert "OPENAI_MODEL=" in compact
     assert "ENABLE_THINKING=" in compact
@@ -160,7 +165,9 @@ def test_flags_compact_includes_ablation_keys() -> None:
     assert "PROBLEM_PROFILER=" in compact
     assert "PROBLEM_PROFILER_MIN_ATTEMPT=" in compact
     assert "PROBLEM_PROFILER_TRIGGER=" in compact
-    assert "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY=" in compact
+    assert "INDUCTION_SCHEME=" in compact
+    assert "INDUCTION_SCHEME_NEST=" in compact
+    assert "LEMMA_WELLFORMED_CHECK=" in compact
     assert "LLM_INVALID_CE_VERIFY=" in compact
     assert "LLM_INVALID_CE_RETRIES=" in compact
     assert "LLM_INVALID_ONLY_STOP=" in compact
@@ -199,11 +206,10 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
         "  repair hints:\n"
         "Library (already proved, in axioms):\n"
         "Last obligation tree (attempt 2; for reference only):\n"
-        "    advice: TRIGGER\n"
     )
     inv = log_prompt_blocks(folder, "template", "prove_prompt_term_rewrite", feedback)
     assert inv["has_tree"] is True
-    assert inv["has_advice"] is True
+    assert "has_advice" not in inv
     assert inv["has_lib"] is True
     assert inv["has_hints"] is True
     assert inv["has_progress"] is True

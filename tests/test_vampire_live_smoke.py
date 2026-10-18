@@ -90,7 +90,7 @@ def test_live_vampire_routed_matches_race() -> None:
         path.write_text(_TRIVIAL_UNSAT, encoding="utf-8")
         with patch.dict(
             os.environ,
-            {"SOLVER_ROUTING": "off", "VAMPIRE_SERIAL_DUAL": "on"},
+            {"VAMPIRE_SERIAL_DUAL": "on"},
             clear=False,
         ):
             result = run_vampire_default(

@@ -16,33 +16,40 @@ os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from exp_flags import (
-    collect_difficulty_for_feedback,
+    ancestor_cycle_filter_enabled,
+    ancestor_prompt_enabled,
+    induction_scheme_enabled,
+    induction_scheme_mode,
+    induction_scheme_nest_policy,
     normalize_strategy_mode,
     paper_schedule_prompt,
     problem_profiler_enabled,
-    prompt_advice_enabled,
     resolve_prompt_pack,
+    should_inject_problem_profiler,
+    should_run_induction_scheme,
     unproved_not_invalid_enabled,
 )
 from lemma_gates import (
     defined_symbols_enabled,
     lemma_filter_drop_enabled,
-    llm_lemma_diagnosis_enabled,
-    llm_lemma_diagnosis_final_only,
     llm_invalid_ce_verify_enabled,
     llm_invalid_only_stop_enabled,
+    should_accept_in_loop_invalid_goal,
     subgoal_sat_abort_enabled,
+)
+from obligation_tree import (
+    invalid_lemmas_mode,
+    invalid_lemmas_paper_mode,
+    lemma_library_enabled,
+    obligation_tree_enabled,
 )
 
 _FLAG_NAMES = (
     "PROBLEM_PROFILER",
-    "PROMPT_ADVICE",
     "UNPROVED_NOT_INVALID",
     "SUBGOAL_SAT_ABORT",
     "LEMMA_DEFINED_SYMBOLS",
     "LEMMA_FILTER_DROP",
-    "LLM_LEMMA_DIAGNOSIS",
-    "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY",
     "LLM_INVALID_CE_VERIFY",
     "LLM_INVALID_CE_RETRIES",
     "LLM_INVALID_ONLY_STOP",
@@ -79,24 +86,17 @@ def test_flags_default_on() -> None:
     saved = _clear_flags()
     try:
         assert problem_profiler_enabled() is False
-        assert prompt_advice_enabled() is True
         assert unproved_not_invalid_enabled() is True
         assert subgoal_sat_abort_enabled() is True
         assert defined_symbols_enabled() is True
         assert lemma_filter_drop_enabled() is True
-        assert llm_lemma_diagnosis_enabled() is True
-        assert llm_lemma_diagnosis_final_only() is False
         assert llm_invalid_ce_verify_enabled() is False
         assert llm_invalid_only_stop_enabled() is True
-        assert collect_difficulty_for_feedback() is True
     finally:
         _restore_flags(saved)
     for val in ("off", "0", "false", "no"):
         with patch.dict(os.environ, {"PROBLEM_PROFILER": val}):
             assert problem_profiler_enabled() is False
-        with patch.dict(os.environ, {"PROMPT_ADVICE": val}):
-            assert prompt_advice_enabled() is False
-            assert collect_difficulty_for_feedback() is False
         with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": val}):
             assert unproved_not_invalid_enabled() is False
 
@@ -176,6 +176,7 @@ def test_format_solver_feedback_pcr_sections() -> None:
     assert "USEFUL BUT UNPROVED" in txt
     assert "SOLVER PROGRESS SIGNALS" not in txt
     assert "SOLVER ROUTING" not in txt
+    assert "    advice:" not in txt
 
     with patch.dict(os.environ, {"UNPROVED_NOT_INVALID": "off"}):
         off_txt = mate.format_solver_feedback_for_prompt(_FEEDBACK_PAYLOAD)
@@ -217,3 +218,73 @@ def test_vampire_paper_order() -> None:
             assert mate_v.prove_run(tmp, "template") is False
     assert calls[:3] == ["prove_prompt_equational_reasoning"] * 3
     assert calls[3:] == ["prove_prompt_term_rewrite"] * 3
+
+
+def test_main_ablation_matrix_flags() -> None:
+    """PCR / GSE / PCIS switch matrix from the paper main table."""
+    useless = {"exp_attempts": [{"kind": "useless"}]}
+
+    pcr = {
+        "LEMMA_LIBRARY": "on",
+        "OBLIGATION_TREE": "on",
+        "INVALID_LEMMAS": "on",
+        "LEMMA_LIBRARY_LOCAL": "on",
+        "ANCESTOR_CYCLE_FILTER": "on",
+        "ANCESTOR_PROMPT": "on",
+        "UNPROVED_NOT_INVALID": "on",
+        "PROBLEM_PROFILER": "off",
+        "INDUCTION_SCHEME": "off",
+        "LLM_INVALID_ONLY_STOP": "on",
+    }
+    with patch.dict(os.environ, pcr, clear=False):
+        assert lemma_library_enabled() and obligation_tree_enabled()
+        assert invalid_lemmas_mode() == "on" and not invalid_lemmas_paper_mode()
+        assert unproved_not_invalid_enabled()
+        assert not problem_profiler_enabled() and not induction_scheme_enabled()
+        assert llm_invalid_only_stop_enabled()
+        assert should_accept_in_loop_invalid_goal(1)
+        assert not should_accept_in_loop_invalid_goal(0)
+
+    gse = {
+        "LEMMA_LIBRARY": "off",
+        "OBLIGATION_TREE": "off",
+        "INVALID_LEMMAS": "paper",
+        "LEMMA_LIBRARY_LOCAL": "off",
+        "ANCESTOR_CYCLE_FILTER": "off",
+        "ANCESTOR_PROMPT": "off",
+        "UNPROVED_NOT_INVALID": "off",
+        "PROBLEM_PROFILER": "on",
+        "PROBLEM_PROFILER_MIN_ATTEMPT": "2",
+        "PROBLEM_PROFILER_TRIGGER": "after_useless",
+        "INDUCTION_SCHEME": "on",
+        "INDUCTION_SCHEME_MODE": "both",
+        "INDUCTION_SCHEME_TRIGGER": "after_useless",
+        "INDUCTION_SCHEME_NEST": "cross_sort",
+        "LLM_INVALID_ONLY_STOP": "on",
+    }
+    with patch.dict(os.environ, gse, clear=False):
+        assert not lemma_library_enabled() and not obligation_tree_enabled()
+        assert invalid_lemmas_paper_mode() and not unproved_not_invalid_enabled()
+        assert not ancestor_cycle_filter_enabled() and not ancestor_prompt_enabled()
+        assert problem_profiler_enabled() and induction_scheme_enabled()
+        assert induction_scheme_mode() == "both"
+        assert induction_scheme_nest_policy() == "cross_sort"
+        assert should_inject_problem_profiler(useless)
+        assert should_run_induction_scheme(useless)
+        assert not should_inject_problem_profiler({"exp_attempts": []})
+
+    pcis = {
+        **pcr,
+        "PROBLEM_PROFILER": "on",
+        "PROBLEM_PROFILER_MIN_ATTEMPT": "2",
+        "PROBLEM_PROFILER_TRIGGER": "after_useless",
+        "INDUCTION_SCHEME": "on",
+        "INDUCTION_SCHEME_MODE": "both",
+        "INDUCTION_SCHEME_TRIGGER": "after_useless",
+        "INDUCTION_SCHEME_NEST": "cross_sort",
+    }
+    with patch.dict(os.environ, pcis, clear=False):
+        assert lemma_library_enabled() and obligation_tree_enabled()
+        assert problem_profiler_enabled() and induction_scheme_enabled()
+        assert should_inject_problem_profiler(useless)
+        assert should_run_induction_scheme(useless)

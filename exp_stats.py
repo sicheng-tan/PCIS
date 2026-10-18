@@ -87,10 +87,13 @@ _COUNTER_KEYS = (
 _FLAG_ENV = (
     "LEMMA_LIBRARY",
     "OBLIGATION_TREE",
+    "INVALID_LEMMAS",
     "LEMMA_LIBRARY_LOCAL",
     "USEFULNESS_HARVEST_DELAY_S",
     "HARVEST_RETRY_TIMEOUT",
     "ROOT_FINISH_PROVE_TIMEOUT",
+    "ANCESTOR_CYCLE_FILTER",
+    "ANCESTOR_PROMPT",
     "PROBLEM_PROFILER",
     "PROBLEM_PROFILER_MIN_ATTEMPT",
     "PROBLEM_PROFILER_TRIGGER",
@@ -99,13 +102,12 @@ _FLAG_ENV = (
     "INDUCTION_SCHEME_TRIGGER",
     "INDUCTION_SCHEME_GOAL_GATE",
     "INDUCTION_SCHEME_PROMPT",
-    "PROMPT_ADVICE",
+    "INDUCTION_SCHEME_NEST",
     "UNPROVED_NOT_INVALID",
     "SUBGOAL_SAT_ABORT",
     "LEMMA_DEFINED_SYMBOLS",
     "LEMMA_FILTER_DROP",
-    "LLM_LEMMA_DIAGNOSIS",
-    "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY",
+    "LEMMA_WELLFORMED_CHECK",
     "LLM_INVALID_CE_VERIFY",
     "LLM_INVALID_CE_RETRIES",
     "LLM_INVALID_ONLY_STOP",
@@ -373,11 +375,9 @@ def log_prompt_blocks(
         "has_useless": "LAST ATTEMPT" in text,
         "has_progress": "SOLVER PROGRESS SIGNALS" in text,
         "has_unproved": "USEFUL BUT UNPROVED" in text,
-        "has_routing": "SOLVER ROUTING" in text,
         "has_hints": "  repair hints:" in text or "INITIAL SOLVE" in text,
         "has_lib": "already proved" in text or "LEMMA LIBRARY" in text,
         "has_tree": "Last obligation tree" in text,
-        "has_advice": "    advice:" in text,
     }
     log_exp("prompt_blocks", goal=goal, prompt=prompt_mode, **inv)
     if folder:
@@ -424,10 +424,13 @@ def ablation_flag_snapshot() -> Dict[str, str]:
     defaults = {
         "LEMMA_LIBRARY": "on",
         "OBLIGATION_TREE": "on",
+        "INVALID_LEMMAS": "on",
         "LEMMA_LIBRARY_LOCAL": "on",
         "USEFULNESS_HARVEST_DELAY_S": "2",
         "HARVEST_RETRY_TIMEOUT": "2",
         "ROOT_FINISH_PROVE_TIMEOUT": "120",
+        "ANCESTOR_CYCLE_FILTER": "on",
+        "ANCESTOR_PROMPT": "on",
         "PROBLEM_PROFILER": "off",
         "PROBLEM_PROFILER_MIN_ATTEMPT": "1",
         "PROBLEM_PROFILER_TRIGGER": "always",
@@ -436,13 +439,12 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "INDUCTION_SCHEME_TRIGGER": "after_useless",
         "INDUCTION_SCHEME_GOAL_GATE": "on",
         "INDUCTION_SCHEME_PROMPT": "on",
-        "PROMPT_ADVICE": "on",
+        "INDUCTION_SCHEME_NEST": "cross_sort",
         "UNPROVED_NOT_INVALID": "on",
         "SUBGOAL_SAT_ABORT": "on",
         "LEMMA_DEFINED_SYMBOLS": "on",
         "LEMMA_FILTER_DROP": "on",
-        "LLM_LEMMA_DIAGNOSIS": "on",
-        "LLM_LEMMA_DIAGNOSIS_FINAL_ONLY": "off",
+        "LEMMA_WELLFORMED_CHECK": "on",
         "LLM_INVALID_CE_VERIFY": "off",
         "LLM_INVALID_CE_RETRIES": "1",
         "LLM_INVALID_ONLY_STOP": "on",
@@ -525,6 +527,7 @@ def _depth_from_goal_name(goal_name: str) -> int:
 
 
 def _hint_kinds(failed_data: dict) -> List[str]:
+    """Legacy repair-hint kinds; PCIS no longer writes ``repair_hints``."""
     del failed_data
     return []
 
@@ -724,6 +727,7 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
     all_hints: List[str] = []
     hint_seen = set()
     for data in records.values():
+        n_progress += len(data.get("progress_lemmas") or [])
         n_invalid_lemmas += len(data.get("invalid_lemmas") or [])
         n_useless_groups += len(data.get("useless_lemma_groups") or [])
         n_unproved += len(data.get("unproved_lemmas") or [])

@@ -1,22 +1,15 @@
-"""Tests for CVC ``:pattern`` helpers and gating (any strategy mode)."""
+"""Tests for SMT-LIB formula helpers (normalize / assert wrap)."""
 
 from __future__ import annotations
-
-import os
 
 from smt_patterns import (
     equality_lhs,
     format_assert_line,
     has_directed_equality,
     infer_trigger_pattern,
-    pattern_trigger_reasons,
-    should_add_cvc_patterns,
     strip_bang_attrs,
-    v2_pattern_features,
-    v2_should_add_cvc_patterns,
 )
 from obligation_tree import inject_library_axioms
-from exp_flags import apply_cvc_patterns_cli, cvc_patterns_enabled
 
 
 def _ok(cond: bool, msg: str = "") -> None:
@@ -73,139 +66,11 @@ def test_inject_library_with_patterns() -> None:
     _ok(":pattern" not in bare, bare)
 
 
-def _rare_inst_failed() -> dict:
-    return {
-        "repair_hints": [{
-            "kind": "high_difficulty_assertions",
-            "rarely_instantiated": ["(forall ((x Nat)) true)"],
-        }],
-    }
-
-
-def test_pattern_gate_requires_flag() -> None:
-    eq = "(forall ((x Nat)) (= (f x) x))"
-    failed = _rare_inst_failed()
-    prev = os.environ.pop("CVC_PATTERNS", None)
-    try:
-        _ok(not cvc_patterns_enabled())
-        _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
-        # Feedback 6-way is deprecated: enabled=True still does not open.
-        _ok(
-            not should_add_cvc_patterns(
-                failed_data=failed, formulas=[eq], enabled=True,
-            )
-        )
-        _ok(
-            not v2_should_add_cvc_patterns(
-                strategy_mode="default",
-                failed_data=failed,
-                formulas=[eq],
-                enabled=True,
-            )
-        )
-        apply_cvc_patterns_cli("on")
-        _ok(cvc_patterns_enabled())
-        _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
-        apply_cvc_patterns_cli("off")
-        _ok(not should_add_cvc_patterns(failed_data=failed, formulas=[eq]))
-        _ok(
-            not should_add_cvc_patterns(
-                failed_data={**failed, "cvc_patterns": True},
-                formulas=[eq],
-            )
-        )
-    finally:
-        if prev is None:
-            os.environ.pop("CVC_PATTERNS", None)
-        else:
-            os.environ["CVC_PATTERNS"] = prev
-
-
-def test_pattern_feature_gates() -> None:
-    eq = "(forall ((x Nat)) (= (f x) x))"
-    rare = _rare_inst_failed()
-    # usefulness timeout is logged, but does not open 6-way ±pattern
-    _ok(
-        not should_add_cvc_patterns(
-            failed_data={"useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}]},
-            formulas=[eq],
-            enabled=True,
-        )
-    )
-    feats_to = v2_pattern_features(
-        {"useless_lemma_groups": [{"lemmas": [eq], "status": "timeout"}]}
-    )
-    _ok(feats_to["useful_timeout"] and not feats_to["trigger"], feats_to)
-    # need_rewrite / rewrite_scarce do not open
-    _ok(
-        not should_add_cvc_patterns(
-            failed_data={"repair_hints": [{"kind": "need_rewrite"}]},
-            formulas=[eq],
-            enabled=True,
-        )
-    )
-    # rare_inst + directed eq + flag still does not open (deprecated 6-way)
-    _ok(
-        not should_add_cvc_patterns(
-            failed_data=rare,
-            formulas=[eq],
-            enabled=True,
-        )
-    )
-    _ok(
-        not should_add_cvc_patterns(
-            failed_data=rare,
-            formulas=[eq],
-            enabled=False,
-        )
-    )
-    # low em/conj alone does NOT open (would prefer successes on full706)
-    _ok(
-        not should_add_cvc_patterns(
-            failed_data={
-                "baseline_diag": {
-                    "stats": {
-                        "QUANTIFIERS_INST_E_MATCHING": 10,
-                        "INST_TOTAL": 10,
-                        "CONJ_TOTAL": 10,
-                        "QUANTIFIERS_SKOLEMIZE": 0,
-                    }
-                },
-            },
-            formulas=[eq],
-            enabled=True,
-        )
-    )
-    # rare_inst but no directed equality
-    _ok(
-        not should_add_cvc_patterns(
-            failed_data=rare,
-            formulas=["(forall ((x Nat)) true)"],
-            enabled=True,
-        )
-    )
-    # explosion ignored (always off in features)
-    feats = v2_pattern_features(
-        {
-            **rare,
-            "progress_routing_signals": ["search_explosion(+50%)"],
-        }
-    )
-    _ok(feats["rare_inst"] and feats["trigger"], feats)
-    _ok(feats["search_explosion"] is False, feats)
-    _ok(pattern_trigger_reasons(rare) == ["rare_inst"])
-    _ok(pattern_trigger_reasons(
-        {"useless_lemma_groups": [{"status": "timeout"}]}
-    ) == [])
-
-
 def main() -> None:
     test_infer_pattern_on_directed_eq()
     test_pattern_skips_var_eq_and_implications()
     test_strip_bang_attrs()
     test_inject_library_with_patterns()
-    test_pattern_gate_requires_flag()
-    test_pattern_feature_gates()
     print("ok")
 
 

@@ -166,9 +166,6 @@ def test_usefulness_records_vampire_status_not_cvc_parser() -> None:
             induction_focus=["(P x)"],
         )
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "FEEDBACK_PROGRESS": "off",
-            "FEEDBACK_REPAIR_HINTS": "off",
         }), patch(
             "Mate_new_vampire.run_vampire_default", return_value=failed
         ) as routed:

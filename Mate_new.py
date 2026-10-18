@@ -52,7 +52,6 @@ from obligation_tree import (
 )
 from exp_flags import (
     ancestor_prompt_enabled,
-    collect_difficulty_for_feedback,
     induction_scheme_enabled,
     normalize_strategy_mode,
     paper_schedule_prompt,
@@ -86,10 +85,7 @@ from llm_time_budget import (
     set_task_deadline,
     usefulness_timeout_s,
 )
-from prompt_modes import apply_advice_system_instruction
 from lemma_gates import (
-    DIAGNOSIS_PROMPT_SUFFIX,
-    FINAL_DIAGNOSIS_PROMPT_SUFFIX,
     allow_unmarked_lemma_output,
     apply_static_lemma_screen,
     BENIGN_SCREEN_GATES,
@@ -122,9 +118,7 @@ from lemma_gates import (
     llm_invalid_ce_verify_enabled,
     llm_invalid_ce_retries,
     format_ce_retry_user,
-    should_append_diagnosis_suffix,
     should_accept_in_loop_invalid_goal,
-    should_run_final_diagnosis,
     subgoal_sat_abort_enabled,
     tree_status_from_child_data,
     with_parse_retry_hint,
@@ -916,10 +910,10 @@ def create_prompt(
         raise ValueError("folder path of prompts must be provided")
 
     with open(f"{folder_path}/{prompt_mode}/system_prompt.txt", "r", encoding="utf-8") as file:
-        system_prompt_content = apply_advice_system_instruction(file.read())
+        system_prompt_content = file.read()
     with open(f"{folder_path}/{prompt_mode}/user_prompt.txt", "r", encoding="utf-8") as file:
         user_prompt_content = file.read()
-    # Order: SMT → profiler → obligation/library → ancestor → dynamic feedback → PROOF_SHAPE.
+    # Order: SMT → profiler → obligation/library → ancestor → attempt feedback.
     failed_info = ""
     failed_data: dict = {}
     if base_path and goal_name:
@@ -1007,10 +1001,6 @@ def create_prompt(
             log_prompt_blocks(base_path, goal_name, prompt_mode, failed_info)
 
     user_content = user_prompt_content.format(smt_file_content=smt_file_content) + failed_info
-    if diagnosis_only:
-        user_content += FINAL_DIAGNOSIS_PROMPT_SUFFIX
-    elif should_append_diagnosis_suffix(depth):
-        user_content += DIAGNOSIS_PROMPT_SUFFIX
 
     messages = [
         {"role": "system", "content": system_prompt_content},
@@ -1178,7 +1168,7 @@ def verify_combined_lemmas(
         output_path,
         timeout=combined_timeout,
         collect_stats=True,
-        collect_difficulty=collect_difficulty_for_feedback(),
+        collect_difficulty=False,
     )
     if base_path:
         add_solver_time(base_path, full.elapsed)
@@ -1267,7 +1257,7 @@ def perform_initial_verification(
         smt_path,
         default_timeout,
         collect_stats=True,
-        collect_difficulty=collect_difficulty_for_feedback(),
+        collect_difficulty=False,
     )
     if base_path:
         add_solver_time(base_path, result.elapsed)
@@ -1913,7 +1903,7 @@ def _harvest_direct_prove(smt_path: Path, base_path: str) -> CvcResult:
         config["DEFAULT_CVC_TIMEOUT"],
         profiles=list(HARVEST_CVC_PROFILES),
         collect_stats=True,
-        collect_difficulty=True,
+        collect_difficulty=False,
     )
     add_solver_time(base_path, result.elapsed)
     log_exp(
@@ -2496,68 +2486,6 @@ def prove_subgoals_parallel(
             return False, _ordered("cancelled")
 
 
-def _run_final_goal_diagnosis(
-    base_path: str,
-    base_name: str,
-    depth: int,
-    pack: Dict[str, Any],
-    prompt_strategy: Optional[str],
-) -> bool:
-    """After child attempts fail, one extra LLM call: is the CURRENT goal invalid?
-
-    Uses accumulated ``invalid_lemmas`` (child write-back), not the obligation
-    tree. Skip when that list is empty — same evidence as in-loop diagnosis.
-    """
-    if not should_run_final_diagnosis(depth):
-        return False
-    failed_data = load_failed_lemmas(base_path, base_name)
-    existing = failed_data.get("node_outcome") or {}
-    if str(existing.get("kind") or "") == "invalid":
-        return True
-    invalid = [
-        item for item in invalid_lemma_records(failed_data)
-        if isinstance(item, dict) and str(item.get("lemma") or "").strip()
-    ]
-    if not should_run_final_diagnosis(depth, has_invalid=bool(invalid)):
-        logging.info("子目标 %s 无 INVALID 子引理，跳过最终鉴定", base_name)
-        log_exp("final_diagnosis_skip", goal=base_name, depth=depth, reason="no_invalid")
-        return False
-    smt_path = Path(base_path) / f"{base_name}.smt2"
-    if not smt_path.exists():
-        return False
-    strat = prompt_strategy or (pack.get("strategies") or [None])[0]
-    if not strat:
-        return False
-    logging.info("子目标 %s attempts 用尽，额外鉴定当前目标是否 invalid", base_name)
-    log_exp("final_diagnosis", goal=base_name, depth=depth, n_invalid=len(invalid))
-    try:
-        generate_lemmas_with_llm(
-            smt_path.read_text(encoding="utf-8"),
-            strat,
-            smt_path,
-            base_path,
-            base_name,
-            pack.get("folder_path"),
-            depth=depth,
-            diagnosis_only=True,
-        )
-    except Exception as exc:
-        logging.warning("最终鉴定调用失败: %s", exc)
-        return False
-    reason = load_failed_lemmas(base_path, base_name).get("last_llm_reason")
-    if not is_invalid_diagnosis_reason(reason):
-        logging.info("最终鉴定为 failed: %s", reason or "empty")
-        return False
-    ok, _reject = _accept_llm_invalid_diagnosis(
-        base_path, base_name, str(reason or ""), source="llm_final",
-    )
-    if not ok:
-        logging.info("子目标 %s 最终鉴定未通过 CE 校验，保持 open", base_name)
-        return False
-    logging.info("子目标 %s 最终鉴定不可证: %s", base_name, reason)
-    return True
-
-
 def prove_run(
     base_path: str,
     base_name: str,
@@ -3042,10 +2970,6 @@ def _prove_run_body(
     # Optional root finish: longer re-prove (library inject if on).
     if maybe_root_finish_prove(base_path, base_name, depth=depth):
         return _done(True, "root_finish_prove")
-    if _run_final_goal_diagnosis(
-        base_path, base_name, depth, pack, current_prompt,
-    ):
-        return _done(False, "llm_invalid")
     return _done(False, "attempts_exhausted")
 
 

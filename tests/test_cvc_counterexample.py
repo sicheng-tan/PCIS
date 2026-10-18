@@ -107,8 +107,8 @@ def test_cvc_sat_abort_stores_cex_reason() -> None:
         sat = CvcResult(status="sat", proved=False, elapsed=0.05)
         with patch.dict(
             __import__("os").environ,
-            {"SUBGOAL_SAT_ABORT": "on", "SOLVER_ROUTING": "off", "LEMMA_LIBRARY": "off"},
-        ), patch("Mate_new.run_cvc_routed", return_value=sat), patch(
+            {"SUBGOAL_SAT_ABORT": "on", "LEMMA_LIBRARY": "off"},
+        ), patch("Mate_new.run_cvc", return_value=sat), patch(
             "Mate_new.counterexample_reason_for_smt",
             return_value="Counterexample: (define-fun P () Bool false)",
         ), patch("Mate_new.generate_lemmas_with_llm") as gen:

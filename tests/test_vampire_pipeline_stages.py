@@ -114,7 +114,7 @@ def test_vampire_perform_initial_caches_baseline() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         smt = Path(tmp) / "template.smt2"
         smt.write_text(TINY_SMT, encoding="utf-8")
-        with patch.dict(os.environ, {"SOLVER_ROUTING": "off"}, clear=False), patch(
+        with patch(
             "Mate_new_vampire.run_vampire_default", return_value=failed
         ) as routed, patch("Mate_new_vampire.run_vampire_diagnostic") as diag:
             ok = mate.perform_initial_verification(
@@ -139,11 +139,7 @@ def test_vampire_perform_initial_skips_artifacts_when_feedback_off() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         smt = Path(tmp) / "template.smt2"
         smt.write_text(TINY_SMT, encoding="utf-8")
-        with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
-            "FEEDBACK_REPAIR_HINTS": "off",
-            "FEEDBACK_PROGRESS": "off",
-        }, clear=False), patch(
+        with patch(
             "Mate_new_vampire.run_vampire_default", return_value=failed
         ) as routed:
             ok = mate.perform_initial_verification(
@@ -151,8 +147,8 @@ def test_vampire_perform_initial_skips_artifacts_when_feedback_off() -> None:
             )
         assert ok is False
         kwargs = routed.call_args.kwargs
-        assert kwargs.get("collect_stats") is False
-        assert kwargs.get("show_induction") is False
+        assert kwargs.get("collect_stats") is True
+        assert kwargs.get("show_induction") is True
 
 
 def test_vampire_perform_initial_materializes_library() -> None:
@@ -166,7 +162,6 @@ def test_vampire_perform_initial_materializes_library() -> None:
         mat = Path(tmp) / "template.__lib.smt2"
         mat.write_text(TINY_SMT + "\n; lib\n", encoding="utf-8")
         with patch.dict(os.environ, {
-            "SOLVER_ROUTING": "off",
             "LEMMA_LIBRARY": "on",
         }), patch(
             "Mate_new_vampire.materialize_smt_with_library", return_value=mat
@@ -332,7 +327,6 @@ def test_vampire_fast_unsat_does_not_start_harvest() -> None:
         with patch.dict(os.environ, {
             "LEMMA_LIBRARY": "on",
             "LEMMA_LIBRARY_LOCAL": "on",
-            "SOLVER_ROUTING": "off",
             "LEMMA_DEFINED_SYMBOLS": "off",
             "USEFULNESS_HARVEST_DELAY_S": "2",
             "INDUCTION_SCHEME": "off",
@@ -372,7 +366,6 @@ def test_vampire_quick_run_starts_scheme_with_vampire_profiles() -> None:
         with patch.dict(os.environ, {
             "INDUCTION_SCHEME": "on",
             "INDUCTION_SCHEME_TRIGGER": "always",
-            "SOLVER_ROUTING": "off",
             "LEMMA_LIBRARY": "off",
             "LEMMA_LIBRARY_LOCAL": "off",
         }), patch(

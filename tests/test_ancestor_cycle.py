@@ -91,6 +91,7 @@ class AncestorScreenTests(unittest.TestCase):
             "ANCESTOR_CYCLE_FILTER": "on",
             "LEMMA_FILTER_DROP": "on",
             "LEMMA_DEFINED_SYMBOLS": "off",
+            "LEMMA_WELLFORMED_CHECK": "off",
         }):
             kept, dropped = apply_static_lemma_screen(
                 [ROOT_ALPHA, BRIDGE],
@@ -112,6 +113,7 @@ class AncestorScreenTests(unittest.TestCase):
             "ANCESTOR_CYCLE_FILTER": "on",
             "LEMMA_FILTER_DROP": "on",
             "LEMMA_DEFINED_SYMBOLS": "off",
+            "LEMMA_WELLFORMED_CHECK": "off",
         }):
             kept, dropped = apply_static_lemma_screen(
                 [LEFT, BRIDGE],
@@ -130,6 +132,7 @@ class AncestorScreenTests(unittest.TestCase):
             "ANCESTOR_CYCLE_FILTER": "off",
             "LEMMA_FILTER_DROP": "on",
             "LEMMA_DEFINED_SYMBOLS": "off",
+            "LEMMA_WELLFORMED_CHECK": "off",
         }):
             self.assertFalse(ancestor_cycle_filter_enabled())
             kept, dropped = apply_static_lemma_screen(

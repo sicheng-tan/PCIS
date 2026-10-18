@@ -1,34 +1,21 @@
 """Fail-fast gates for lemma subgoals: defined symbols, sat abort, LLM reason.
 
-Boolean flags default on (current method). Set them off in paper.env to restore
-the original loop. CHILD_LLM_ATTEMPTS=0 keeps the root 2N budget at every depth.
-LEMMA_FILTER_DROP keeps remaining members after screening and continues
-usefulness; paper.env sets it off so any failing member aborts the group.
-The diagnosis suffix is never attached at depth 0; children follow LLM_LEMMA_DIAGNOSIS.
-``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY`` (default off) when on skips the in-loop
-INVALID_GOAL suffix and early ``llm_invalid`` stop; diagnosis runs only after
-child attempts are exhausted (``should_run_final_diagnosis``). Default off keeps
-per-attempt empty+INVALID_GOAL abort (with optional CE verify/retry).
-After a child node's attempts are exhausted, one extra diagnosis-only LLM call
-judges whether the CURRENT goal is invalid from the parent's accumulated
-``invalid_lemmas`` (hard / mathematically refuted child write-back), same
-signal as in-loop diagnosis — not the obligation tree. Skip when that
-INVALID list is empty.
+Boolean flags default on (PCIS method). CHILD_LLM_ATTEMPTS=0 keeps the root 2N
+budget at every depth. LEMMA_FILTER_DROP keeps remaining members after screening
+and continues usefulness.
+
+Child prompts (system templates) may emit empty ``<output>`` plus
+``; INVALID_GOAL:`` when the CURRENT goal is not a theorem. Depth ≥ 1 accepts
+that signal. ``LLM_INVALID_ONLY_STOP`` (default on) early-stops the child with
+``kind=stopped`` without hard ``node_outcome.invalid`` write-back.
+
 ``INVALID_LEMMAS`` modes: ``off`` | ``on`` (default, hard+soft) | ``paper``
 (hard only + all useless groups; Situation A → invalid). Soft
 ``soft_rejected_lemmas`` only in ``on``.
-``LLM_INVALID_ONLY_STOP`` (default on) lets LLM INVALID_GOAL early-stop a child
-without writing hard ``node_outcome.invalid`` (parent keeps unproved/failed).
-LLM_PARSE_RETRIES extra LLM calls after a format parse failure stay inside the
-same prove-run attempt (HTTP retries are LLM_MAX_RETRIES and unrelated).
-LLM_SCREEN_RETRIES extra generation after static screen kept=0 (default 1);
-not mixed with parse retries.
-``LEMMA_WELLFORMED_CHECK`` (default on) runs cvc5 ``--parse-only`` on each
-candidate before validity/usefulness (both CVC Mate and Vampire Mate — Vampire
-has no dedicated parse-only mode). Failures are ``parse_error`` /
-``type_error`` (not mathematical ``invalid``) and feed the screen-retry prompt.
-Nullary ctor apps ``(nil)`` are normalized to ``nil`` first so cvc5's stricter
-syntax does not false-drop lemmas Vampire would accept.
+
+LLM_PARSE_RETRIES / LLM_SCREEN_RETRIES stay inside the same prove-run attempt
+(HTTP retries are LLM_MAX_RETRIES). ``LEMMA_WELLFORMED_CHECK`` (default on) runs
+cvc5 ``--parse-only`` before validity/usefulness.
 """
 
 from __future__ import annotations
@@ -41,18 +28,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from exp_flags import (
     _flag_enabled,
-    prompt_advice_enabled,
 )
 from obligation_tree import (
     compact_formula,
     lemmas_equivalent,
     normalize_lemma_formula,
     obligation_tree_enabled,
-)
-from prompt_modes import (
-    advice_from_failed_data,
-    format_advice_lines,
-    format_local_vs_parent_lines,
 )
 
 _DECLARE_FUN = re.compile(
@@ -85,39 +66,6 @@ _RESERVED = frozenset({
     "declare-const", "declare-datatype", "declare-datatypes",
 })
 
-DIAGNOSIS_PROMPT_SUFFIX = (
-    "\nIf the CURRENT goal is invalid (not a theorem of the given axioms, "
-    "for example it is missing hypotheses, it contradicts existing axioms or lemmas, "
-    "or a used function is only declared with no defining assert), "
-    "emit <output></output> and write:\n"
-    "; INVALID_GOAL: <short explanation>\n"
-    "; CE_SMT:\n"
-    "(define-fun <var> () <Sort> <value>)\n"
-    "... one define-fun per free constant in a concrete counterexample ...\n"
-    "INVALID_GOAL means the CURRENT goal is not a theorem, not that no helper lemma is needed.\n"
-    "CE_SMT must be a ground model (nullary define-fun bindings) that makes "
-    "(assert (not CURRENT)) satisfiable under the axioms; the solver will check it.\n"
-    "If a previously proposed child lemma is marked invalid, use that invalid mark "
-    "and its reason to decide whether the CURRENT goal is also invalid "
-    "(e.g. it depends on the same missing definition or contradiction).\n"
-)
-
-FINAL_DIAGNOSIS_PROMPT_SUFFIX = (
-    "\nFINAL CHECK (do not propose lemmas; do not use <lemma> tags).\n"
-    "Using INVALID child lemmas and their reasons "
-    "(written back when a proposed helper was refuted), "
-    "decide whether the CURRENT goal is a theorem of the given axioms.\n"
-    "If a previously proposed child lemma is marked invalid, use that mark "
-    "and its reason to decide whether the CURRENT goal is also invalid "
-    "(e.g. it depends on the same missing definition or contradiction).\n"
-    "If it is INVALID (not a theorem), output invalid and write:\n"
-    "; INVALID_GOAL: <short explanation>\n"
-    "; CE_SMT:\n"
-    "(define-fun <var> () <Sort> <value>)\n"
-    "CE_SMT must be a ground model the solver can check against axioms ∧ ¬CURRENT.\n"
-    "If it MAY still be a theorem, output failed.\n"
-)
-
 _OPEN_DIAGNOSIS = frozenset({
     "still_open", "open", "still possible", "may still be a theorem", "failed",
 })
@@ -137,15 +85,6 @@ HD_DIFFICULTY_EXPLAIN = (
 HD_AXIOM_GOAL_HINT = (
     "hint: listed axioms are possible starting points; propose lemmas that "
     "help prove the CURRENT goal (a hotspot need not be used)."
-)
-FORMULA_EVIDENCE_KIND = "solver_formula_evidence"
-MAX_FORMULA_EVIDENCE_CHARS = 400
-FORMULA_EVIDENCE_EXPLAIN = (
-    "Use hotspots as possible starting points, not mandatory dependencies. "
-    "Inspect formula conditions and recursive-call arguments. "
-    "These samples do not establish that a condition is missing or that "
-    "generalization is required. Other axioms may provide essential "
-    "intermediate connections."
 )
 MAX_PARSE_RETRY_SNIPPET = 1500
 PARSE_RETRY_USER = (
@@ -197,20 +136,6 @@ def lemma_filter_drop_enabled() -> bool:
     paper.env sets this off: any failing member aborts the whole group.
     """
     return _flag_enabled("LEMMA_FILTER_DROP")
-
-
-def llm_lemma_diagnosis_enabled() -> bool:
-    return _flag_enabled("LLM_LEMMA_DIAGNOSIS")
-
-
-def llm_lemma_diagnosis_final_only() -> bool:
-    """When on, child diagnosis runs only after attempts are exhausted.
-
-    Default **off** (in-loop ``DIAGNOSIS_PROMPT_SUFFIX`` + early ``llm_invalid``).
-    Set ``LLM_LEMMA_DIAGNOSIS_FINAL_ONLY=on`` to skip in-loop diagnosis and rely
-    on the final diagnosis-only call after attempts are exhausted.
-    """
-    return _flag_enabled("LLM_LEMMA_DIAGNOSIS_FINAL_ONLY", default="off")
 
 
 def llm_invalid_ce_verify_enabled() -> bool:
@@ -265,20 +190,9 @@ def format_ce_retry_user(
     return "\n".join(parts)
 
 
-def should_append_diagnosis_suffix(depth: int = 0) -> bool:
-    """Root never; children only when diagnosis is on and not final-only."""
-    if int(depth or 0) <= 0:
-        return False
-    if not llm_lemma_diagnosis_enabled():
-        return False
-    if llm_lemma_diagnosis_final_only():
-        return False
-    return True
-
-
 def should_accept_in_loop_invalid_goal(depth: int = 0) -> bool:
-    """Empty ``INVALID_GOAL`` may end a child attempt (not final-only mode)."""
-    return should_append_diagnosis_suffix(depth)
+    """Child nodes may early-stop on empty ``INVALID_GOAL`` (system prompts)."""
+    return int(depth or 0) >= 1
 
 
 def llm_parse_retries() -> int:
@@ -397,20 +311,6 @@ def node_attempt_plan(depth: int, pack: Dict[str, Any]) -> Tuple[int, int]:
     capped = min(cap, total)
     per_capped = max(1, capped // n_strat) if n_strat > 1 else capped
     return capped, per_capped
-
-
-def should_run_final_diagnosis(depth: int = 0, *, has_invalid: bool = True) -> bool:
-    """Extra invalid-check LLM call after child attempts are exhausted.
-
-    Requires at least one INVALID lemma on this node (typically written back
-    when a child subgoal was refuted). No INVALID evidence → skip the call.
-    Independent of ``OBLIGATION_TREE``.
-    """
-    return (
-        int(depth or 0) >= 1
-        and llm_lemma_diagnosis_enabled()
-        and bool(has_invalid)
-    )
 
 
 def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
@@ -1514,13 +1414,6 @@ def format_stuck_lines(
 ) -> List[str]:
     """Compact solver-stuck lines. ``need_rewrite`` is not shown (disabled)."""
     del backend
-    evidence_ids = {
-        str(hint.get("attempt_id") or "")
-        for hint in (hints or [])
-        if isinstance(hint, dict)
-        and str(hint.get("kind") or "") == FORMULA_EVIDENCE_KIND
-        and hint.get("attempt_id")
-    }
     lines: List[str] = []
     for hint in hints or []:
         if not isinstance(hint, dict) or not repair_hint_for_prompt(hint):
@@ -1528,9 +1421,6 @@ def format_stuck_lines(
         kind = str(hint.get("kind") or "")
         if kind in _STUCK_SKIP_KINDS:
             continue
-        if kind == "high_difficulty_assertions" and evidence_ids:
-            if str(hint.get("attempt_id") or "") not in evidence_ids:
-                continue
         if kind == "high_difficulty_assertions":
             sources = [
                 str(item) for item in (hint.get("source_lemmas") or []) if item
@@ -1576,42 +1466,6 @@ def format_stuck_lines(
                 lines.append(f"    {HD_DIFFICULTY_EXPLAIN}")
                 if not omit_axiom_goal_hint:
                     lines.append(f"    {HD_AXIOM_GOAL_HINT}")
-            continue
-        if kind == FORMULA_EVIDENCE_KIND:
-            samples = [
-                item for item in (hint.get("samples") or [])
-                if isinstance(item, dict) and item.get("formula")
-            ]
-            if not samples:
-                continue
-            lines.append("    selected solver formulas:")
-            for sample in samples[:4]:
-                relation = str(sample.get("relation") or "unlinked")
-                profile = str(sample.get("profile") or "")
-                source = str(sample.get("source") or "")
-                bits = [bit for bit in (profile, source, relation) if bit]
-                if relation == "matched_quantifier":
-                    label = "instance of the hotspot assertion"
-                elif relation == "shared_symbols":
-                    label = "shares functions with a hotspot; source unconfirmed"
-                else:
-                    label = "not linked to a hotspot assertion"
-                meta = ", ".join(bits)
-                lines.append(
-                    f"      {compact_formula(sample.get('formula'), MAX_FORMULA_EVIDENCE_CHARS)}"
-                    + (f"  [{meta}]" if meta else "")
-                )
-                lines.append(f"      ({label})")
-                related = str(sample.get("related_axiom") or "").strip()
-                if related and relation == "matched_quantifier":
-                    lines.append(
-                        f"      related axiom: {compact_formula(related)}"
-                    )
-                elif related and relation == "shared_symbols":
-                    lines.append(
-                        f"      shared-function axiom: {compact_formula(related)}"
-                    )
-            lines.append(f"    {FORMULA_EVIDENCE_EXPLAIN}")
             continue
         detail = str(hint.get("detail") or "").strip()
         lines.append(f"    {kind}: {detail}" if detail else f"    {kind}")
@@ -1689,15 +1543,14 @@ def format_attempt_feedback_for_prompt(
     *,
     backend: str = "cvc5",
     include_stuck: bool = True,
-    suppress_advice: bool = False,
     current_goal: Optional[str] = None,
 ) -> str:
     """LAST ATTEMPT (latest failed C + screen drops + stuck) or INITIAL SOLVE.
 
     History of older useless groups stays in json; only the last group is shown
     unless ``INVALID_LEMMAS=paper`` (then all useless groups, LLM4Ind style).
-    ``suppress_advice`` is kept for callers.
     """
+    del current_goal  # reserved for callers
     data = failed_data if isinstance(failed_data, dict) else {}
     try:
         from obligation_tree import invalid_lemmas_paper_mode
@@ -1712,31 +1565,20 @@ def format_attempt_feedback_for_prompt(
         if isinstance(item, dict)
     ]
     status = ""
+    hints: Sequence[dict] = ()
     if isinstance(group, dict):
         status = str(group.get("status") or "").strip()
-    hints: Sequence[dict] = ()
-    want_program = include_stuck
-    want_advice = (
-        want_program and prompt_advice_enabled() and not suppress_advice
-    )
-    want_local = want_program and obligation_tree_enabled()
-    advice = (
-        advice_from_failed_data(data, backend=backend, has_kept=bool(kept))
-        if want_advice else None
-    )
-    stuck_lines = format_stuck_lines(
-        hints, backend, omit_axiom_goal_hint=advice is not None,
-    ) if want_program else []
-    local_lines = format_local_vs_parent_lines(data) if want_local else []
-    advice_lines = format_advice_lines(advice) if want_advice else []
+        raw = group.get("repair_hints") or []
+        if isinstance(raw, list):
+            hints = [item for item in raw if isinstance(item, dict)]
+    if not hints:
+        raw = data.get("repair_hints") or []
+        if isinstance(raw, list):
+            hints = [item for item in raw if isinstance(item, dict)]
+    stuck_lines = format_stuck_lines(hints, backend) if include_stuck else []
     drop_lines = [line for line in (format_dropped_line(item) for item in dropped) if line]
     has_attempt = bool(kept or drop_lines)
-    if (
-        not has_attempt
-        and not stuck_lines
-        and not local_lines
-        and not advice_lines
-    ):
+    if not has_attempt and not stuck_lines:
         return ""
 
     parts: List[str] = []
@@ -1752,11 +1594,9 @@ def format_attempt_feedback_for_prompt(
         if drop_lines:
             parts.append("  dropped:")
             parts.extend(drop_lines)
-        if stuck_lines or local_lines or advice_lines:
+        if stuck_lines:
             parts.append("  repair hints:")
             parts.extend(stuck_lines)
-            parts.extend(local_lines)
-            parts.extend(advice_lines)
         parts.append("  You may refine kept lemmas or propose a different set.")
         return "\n".join(parts)
 
@@ -1765,10 +1605,9 @@ def format_attempt_feedback_for_prompt(
     )
     parts.append("  repair hints:")
     parts.extend(stuck_lines)
-    parts.extend(local_lines)
-    parts.extend(advice_lines)
     parts.append("  Propose auxiliary lemmas that help the solver prove the goal.")
     return "\n".join(parts)
+
 
 
 def attach_source_lemmas(

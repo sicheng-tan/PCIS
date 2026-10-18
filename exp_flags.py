@@ -1,9 +1,8 @@
-"""Ablation switches for PCIS features (PCR / GSE / prompt advice).
+"""Ablation switches for PCIS features (PCR / GSE).
 
 PCR memory: ``LEMMA_LIBRARY``, ``LEMMA_LIBRARY_LOCAL``, ``INVALID_LEMMAS``
 (``off``/``on``/``paper``), ``OBLIGATION_TREE``, ``ANCESTOR_*``.
 GSE: ``PROBLEM_PROFILER``, ``INDUCTION_SCHEME*``.
-``PROMPT_ADVICE`` defaults on (LAST ATTEMPT advice labels).
 Set a value in ``off`` / ``0`` / ``false`` / ``no`` to disable a piece.
 
 ``ANCESTOR_CYCLE_FILTER`` / ``ANCESTOR_PROMPT`` default on: path-local
@@ -26,11 +25,6 @@ NAIVE_PROMPT_STRATEGIES = ("prompt_naive",)
 
 def _flag_enabled(name: str, default: str = "on") -> bool:
     return os.getenv(name, default).strip().lower() not in _OFF_VALUES
-
-
-def collect_difficulty_for_feedback() -> bool:
-    """True when CVC ``--dump-difficulty`` is needed for PROMPT_ADVICE."""
-    return prompt_advice_enabled()
 
 
 def problem_profiler_enabled() -> bool:
@@ -155,11 +149,6 @@ def should_run_induction_scheme(
         return False
     last = attempts[-1] if isinstance(attempts[-1], dict) else {}
     return str(last.get("kind") or "") == "useless"
-
-
-def prompt_advice_enabled() -> bool:
-    """Emit LAST ATTEMPT advice labels (TRIGGER/BRIDGE/GENERALIZE/...)."""
-    return _flag_enabled("PROMPT_ADVICE")
 
 
 def unproved_not_invalid_enabled() -> bool:

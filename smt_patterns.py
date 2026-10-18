@@ -1,28 +1,14 @@
-"""CVC5 ``:pattern`` helpers for axiom injection.
+"""SMT-LIB formula helpers used by PCR/GSE inject paths.
 
-Syntax helpers (``infer_trigger_pattern`` / ``format_assert_line``) stay.
-The feedback-gated 6-way ±pattern portfolio is **temporarily deprecated**:
-last-round ``rare_inst`` must not change the next CVC run. LAST ATTEMPT
-``advice: TRIGGER`` consumes that evidence instead.
-
-``CVC_PATTERNS`` / ``--cvc-patterns`` default **off**. Even when set on,
-``should_add_cvc_patterns`` stays false until ``PATTERN_FEEDBACK_GATE_ENABLED``.
+Includes s-expression readers, lemma normalization, and optional
+``:pattern`` / ``:named`` wrapping for ``(assert ...)`` lines.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-from exp_flags import resolve_cvc_patterns_enabled
-from solver_relative_metrics import (
-    EMATCHING_PER_CONJ_MAX,
-    EMATCHING_PER_CONJ_SOFT,
-    INST_OF_MATCHING_MAX,
-)
-
-
-_TIMEOUT_STATUSES = frozenset({"timeout", "unknown"})
 _BANG_ATTR = re.compile(r"\(\s*!\s+")
 
 
@@ -190,154 +176,3 @@ def format_assert_line(
     if attrs:
         return f"(assert (! {text} {' '.join(attrs)}))"
     return f"(assert {text})"
-
-
-def _diag_stats(failed_data: Optional[dict]) -> Dict[str, int]:
-    """Best available cached CVC stats (baseline 60s, else short diagnostic)."""
-    data = failed_data if isinstance(failed_data, dict) else {}
-    for key in ("baseline_diag", "baseline_diag_short"):
-        diag = data.get(key)
-        if not isinstance(diag, dict):
-            continue
-        stats = diag.get("stats")
-        if isinstance(stats, dict) and stats:
-            return {str(k): int(v or 0) for k, v in stats.items()}
-    return {}
-
-
-def ematching_total(stats: Optional[dict]) -> int:
-    """Pure E-matching volume (excludes CBQI)."""
-    st = stats or {}
-    return int(st.get("QUANTIFIERS_INST_E_MATCHING") or 0) + int(
-        st.get("QUANTIFIERS_INST_E_MATCHING_SIMPLE") or 0
-    )
-
-
-def v2_pattern_features(failed_data: Optional[dict]) -> Dict[str, Any]:
-    """Booleans for the CVC ``:pattern`` gate (independent of prompt mode).
-
-    ``trigger`` is ``rare_inst`` only: a high-difficulty axiom had no
-    formula-shaped instantiations. That is the case where E-matching triggers
-    are actually missing.
-
-    ``useful_timeout`` and ``rewrite_scarce`` are still computed for logs, but
-    they do not open the gate. Timeout is common and would spend a 6-way
-    ±pattern contrast (4 CVC profiles + simple/inductive with ``:pattern``)
-    on coverage rather than the scarce QI-rare cases. Low ``E_MATCHING/CONJ``
-    prefers successes on full706, so it is not a trigger either.
-    ``search_explosion`` is not consulted.
-    """
-    data = failed_data if isinstance(failed_data, dict) else {}
-    hints = data.get("repair_hints") or []
-    kinds = {
-        str(h.get("kind") or "")
-        for h in hints
-        if isinstance(h, dict)
-    }
-    rare_inst = False
-    for hint in hints:
-        if not isinstance(hint, dict):
-            continue
-        if hint.get("kind") != "high_difficulty_assertions":
-            continue
-        rare = hint.get("rarely_instantiated") or []
-        if isinstance(rare, list) and rare:
-            rare_inst = True
-            break
-
-    stats = _diag_stats(data)
-    skol = int(stats.get("QUANTIFIERS_SKOLEMIZE") or 0)
-    inst = int(stats.get("INST_TOTAL") or 0)
-    conj = int(stats.get("CONJ_TOTAL") or 0)
-    em = ematching_total(stats)
-    matching = skol + inst
-    iom = (inst / matching) if matching > 0 else 1.0
-    rewrite_scarce_stats = skol > 0 and matching > 0 and iom < INST_OF_MATCHING_MAX
-    rewrite_scarce = rewrite_scarce_stats or ("need_rewrite" in kinds)
-    em_per_conj = (em / conj) if conj > 0 else None
-    # Diagnostic only — not part of trigger (hits successes more than failures).
-    em_vs_conj_poor = em_per_conj is not None and em_per_conj < EMATCHING_PER_CONJ_MAX
-    soft_em_vs_conj = em_per_conj is not None and em_per_conj < EMATCHING_PER_CONJ_SOFT
-    quant_activity = skol + conj + inst + em
-    em_zero = quant_activity > 0 and em == 0
-
-    useful_timeout = False
-    for group in data.get("useless_lemma_groups") or []:
-        if isinstance(group, dict):
-            status = str(group.get("status") or "").strip().lower()
-        else:
-            status = ""
-        if status in _TIMEOUT_STATUSES:
-            useful_timeout = True
-            break
-
-    # Instantiation-rare only. Timeout / rewrite-scarce mix are logged but not
-    # used as open triggers (6-way ±pattern contrast is reserved for QI-rare).
-    trigger = bool(rare_inst)
-    inst_poor = bool(rare_inst or rewrite_scarce or em_zero)
-    return {
-        "rare_inst": rare_inst,
-        "useful_timeout": useful_timeout,
-        "rewrite_scarce": rewrite_scarce,
-        "rewrite_scarce_stats": rewrite_scarce_stats,
-        "em_vs_conj_poor": em_vs_conj_poor,
-        "soft_em_vs_conj": soft_em_vs_conj,
-        "em_zero": em_zero,
-        "inst_poor": inst_poor,
-        "ematching": em,
-        "em_per_conj": em_per_conj,
-        "iom": iom if matching > 0 else None,
-        "search_explosion": False,
-        "trigger": trigger,
-    }
-
-
-# Last-round rare_inst → next-round 6-way :pattern. Deprecated: that evidence
-# now goes to LLM TRIGGER advice, not solver config. Keep helpers + flag.
-PATTERN_FEEDBACK_GATE_ENABLED = False
-
-
-def should_add_cvc_patterns(
-    *,
-    failed_data: Optional[dict] = None,
-    formulas: Sequence[str] = (),
-    enabled: Optional[bool] = None,
-) -> bool:
-    """Whether to wrap directed equalities with ``:pattern`` on CVC axiom inject.
-
-    Currently always false (``PATTERN_FEEDBACK_GATE_ENABLED``). Historical
-    ``pattern_on`` was ``patterns_enabled ∧ rare_inst ∧ has_directed_eq``.
-    """
-    if not PATTERN_FEEDBACK_GATE_ENABLED:
-        return False
-    data = failed_data if isinstance(failed_data, dict) else {}
-    if enabled is None and "cvc_patterns" in data:
-        enabled = bool(data.get("cvc_patterns"))
-    if not resolve_cvc_patterns_enabled(enabled):
-        return False
-    feats = v2_pattern_features(data)
-    if not feats["trigger"]:
-        return False
-    return formulas_have_directed_equality(formulas)
-
-
-def v2_should_add_cvc_patterns(
-    *,
-    strategy_mode: str = "",
-    failed_data: Optional[dict] = None,
-    formulas: Sequence[str] = (),
-    enabled: Optional[bool] = None,
-) -> bool:
-    """Backward-compatible alias; ``strategy_mode`` no longer gates patterns."""
-    del strategy_mode
-    return should_add_cvc_patterns(
-        failed_data=failed_data, formulas=formulas, enabled=enabled
-    )
-
-
-def pattern_trigger_reasons(failed_data: Optional[dict]) -> List[str]:
-    feats = v2_pattern_features(failed_data)
-    reasons: List[str] = []
-    if feats["rare_inst"]:
-        reasons.append("rare_inst")
-    return reasons
