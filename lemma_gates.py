@@ -286,18 +286,17 @@ def with_screen_retry_hint(
 
 
 def child_llm_attempts() -> int:
-    """0 / unset-as-default: use the same 2N budget as the root.
+    """Cap child-node LLM attempts (root keeps the full 2N budget).
 
-    Default is 2 so the current method caps child LLM loops. paper.env should
-    set CHILD_LLM_ATTEMPTS=0.
+    Default **6** (main ablation). ``0`` uses the same 2N budget as the root.
     """
     raw = os.getenv("CHILD_LLM_ATTEMPTS")
     if raw is None or str(raw).strip() == "":
-        return 2
+        return 6
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
-        return 2
+        return 6
 
 
 def node_attempt_plan(depth: int, pack: Dict[str, Any]) -> Tuple[int, int]:

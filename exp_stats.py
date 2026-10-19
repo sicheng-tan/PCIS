@@ -448,7 +448,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "LLM_INVALID_CE_VERIFY": "off",
         "LLM_INVALID_CE_RETRIES": "1",
         "LLM_INVALID_ONLY_STOP": "on",
-        "CHILD_LLM_ATTEMPTS": "2",
+        "CHILD_LLM_ATTEMPTS": "6",
         "LLM_PARSE_RETRIES": "2",
         "LLM_SCREEN_RETRIES": "1",
         "MODEL_TYPE": "gpt-4o",

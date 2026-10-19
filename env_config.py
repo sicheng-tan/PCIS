@@ -81,7 +81,7 @@ def setup_environment():
     llm_invalid_ce_verify = os.getenv('LLM_INVALID_CE_VERIFY', 'off')
     llm_invalid_ce_retries = os.getenv('LLM_INVALID_CE_RETRIES', '1')
     llm_invalid_only_stop = os.getenv('LLM_INVALID_ONLY_STOP', 'on')
-    child_llm_attempts = os.getenv('CHILD_LLM_ATTEMPTS', '2')
+    child_llm_attempts = os.getenv('CHILD_LLM_ATTEMPTS', '6')
     llm_parse_retries = os.getenv('LLM_PARSE_RETRIES', '2')
     llm_screen_retries = os.getenv('LLM_SCREEN_RETRIES', '1')
     raw_llm_timeout = os.getenv('LLM_TIMEOUT')
