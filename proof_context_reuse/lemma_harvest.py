@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from exp_stats import log_exp
-from obligation_tree import (
+from .obligation_tree import (
     HARVEST_CVC_PROFILES,
     HARVEST_DISPATCH_KEY,
     local_lemma_harvest_enabled,

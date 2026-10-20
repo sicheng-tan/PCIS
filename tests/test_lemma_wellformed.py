@@ -20,7 +20,7 @@ from cvc5_runner import (  # noqa: E402
     check_lemma_wellformed,
     classify_cvc_wellformed_message,
 )
-from lemma_gates import (  # noqa: E402
+from proof_context_reuse.lemma_gates import (  # noqa: E402
     ILLFORMED_SCREEN_GATES,
     apply_static_lemma_screen,
     format_screen_retry_user,

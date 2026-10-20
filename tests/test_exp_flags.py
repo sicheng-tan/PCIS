@@ -29,7 +29,7 @@ from exp_flags import (
     should_run_induction_scheme,
     unproved_not_invalid_enabled,
 )
-from lemma_gates import (
+from proof_context_reuse.lemma_gates import (
     defined_symbols_enabled,
     lemma_filter_drop_enabled,
     llm_invalid_ce_verify_enabled,
@@ -37,7 +37,7 @@ from lemma_gates import (
     should_accept_in_loop_invalid_goal,
     subgoal_sat_abort_enabled,
 )
-from obligation_tree import (
+from proof_context_reuse.obligation_tree import (
     invalid_lemmas_mode,
     invalid_lemmas_paper_mode,
     lemma_library_enabled,

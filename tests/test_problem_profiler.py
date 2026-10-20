@@ -268,7 +268,7 @@ def test_nested_induction_progressive_list() -> None:
 
 def test_create_prompt_respects_after_useless_trigger() -> None:
     import Mate_new as mate
-    from obligation_tree import save_lemma_library
+    from proof_context_reuse.obligation_tree import save_lemma_library
 
     prompts = Path(__file__).resolve().parents[1] / "prompts_ours" / "prove_prompt_equational_reasoning"
     if not prompts.exists():
@@ -331,7 +331,7 @@ def test_create_prompt_respects_after_useless_trigger() -> None:
 
 def test_create_prompt_injects_when_flag_on() -> None:
     import Mate_new as mate
-    from obligation_tree import save_lemma_library
+    from proof_context_reuse.obligation_tree import save_lemma_library
 
     with tempfile.TemporaryDirectory() as tmp:
         prompts = Path(__file__).resolve().parents[1] / "prompts_ours" / "prove_prompt_equational_reasoning"

@@ -11,7 +11,7 @@ from exp_flags import (
     induction_scheme_mode,
     should_run_induction_scheme,
 )
-from lemma_harvest import write_negated_lemma_smt
+from proof_context_reuse.lemma_harvest import write_negated_lemma_smt
 
 from .constants import NEST
 from .dispatch import (

@@ -68,12 +68,12 @@ def harvest_scheme_refuted_to_invalid(
 ) -> int:
     """Record solver-refuted (sat) scheme obligations into ``invalid_lemmas``.
 
-    No-op when Module-2 ``INVALID_LEMMAS`` is off (same gate as lemma library).
+    No-op when PCR ``INVALID_LEMMAS`` is off (same gate as lemma library).
     """
     if not base_path or not attempt or attempt.skipped:
         return 0
     try:
-        from obligation_tree import invalid_lemmas_enabled
+        from proof_context_reuse.obligation_tree import invalid_lemmas_enabled
         if not invalid_lemmas_enabled():
             return 0
     except Exception:
@@ -119,7 +119,7 @@ def harvest_scheme_proved_to_library(
     if not base_path or not attempt or attempt.skipped:
         return 0
     try:
-        from obligation_tree import (
+        from proof_context_reuse.obligation_tree import (
             add_proved_lemma,
             lemma_library_enabled,
             scheme_helpers_in_text,
@@ -192,7 +192,7 @@ def filter_library_excluding_current_scheme(
     if not formulas:
         return items
     try:
-        from obligation_tree import lemmas_equivalent
+        from proof_context_reuse.obligation_tree import lemmas_equivalent
     except Exception:
         from smt_patterns import normalize_lemma_formula
 

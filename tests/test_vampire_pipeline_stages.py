@@ -20,7 +20,7 @@ os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from induction_scheme.constants import VAMPIRE_PROVE_PROFILES
-from obligation_tree import HARVEST_VAMPIRE_PROFILES, add_proved_lemma, save_lemma_library
+from proof_context_reuse.obligation_tree import HARVEST_VAMPIRE_PROFILES, add_proved_lemma, save_lemma_library
 from vampire_runner import (
     VampireResult,
     parse_vampire_stats,

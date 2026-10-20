@@ -40,11 +40,11 @@ Prompt templates under `prompts_ours/`, `prompts_ours_compact/`, `prompts_naive/
 
 | Piece | Flags / code |
 |-------|----------------|
-| Lemma library + local harvest | `LEMMA_LIBRARY`, `LEMMA_LIBRARY_LOCAL`, `USEFULNESS_HARVEST_*`, `lemma_harvest.py` |
-| Obligation tree | `OBLIGATION_TREE`, `obligation_tree.py` |
+| Lemma library + local harvest | `LEMMA_LIBRARY`, `LEMMA_LIBRARY_LOCAL`, `USEFULNESS_HARVEST_*`, `proof_context_reuse/lemma_harvest.py` |
+| Obligation tree | `OBLIGATION_TREE`, `proof_context_reuse/obligation_tree.py` |
 | Invalid / soft / unproved memory | `INVALID_LEMMAS` (`off` \| `on` \| `paper`), `UNPROVED_NOT_INVALID` |
-| Ancestor path filter + prompt | `ANCESTOR_CYCLE_FILTER`, `ANCESTOR_PROMPT`, `ancestor_stack.py` |
-| Static lemma gates | `LEMMA_DEFINED_SYMBOLS`, `LEMMA_FILTER_DROP`, `LEMMA_WELLFORMED_CHECK`, `lemma_gates.py` |
+| Ancestor path filter + prompt | `ANCESTOR_CYCLE_FILTER`, `ANCESTOR_PROMPT`, `proof_context_reuse/ancestor_stack.py` |
+| Static lemma gates | `LEMMA_DEFINED_SYMBOLS`, `LEMMA_FILTER_DROP`, `LEMMA_WELLFORMED_CHECK`, `proof_context_reuse/lemma_gates.py` |
 
 ### GSE — guided scheme / structure
 
@@ -54,11 +54,6 @@ Prompt templates under `prompts_ours/`, `prompts_ours_compact/`, `prompts_naive/
 | Induction scheme | `INDUCTION_SCHEME`, `MODE=both`, `TRIGGER=after_useless`, `NEST=cross_sort`, … → `induction_scheme/` |
 
 Paper GSE gating: inject / run **after a useless attempt**, with profiler **min attempt = 2**.
-
-### Child early-stop (kept)
-
-- System prompts may emit empty `<output>` + `; INVALID_GOAL:` on children
-- `LLM_INVALID_ONLY_STOP=on` (default): early-stop with `kind=stopped`, **no** hard invalid write-back
 
 ---
 
@@ -77,8 +72,10 @@ DOTENV_PATH=experiments/configs/<name>.env \
 | Paper name | Template | Meaning |
 |------------|----------|---------|
 | **PCIS** (Full) | `ablation_pcis.env.example` | PCR on + GSE on |
-| **PCR** | `ablation_pcr.env.example` | Module-2 memory only (profiler/scheme off) |
-| **GSE** | `ablation_gse.env.example` | Profiler+scheme; Module-2 off; `INVALID_LEMMAS=paper` |
+| **PCR** | `ablation_pcr.env.example` | PCR on only (profiler/scheme off) |
+| **GSE** | `ablation_gse.env.example` | Profiler+scheme; PCR off; `INVALID_LEMMAS=paper` |
+
+Shared non-ablation knobs (`LLM_INVALID_*`, child/parse/screen retries): `experiments/configs/shared.env.example` → `shared.env` (gitignored; loaded automatically when present).
 
 Simple / case-study template: `case.env.example` → `case.env` (serial `MAX_PARALLEL_TASKS=1`; default fallback in `env_config.py`).
 
@@ -162,7 +159,7 @@ PCIS/
 ├── run_exp_folder*.py                  # multiprocess batch runners
 ├── main.py                             # single-task entry
 ├── env_config.py / exp_flags.py        # env + ablation switches
-├── obligation_tree.py / ancestor_stack.py / lemma_gates.py / lemma_harvest.py
+├── proof_context_reuse/                # PCR (library, tree, ancestor, gates)
 ├── problem_profiler/ / induction_scheme/
 ├── cvc5_runner.py / vampire_runner.py / solver_profiles.py
 ├── prompts_ours/                       # paper main templates

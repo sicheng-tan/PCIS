@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from lemma_harvest import write_negated_lemma_smt
+from proof_context_reuse.lemma_harvest import write_negated_lemma_smt
 
 from .constants import (
     GOAL_GATE_TIMEOUT_S,
@@ -70,7 +70,7 @@ def _smt_with_measure_prelude(smt_content: str, attempt: SchemeAttempt) -> str:
     prelude = (attempt.measure_prelude or "").strip()
     if not prelude:
         return smt_content
-    from obligation_tree import upgrade_smt_logic_for_text
+    from proof_context_reuse.obligation_tree import upgrade_smt_logic_for_text
 
     # UFDT + Int μ helpers must become UFDTLIA before short-prove / gate.
     base = upgrade_smt_logic_for_text(smt_content, prelude)

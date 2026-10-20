@@ -1,7 +1,7 @@
 """Static theory-feature analysis for SMT-LIB2 inductive problems.
 
-Used by Feedback-Guided solver routing to pick Vampire / CVC5 profiles
-before any LLM query, and to explain routing decisions in prompts.
+Used for lightweight problem characterization (sorts/symbols); not part of
+the paper PCIS search loop.
 """
 
 from __future__ import annotations

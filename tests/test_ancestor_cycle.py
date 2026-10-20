@@ -6,14 +6,14 @@ import os
 import unittest
 from unittest.mock import patch
 
-from ancestor_stack import (
+from proof_context_reuse.ancestor_stack import (
     empty_ancestor_stack,
     extend_ancestors,
     format_proof_path_goals_for_prompt,
     lemma_matches_ancestor,
 )
 from exp_flags import ancestor_cycle_filter_enabled, ancestor_prompt_enabled
-from lemma_gates import (
+from proof_context_reuse.lemma_gates import (
     BENIGN_SCREEN_GATES,
     apply_static_lemma_screen,
     lemma_same_as_goal,

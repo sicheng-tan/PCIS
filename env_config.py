@@ -6,18 +6,24 @@ from langchain_openai import ChatOpenAI
 
 _ROOT = Path(__file__).resolve().parent
 DEFAULT_EXPERIMENT_ENV = _ROOT / "experiments" / "configs" / "case.env"
+SHARED_EXPERIMENT_ENV = _ROOT / "experiments" / "configs" / "shared.env"
 DEFAULT_OPENAI_API_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_OPENAI_MODEL = "openai/gpt-5"
 
 
 def load_runtime_env():
-    """Load project .env, then optional experiment env.
+    """Load project .env, shared knobs, then optional experiment env.
 
-    Existing OS environment variables win, except when ``DOTENV_PATH`` is set
-    (that file overrides). ``case.env`` is used only when no API key is present
-    yet, so unit tests that inject ``OPENAI_API_KEY`` are not affected.
+    Load order:
+    1. project ``.env`` (no override of existing OS env)
+    2. ``experiments/configs/shared.env`` if present (no override)
+    3. ``DOTENV_PATH`` when set (overrides), else ``case.env`` when no API key yet
+
+    Existing OS environment variables win unless ``DOTENV_PATH`` is set.
     """
     load_dotenv()
+    if SHARED_EXPERIMENT_ENV.exists():
+        load_dotenv(SHARED_EXPERIMENT_ENV, override=False)
     dotenv_path = os.getenv("DOTENV_PATH")
     if dotenv_path:
         load_dotenv(dotenv_path, override=True)
@@ -79,7 +85,7 @@ def setup_environment():
     lemma_defined_symbols = os.getenv('LEMMA_DEFINED_SYMBOLS', 'on')
     lemma_filter_drop = os.getenv('LEMMA_FILTER_DROP', 'on')
     llm_invalid_ce_verify = os.getenv('LLM_INVALID_CE_VERIFY', 'off')
-    llm_invalid_ce_retries = os.getenv('LLM_INVALID_CE_RETRIES', '1')
+    llm_invalid_ce_retries = os.getenv('LLM_INVALID_CE_RETRIES', '0')
     llm_invalid_only_stop = os.getenv('LLM_INVALID_ONLY_STOP', 'on')
     child_llm_attempts = os.getenv('CHILD_LLM_ATTEMPTS', '6')
     llm_parse_retries = os.getenv('LLM_PARSE_RETRIES', '2')

@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
-from obligation_tree import root_finish_prove_timeout_s
+from proof_context_reuse.obligation_tree import root_finish_prove_timeout_s
 import Mate_new as mate
 
 

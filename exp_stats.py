@@ -446,7 +446,7 @@ def ablation_flag_snapshot() -> Dict[str, str]:
         "LEMMA_FILTER_DROP": "on",
         "LEMMA_WELLFORMED_CHECK": "on",
         "LLM_INVALID_CE_VERIFY": "off",
-        "LLM_INVALID_CE_RETRIES": "1",
+        "LLM_INVALID_CE_RETRIES": "0",
         "LLM_INVALID_ONLY_STOP": "on",
         "CHILD_LLM_ATTEMPTS": "6",
         "LLM_PARSE_RETRIES": "2",

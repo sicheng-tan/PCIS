@@ -27,7 +27,7 @@ from llm_time_budget import (
     set_task_deadline,
     usefulness_timeout_s,
 )
-from obligation_tree import (
+from proof_context_reuse.obligation_tree import (
     add_proved_lemma,
     append_attempt,
     classify_failed_attempt,
@@ -65,19 +65,19 @@ from exp_flags import (
     unproved_not_invalid_enabled,
 )
 from solver_profiles import VAMPIRE_FALLBACK_PROFILE
-from ancestor_stack import (
+from proof_context_reuse.ancestor_stack import (
     AncestorStack,
     empty_ancestor_stack,
     extend_ancestors,
     format_proof_path_goals_for_prompt,
 )
-from lemma_harvest import (
+from proof_context_reuse.lemma_harvest import (
     harvest_slot_kind,
     make_harvest_slots,
     run_usefulness_with_delayed_harvest,
     usefulness_fail_allows_local_harvest,
 )
-from lemma_gates import (
+from proof_context_reuse.lemma_gates import (
     allow_unmarked_lemma_output,
     apply_static_lemma_screen,
     BENIGN_SCREEN_GATES,
@@ -230,7 +230,7 @@ def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
 def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     """Hard invalid: solver-refuted or LLM/solver child write-back.
 
-    Module-2 / paper negative memory (``INVALID_LEMMAS`` not ``off``).
+    PCR / paper negative memory (``INVALID_LEMMAS`` not ``off``).
     When mode is ``off``, this is a no-op. Formula already present keeps the
     original reason (no append).
     """

@@ -9,7 +9,7 @@ from smt_patterns import (
     infer_trigger_pattern,
     strip_bang_attrs,
 )
-from obligation_tree import inject_library_axioms
+from proof_context_reuse.obligation_tree import inject_library_axioms
 
 
 def _ok(cond: bool, msg: str = "") -> None:

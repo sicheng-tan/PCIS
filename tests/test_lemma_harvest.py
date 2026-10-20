@@ -17,7 +17,7 @@ os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from cvc5_runner import CvcResult
-from obligation_tree import (
+from proof_context_reuse.obligation_tree import (
     HARVEST_VAMPIRE_PROFILES,
     lemma_library_role,
     load_lemma_library,
@@ -128,7 +128,7 @@ def test_timeout_harvest_local_retries_goal_without_prove_run() -> None:
 
 def test_cvc_unknown_usefulness_still_harvests_local() -> None:
     """CVC portfolio may finish as unknown (not timeout); local harvest must still run."""
-    from lemma_harvest import usefulness_fail_allows_local_harvest
+    from proof_context_reuse.lemma_harvest import usefulness_fail_allows_local_harvest
 
     assert usefulness_fail_allows_local_harvest("unknown")
     assert not usefulness_fail_allows_local_harvest("sat")
@@ -414,7 +414,7 @@ def test_vampire_harvest_retry_refreshes_baseline() -> None:
 
 def test_vampire_incomplete_usefulness_still_harvests_local() -> None:
     """Single-schedule Vampire often ends incomplete (not timeout); harvest must pin."""
-    from lemma_harvest import usefulness_fail_allows_local_harvest
+    from proof_context_reuse.lemma_harvest import usefulness_fail_allows_local_harvest
 
     assert usefulness_fail_allows_local_harvest("incomplete")
     assert usefulness_fail_allows_local_harvest("timeout")

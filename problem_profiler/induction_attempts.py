@@ -414,7 +414,7 @@ def _formulas_match(left: str, right: str) -> bool:
     if a == b:
         return True
     try:
-        from obligation_tree import lemmas_equivalent
+        from proof_context_reuse.obligation_tree import lemmas_equivalent
         return lemmas_equivalent(a, b)
     except Exception:
         return False

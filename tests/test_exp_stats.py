@@ -93,7 +93,7 @@ def test_summarize_artifacts_counts_attempts_and_library(tmp_path: Path) -> None
     assert summary["active_profile"] == ""
     assert summary["winner_profile"] == ""
     assert summary["max_goal_depth"] == 2
-    # repair_hints writers removed with Module-1 feedback; kinds stay empty.
+    # repair_hints writers removed with the old feedback module; kinds stay empty.
     assert summary["hint_kinds"] == []
     assert summary["n_cancelled"] == 1
     assert summary["n_subgoals_proved"] == 1

@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from exp_flags import (
     _flag_enabled,
 )
-from obligation_tree import (
+from .obligation_tree import (
     compact_formula,
     lemmas_equivalent,
     normalize_lemma_formula,
@@ -163,16 +163,16 @@ def llm_invalid_only_stop_enabled() -> bool:
 def llm_invalid_ce_retries() -> int:
     """Extra lemma-generation rounds after CE_SMT fails solver check.
 
-    Default 1 (same prove-run attempt: re-run ``quick_run`` with a CE-fail hint,
-    not a diagnosis-only CE rewrite). 0 disables. Only when verify is on.
+    Default **0** (main ablation / shared.env). Same prove-run attempt when >0:
+    re-run ``quick_run`` with a CE-fail hint. Only applies when verify is on.
     """
     raw = os.getenv("LLM_INVALID_CE_RETRIES")
     if raw is None or str(raw).strip() == "":
-        return 1
+        return 0
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
-        return 1
+        return 0
 
 
 def format_ce_retry_user(
@@ -318,9 +318,9 @@ def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
     Hard ``invalid_lemmas`` only (child write-back / solver refutation). Soft
     suppressions are omitted — they are not mathematical INVALID evidence.
     Omits unproved, repair, progress, routing, and the obligation tree.
-    Honors Module-2 ``INVALID_LEMMAS`` (empty when off).
+    Honors PCR ``INVALID_LEMMAS`` (empty when off).
     """
-    from obligation_tree import invalid_lemma_records
+    from .obligation_tree import invalid_lemma_records
 
     records = [
         item for item in invalid_lemma_records(failed_data)
@@ -342,9 +342,9 @@ def format_diagnosis_invalid_prompt(failed_data: Optional[dict]) -> str:
 def format_soft_rejected_prompt(failed_data: Optional[dict]) -> str:
     """Node-local suppressions: do not regenerate; not mathematical INVALID.
 
-    Honors Module-2 ``INVALID_LEMMAS`` (empty when off).
+    Honors PCR ``INVALID_LEMMAS`` (empty when off).
     """
-    from obligation_tree import soft_rejected_lemma_records
+    from .obligation_tree import soft_rejected_lemma_records
 
     records = [
         item for item in soft_rejected_lemma_records(failed_data)
@@ -1150,7 +1150,7 @@ def apply_static_lemma_screen(
     Parse/type failures are ``illformed_lemmas``, not mathematical invalid.
     Library and in-group duplicates always drop only that member.
     """
-    from ancestor_stack import lemma_matches_ancestor
+    from .ancestor_stack import lemma_matches_ancestor
     from exp_flags import ancestor_cycle_filter_enabled
 
     current = list(lemmas)
@@ -1170,9 +1170,9 @@ def apply_static_lemma_screen(
     if not current:
         return [], dropped
 
-    # INVALID_LEMMAS: hard when not off; soft only in Module-2 ``on``.
+    # INVALID_LEMMAS: hard when not off; soft only in PCR ``on``.
     try:
-        from obligation_tree import (
+        from .obligation_tree import (
             invalid_lemmas_enabled as _hard_on,
             soft_rejected_memory_enabled as _soft_on,
         )
@@ -1249,7 +1249,7 @@ def apply_static_lemma_screen(
 
     # Scheme helpers must be declare-fun'd in the background (library / prelude).
     # Catches LLM-invented __scheme_* before cvc5 --parse-only (form B).
-    from obligation_tree import undeclared_scheme_helpers
+    from .obligation_tree import undeclared_scheme_helpers
 
     def _scheme_helper_reason(lemma: str) -> Optional[str]:
         missing = undeclared_scheme_helpers(lemma, smt)
@@ -1552,7 +1552,7 @@ def format_attempt_feedback_for_prompt(
     del current_goal  # reserved for callers
     data = failed_data if isinstance(failed_data, dict) else {}
     try:
-        from obligation_tree import invalid_lemmas_paper_mode
+        from .obligation_tree import invalid_lemmas_paper_mode
         if invalid_lemmas_paper_mode():
             return format_paper_useless_groups_for_prompt(data)
     except Exception:

@@ -16,7 +16,7 @@ os.environ.setdefault("OPENAI_API_KEY", "unit-test-placeholder")
 os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from exp_flags import resolve_prompt_pack
-from lemma_gates import (
+from proof_context_reuse.lemma_gates import (
     HD_AXIOM_GOAL_HINT,
     HD_DIFFICULTY_EXPLAIN,
     PARSE_ERR_EMPTY,
@@ -146,7 +146,7 @@ def test_static_screen_drops_library_alpha_keeps_rest() -> None:
 
 def test_static_screen_dedupes_alpha_within_group() -> None:
     """Keep first; drop later α-equivalent members (never whole group)."""
-    from obligation_tree import compact_formula
+    from proof_context_reuse.obligation_tree import compact_formula
 
     alpha = (
         "(forall ((xs Lst) (n Nat)) (= (len (append xs (cons n nil))) (succ (len xs))))"
@@ -486,7 +486,7 @@ def test_soft_vs_hard_rejected_lists() -> None:
     import Mate_new as mate_cvc
     import Mate_new_vampire as mate_v
     from cvc5_runner import CvcResult
-    from lemma_gates import (
+    from proof_context_reuse.lemma_gates import (
         apply_static_lemma_screen,
         format_diagnosis_invalid_prompt,
         format_soft_rejected_prompt,
@@ -1018,7 +1018,7 @@ def test_tree_status_sat_is_invalid() -> None:
 
 
 def test_tree_status_nested_invalid_does_not_mark_parent() -> None:
-    from obligation_tree import append_attempt, make_child_node, make_goal_tree
+    from proof_context_reuse.obligation_tree import append_attempt, make_child_node, make_goal_tree
 
     tree = make_goal_tree(
         "template_1",
@@ -1118,7 +1118,7 @@ def test_quick_run_drops_undefined_keeps_snoc() -> None:
 
 def test_quick_run_library_duplicate_retries_goal_not_invalid() -> None:
     import Mate_new_vampire as mate
-    from obligation_tree import add_proved_lemma
+    from proof_context_reuse.obligation_tree import add_proved_lemma
 
     snoc_alpha = (
         "(forall ((xs Lst) (n Nat)) (= (len (append xs (cons n nil))) (succ (len xs))))"
@@ -1922,7 +1922,7 @@ def test_empty_output_cot_reason_does_not_store_invalid() -> None:
 
 def test_root_tree_prompt_does_not_ask_to_judge_goal_invalid() -> None:
     import Mate_new as mate
-    from obligation_tree import append_attempt, make_child_node, make_goal_tree
+    from proof_context_reuse.obligation_tree import append_attempt, make_child_node, make_goal_tree
 
     tree = make_goal_tree(
         "template",
@@ -2080,7 +2080,7 @@ def test_prompt_invalid_not_unproved_and_drops_child_atp() -> None:
 
 def test_invalid_child_does_not_stop_parent_attempts() -> None:
     import Mate_new_vampire as mate
-    from obligation_tree import make_child_node
+    from proof_context_reuse.obligation_tree import make_child_node
 
     child = make_child_node(
         node_id="template_1",

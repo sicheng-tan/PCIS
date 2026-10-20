@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from obligation_tree import (
+from proof_context_reuse.obligation_tree import (
     add_proved_lemma,
     append_attempt,
     classify_failed_attempt,
@@ -321,7 +321,7 @@ def test_inject_upgrades_ufdt_when_int_measure_prelude() -> None:
 
 
 def test_ensure_smt_logic_for_arith_noop_when_already_lia() -> None:
-    from obligation_tree import ensure_smt_logic_for_arith
+    from proof_context_reuse.obligation_tree import ensure_smt_logic_for_arith
 
     smt = "(set-logic UFDTLIA)\n(assert true)\n"
     assert ensure_smt_logic_for_arith(smt, need_int=True, need_real=False) == smt
@@ -351,7 +351,7 @@ def test_add_proved_lemma_stores_prelude() -> None:
             assert lib_id2 == "lib_1"
             # Promote path: pin with prelude fills empty.
             items[0]["prelude"] = ""
-            from obligation_tree import save_lemma_library
+            from proof_context_reuse.obligation_tree import save_lemma_library
             save_lemma_library(tmp, items)
             add_proved_lemma(
                 tmp, formula, origin="scheme:g:fix", role="pin", prelude=prelude,
@@ -690,7 +690,7 @@ def test_flags_default_and_off_synonyms() -> None:
 def test_invalid_lemmas_paper_mode_hard_only_and_all_useless() -> None:
     """paper: hard INVALID + all useless groups; no soft; Situation A → invalid."""
     import Mate_new as mate
-    from lemma_gates import format_attempt_feedback_for_prompt
+    from proof_context_reuse.lemma_gates import format_attempt_feedback_for_prompt
 
     g1 = ["(forall ((x Nat)) (= x x))"]
     g2 = ["(forall ((y Nat)) (= y y))", "(forall ((z Nat)) true)"]
@@ -727,7 +727,7 @@ def test_invalid_lemmas_paper_mode_hard_only_and_all_useless() -> None:
                        for r in stored.get("invalid_lemmas") or [])
 
             fb = mate.format_solver_feedback_for_prompt(data)
-            # Upstream LLM4Ind create_prompt wording (not Module-2 INVALID: block).
+            # Upstream base-search create_prompt wording (not PCR INVALID: block).
             assert "; IMPORTANT: The following lemmas are INVALID" in fb
             assert "DO NOT generate these lemmas:" in fb
             assert "; Invalid lemma 1 (sat):" in fb
@@ -744,15 +744,15 @@ def test_invalid_lemmas_paper_mode_hard_only_and_all_useless() -> None:
 
 
 def test_invalid_lemmas_flag_gates_write_prompt_and_screen() -> None:
-    """Module-2 INVALID_LEMMAS: off ⇒ hard+soft memory ignored for write/prompt/screen."""
+    """PCR INVALID_LEMMAS: off ⇒ hard+soft memory ignored for write/prompt/screen."""
     import Mate_new as mate
-    from lemma_gates import (
+    from proof_context_reuse.lemma_gates import (
         apply_static_lemma_screen,
         format_diagnosis_invalid_prompt,
         format_soft_rejected_prompt,
         lemma_same_as_goal,
     )
-    from obligation_tree import soft_rejected_lemma_records
+    from proof_context_reuse.obligation_tree import soft_rejected_lemma_records
 
     bad = "(forall ((x Nat)) false)"
     soft_lem = "(forall ((x Nat)) (= (f x) x))"

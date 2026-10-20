@@ -28,3 +28,5 @@ Optional overrides: `DOTENV_PATH`, `RESULT_DIR`, `SKIP_FILE`.
 
 Default results go to `experiments/results/ablation_{pcr,gse,pcis}/`.
 Each chain runs `autoproof` → `dtt` → `ind-ben` → `vmcai15-dt` under `nohup`.
+
+Optional shared knobs (not ablation-specific): `cp experiments/configs/shared.env.example experiments/configs/shared.env`

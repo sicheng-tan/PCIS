@@ -878,7 +878,7 @@ def test_library_prompt_filters_current_scheme_only() -> None:
 def test_harvest_scheme_proved_stores_measure_prelude() -> None:
     """Scheme pins that use __scheme_* must carry measure_prelude into the library."""
     from induction_scheme.ledger import harvest_scheme_proved_to_library
-    from obligation_tree import inject_library_axioms, load_lemma_library
+    from proof_context_reuse.obligation_tree import inject_library_axioms, load_lemma_library
 
     prelude = (
         "(declare-fun __scheme_nat_to_int (Nat) Int)\n"

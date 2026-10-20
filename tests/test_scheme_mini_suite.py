@@ -21,7 +21,7 @@ from induction_scheme.bridges import _is_descent_name, _list_nil_cons, pick_or_s
 from induction_scheme.generate import generate_scheme, select_measure_fun
 from induction_scheme.ledger import harvest_scheme_proved_to_library
 from induction_scheme.types import SchemeAttempt, SchemeObligation
-from obligation_tree import inject_library_axioms, load_lemma_library, scheme_helpers_in_text
+from proof_context_reuse.obligation_tree import inject_library_axioms, load_lemma_library, scheme_helpers_in_text
 from problem_profiler import build_problem_profile
 
 _FIX = Path(__file__).resolve().parent / "fixtures" / "induction_scheme"
@@ -119,7 +119,7 @@ def test_A_dirty_lib_wellformed_false_positive_and_fix() -> None:
     Inject skip + proper prelude restore wellformed.
     """
     from cvc5_runner import check_lemma_wellformed
-    from obligation_tree import merge_scheme_prelude_into_smt
+    from proof_context_reuse.obligation_tree import merge_scheme_prelude_into_smt
 
     smt = _load_fix("measure_nat_len.smt2")
     # Experimental shape (isa/goal74, rotate-goal4): nonneg without declare.
@@ -165,7 +165,7 @@ def test_A_list_len_dirty_lib_wellformed_false_positive_and_fix() -> None:
     """CVC scheme_p20 form A (sort_SSortIsSort): __scheme_list_len without declare."""
     from cvc5_runner import check_lemma_wellformed
     from induction_scheme.bridges import pick_or_synthesize_measure
-    from obligation_tree import merge_scheme_prelude_into_smt
+    from proof_context_reuse.obligation_tree import merge_scheme_prelude_into_smt
     from problem_profiler import build_problem_profile
 
     smt = """(set-logic UFDTLIA)
@@ -211,8 +211,8 @@ def test_A_list_len_dirty_lib_wellformed_false_positive_and_fix() -> None:
 def test_B_lemma_mentions_scheme_helper_needs_prelude() -> None:
     """CVC scheme_p20 form B: lemma itself uses __scheme_*; fail without prelude."""
     from cvc5_runner import check_lemma_wellformed
-    from lemma_gates import apply_static_lemma_screen, screen_lemmas_wellformed
-    from obligation_tree import merge_scheme_prelude_into_smt
+    from proof_context_reuse.lemma_gates import apply_static_lemma_screen, screen_lemmas_wellformed
+    from proof_context_reuse.obligation_tree import merge_scheme_prelude_into_smt
 
     smt = _load_fix("measure_nat_len.smt2")
     # goal74-style take/append lemma using nat→int (shortened).
@@ -253,8 +253,8 @@ def test_B_lemma_mentions_scheme_helper_needs_prelude() -> None:
 def test_B_list_len_lemma_screen_soft_then_ok_with_prelude() -> None:
     """Form B1 (MSortBUIsSort shape): lemma uses __scheme_list_len."""
     from induction_scheme.bridges import pick_or_synthesize_measure
-    from lemma_gates import apply_static_lemma_screen
-    from obligation_tree import merge_scheme_prelude_into_smt
+    from proof_context_reuse.lemma_gates import apply_static_lemma_screen
+    from proof_context_reuse.obligation_tree import merge_scheme_prelude_into_smt
     from problem_profiler import build_problem_profile
 
     smt = """(set-logic UFDTLIA)
