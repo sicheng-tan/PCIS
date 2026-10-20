@@ -82,6 +82,9 @@ DOTENV_PATH=experiments/configs/<name>.env \
 
 Vampire: same env + `run_exp_folder_vampire.py` / `Mate_new_vampire.py`.
 
+Full706 chain launchers (CVC5, four suites, `nohup`):
+`experiments/scripts/run_ablation_{pcr,gse,pcis}.sh` — see `experiments/scripts/README.md`.
+
 Evaluation size: **706 − 20 = 686** (see `docs/excluded_instances.md`).
 
 ---
