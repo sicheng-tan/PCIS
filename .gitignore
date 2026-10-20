@@ -1,21 +1,20 @@
 .env
-运行说明.md
 .DS_Store
 
-# 个例实验：配置含密钥；结果目录默认不入库，仅保留顶层汇总 CSV
+# Case-study experiments: configs contain secrets; ignore result trees, keep top-level summary CSVs
 experiments/configs/*.env
 experiments/results/**
 !experiments/results/.gitkeep
 !experiments/results/*.csv
 
-# 本地 AI / IDE 元数据
+# Local AI / IDE metadata
 .codex/
 .cursor/
 .claude/
 .idea/
 .vscode/
 
-# 生成的演示文稿及其检查产物
+# Generated slide decks and their inspection artifacts
 .codex_artifacts/
 *.pptx
 *.pptx.inspect.ndjson
@@ -23,12 +22,12 @@ experiments/results/**
 __pycache__/
 *.pyc
 
-# cvc5 静态库（只保留 bin/cvc5 可执行文件）
+# cvc5 static SDK extras (keep only bin/cvc5)
 cvc/cvc5-Linux-x86_64-static/include/
 cvc/cvc5-Linux-x86_64-static/lib/
 cvc/cvc5-Linux-x86_64-static/licenses/
 cvc/cvc5-Linux-x86_64-static/AUTHORS
 cvc/cvc5-Linux-x86_64-static/COPYING
 
-# 本地论文稿件与投稿模板，不纳入版本控制
+# Local paper drafts and submission templates (not version-controlled)
 /paper/

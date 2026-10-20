@@ -894,7 +894,7 @@ def ensure_task_summary(
             except OSError:
                 pass
         return existing
-    exit_reason = "timeout" if error and "超时" in error else ("error" if error else "attempts_exhausted")
+    exit_reason = "timeout" if error and "Task timeout" in error else ("error" if error else "attempts_exhausted")
     if existing.get("exit_reason") == "timeout" and not error:
         return existing
     return write_task_summary(folder, proved=proved, exit_reason=exit_reason, error=error)
@@ -1011,21 +1011,21 @@ def print_batch_stats(results: Sequence[Tuple], total_duration: float) -> None:
         summary = load_task_summary(folder)
         by_solved[summary.get("solved_by") or ("llm" if row[1] else "unsolved")] += 1
         by_reason[summary.get("exit_reason") or ""] += 1
-        if error and "超时" in str(error):
+        if error and "Task timeout" in str(error):
             timeouts += 1
-    print("\n=== 执行完成 ===")
-    print(f"总任务数: {total}")
-    print(f"成功求解: {successful}")
-    print(f"失败任务: {total - successful}")
+    print("\n=== Run complete ===")
+    print(f"Total tasks: {total}")
+    print(f"Solved: {successful}")
+    print(f"Failed tasks: {total - successful}")
     if timeouts:
-        print(f"超时任务: {timeouts}")
-    print(f"总执行时间: {total_duration:.2f}秒")
+        print(f"Timed-out tasks: {timeouts}")
+    print(f"Total wall time: {total_duration:.2f}s")
     if total:
-        print(f"平均每任务时间: {total_duration / total:.2f}秒")
+        print(f"Average time per task: {total_duration / total:.2f}s")
     if by_solved:
         parts = ", ".join(f"{name}={count}" for name, count in sorted(by_solved.items()) if name)
-        print(f"求解来源: {parts}")
+        print(f"Solve sources: {parts}")
     reasons = {name: count for name, count in by_reason.items() if name}
     if reasons:
         parts = ", ".join(f"{name}={count}" for name, count in sorted(reasons.items()))
-        print(f"结束原因: {parts}")
+        print(f"Exit reasons: {parts}")

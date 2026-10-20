@@ -136,23 +136,23 @@ from exp_stats import (
     record_llm_generation,
 )
 
-# 配置彩色日志
+# Configure colored logging
 logger = setup_colored_logger()
 config = setup_environment()
 
-# 初始化模型
+# Initialize the model
 llm = setup_model(config)
 
 _DIAGNOSTIC_TIMEOUT = 3
 
-# 在文件开头添加失败引理管理函数
+# Failed-lemma bookkeeping helpers
 def get_failed_lemmas_file(base_path: str, goal_name: str) -> Path:
-    """获取失败引理记录文件路径，根据目标名称生成对应文件"""
-    # 提取目标名称的后缀部分来构建文件名
+    """Return the failed-lemma record path for the given goal name."""
+    # Build the filename from the goal-name suffix
     if goal_name == "template":
         filename = "failed_lemmas.json"
     else:
-        # 提取template后面的部分，如template_1 -> _1, template_1_2 -> _1_2
+        # Take the part after template, e.g. template_1 -> _1, template_1_2 -> _1_2
         suffix = goal_name.replace("template", "")
         filename = f"failed_lemmas{suffix}.json"
     
@@ -178,7 +178,7 @@ def _empty_failed_data() -> dict:
     }
 
 def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
-    """加载失败引理记录"""
+    """Load failed-lemma records."""
     failed_file = get_failed_lemmas_file(base_path, goal_name)
     if failed_file.exists():
         try:
@@ -201,11 +201,11 @@ def load_failed_lemmas(base_path: str, goal_name: str) -> dict:
             data.setdefault("last_screen", [])
             return data
         except Exception as e:
-            logging.warning(f"加载失败引理文件出错: {e}")
+            logging.warning(f"Error loading failed-lemma file: {e}")
     return _empty_failed_data()
 
 def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
-    """保存失败引理记录"""
+    """Save failed-lemma records."""
     failed_file = get_failed_lemmas_file(base_path, goal_name)
     tmp_file = None
     try:
@@ -223,7 +223,7 @@ def save_failed_lemmas(base_path: str, goal_name: str, failed_data: dict):
             os.fsync(f.fileno())
         os.replace(tmp_file, failed_file)
     except Exception as e:
-        logging.error(f"保存失败引理文件出错: {e}")
+        logging.error(f"Error saving failed-lemma file: {e}")
         if tmp_file is not None:
             try:
                 tmp_file.unlink()
@@ -245,7 +245,7 @@ def add_invalid_lemma(base_path: str, goal_name: str, lemma: str, reason: str):
     lemma_record = {"lemma": lemma, "reason": reason}
     failed_data["invalid_lemmas"].append(lemma_record)
     save_failed_lemmas(base_path, goal_name, failed_data)
-    logging.info(f"记录无效引理到{goal_name}: {reason} - {lemma[:50]}...")
+    logging.info(f"Recorded invalid lemma for {goal_name}: {reason} - {lemma[:50]}...")
     log_exp("invalid_lemma", goal=goal_name, reason=reason)
 
 
@@ -274,7 +274,7 @@ def add_soft_rejected_lemma(
     failed_data["soft_rejected_lemmas"] = soft[-40:]
     save_failed_lemmas(base_path, goal_name, failed_data)
     logging.info(
-        "记录节点抑制引理到%s: %s - %s...",
+        "Recorded node-suppressed lemma for %s: %s - %s...",
         goal_name, soft_gate, (lemma or "")[:50],
     )
     log_exp("soft_rejected_lemma", goal=goal_name, gate=soft_gate, reason=reason)
@@ -301,13 +301,13 @@ def add_illformed_lemma(
     # Cap growth within one node.
     failed_data["illformed_lemmas"] = records[-40:]
     save_failed_lemmas(base_path, goal_name, failed_data)
-    logging.info("记录格式/类型错误引理到%s: %s - %s...", goal_name, gate, (lemma or "")[:50])
+    logging.info("Recorded ill-formed/type-error lemma for %s: %s - %s...", goal_name, gate, (lemma or "")[:50])
     log_exp("illformed_lemma", goal=goal_name, kind=gate, reason=reason)
 
 
 def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[str],
                             meta: Optional[dict] = None):
-    """添加无用引理组合记录（可附带 cvc5 失败元信息）"""
+    """Record a useless lemma group (optionally with cvc5 failure metadata)."""
     failed_data = load_failed_lemmas(base_path, goal_name)
     record: Any = lemma_group
     if meta:
@@ -318,7 +318,7 @@ def add_useless_lemma_group(base_path: str, goal_name: str, lemma_group: List[st
             return
     failed_data["useless_lemma_groups"].append(record)
     save_failed_lemmas(base_path, goal_name, failed_data)
-    logging.info(f"记录无用引理组合到{goal_name}: {len(lemma_group)}条引理")
+    logging.info(f"Recorded useless lemma group for {goal_name}: {len(lemma_group)} lemmas")
     log_exp(
         "useless_group",
         goal=goal_name,
@@ -426,7 +426,7 @@ def _accept_llm_invalid_diagnosis(
             source=source,
             reason="missing_ce_smt",
         )
-        logging.info("子目标 %s LLM invalid 缺 CE_SMT，不写入硬 invalid", goal_name)
+        logging.info("Subgoal %s LLM invalid lacks CE_SMT; not writing hard invalid", goal_name)
         return False, "missing_ce_smt"
     smt_path = Path(base_path) / f"{goal_name}.smt2"
     if not smt_path.exists():
@@ -447,7 +447,7 @@ def _accept_llm_invalid_diagnosis(
             reason=detail,
         )
         logging.info(
-            "子目标 %s LLM CE 未通过求解器校验 (%s)，不写入硬 invalid",
+            "Subgoal %s LLM CE failed solver check (%s); not writing hard invalid",
             goal_name,
             detail,
         )
@@ -773,7 +773,7 @@ def _set_goal_only_baseline(
     _store_cached_diag(base_path, goal_name, "baseline_diag", result)
     if result.difficulty:
         logging.info(
-            "cvc5 高难度断言 (%s): %s",
+            "cvc5 hard assertion (%s): %s",
             context,
             [t[:80] for t, _s in result.difficulty[:3]],
         )
@@ -905,7 +905,7 @@ def create_prompt(
     ancestor_stack: AncestorStack = (),
     current_formula: Optional[str] = None,
 ) -> Tuple[list, str]:
-    """创建用于 LLM 的结构化消息列表。返回 (messages, 本轮追加的反馈文本)。"""
+    """Build the structured LLM message list. Returns (messages, feedback text appended this round)."""
     if folder_path is None:
         raise ValueError("folder path of prompts must be provided")
 
@@ -1010,8 +1010,8 @@ def create_prompt(
     return messages, failed_info
 
 def extract_balanced_forall(assert_not_content: str) -> Optional[str]:
-    """提取平衡的 forall 表达式"""
-    # 首先定位到 forall 的开始位置
+    """Extract a balanced forall expression."""
+    # Locate the start of forall
     start_match = re.search(r'\(\s*forall', assert_not_content)
     if not start_match:
         return None
@@ -1020,7 +1020,7 @@ def extract_balanced_forall(assert_not_content: str) -> Optional[str]:
     balance = 0
     end_pos = start_pos
     
-    # 从 forall 开始处扫描，找到平衡的右括号
+    # Scan from forall to find the matching closing parenthesis
     for i, c in enumerate(assert_not_content[start_pos:]):
         if c == '(':
             balance += 1
@@ -1035,7 +1035,7 @@ def extract_balanced_forall(assert_not_content: str) -> Optional[str]:
 def parse_llm_response(
     response: str, *, depth: int = 0, diagnosis_only: bool = False
 ) -> List[str]:
-    """解析LLM输出，提取有效断言。"""
+    """Parse LLM output and extract valid assertions."""
     return parse_llm_lemmas(response, depth=depth, diagnosis_only=diagnosis_only)
 
 def _remember_strategy_mode(base_path: str, goal_name: str, strategy_mode: str) -> str:
@@ -1195,7 +1195,7 @@ def verify_combined_lemmas(
     )
     if full.proved:
         logging.info(
-            "组合引理证出目标（cvc5 portfolio strategy=%s elapsed=%.2fs）",
+            "Combined lemmas proved the goal (cvc5 portfolio strategy=%s elapsed=%.2fs)",
             full.strategy, full.elapsed,
         )
         return True, list(asserts), full
@@ -1243,9 +1243,9 @@ def perform_initial_verification(
     log_event: str = "initial_prove",
     timeout: Optional[int] = None,
 ) -> bool:
-    """执行初始验证检查。timeout 仅覆盖本次调用，默认仍是 DEFAULT_CVC_TIMEOUT。"""
+    """Run the initial verification check. timeout overrides only this call; default remains DEFAULT_CVC_TIMEOUT."""
     default_timeout = config['DEFAULT_CVC_TIMEOUT'] if timeout is None else int(timeout)
-    logging.info(f"🔍执行初始检查, 目标文件: {goal_smt_file}")
+    logging.info(f"Running initial check, goal file: {goal_smt_file}")
     smt_path = goal_smt_file
     if base_path and lemma_library_enabled():
         n_lib = len(load_lemma_library(base_path))
@@ -1282,7 +1282,7 @@ def perform_initial_verification(
         profile=result.strategy,
     )
     if result.proved:
-        logging.info("✅ 原目标直接验证成功! (strategy=%s)", result.strategy)
+        logging.info("Original goal proved directly! (strategy=%s)", result.strategy)
         return True
 
     if base_path and goal_name:
@@ -1291,7 +1291,7 @@ def perform_initial_verification(
                 base_path, goal_name, result, context="initial_goal", replace=False,
             )
             logging.error(
-                "CVC5验证未通过 (status=%s elapsed=%.2fs strategy=%s)，开始生成新引理...",
+                "CVC5 verification failed (status=%s elapsed=%.2fs strategy=%s); generating new lemmas...",
                 result.status, result.elapsed, result.strategy,
             )
         elif log_event == "harvest_retry":
@@ -1300,7 +1300,7 @@ def perform_initial_verification(
                 context="harvest_retry", replace=True,
             )
             logging.info(
-                "再证当前目标未通过 (status=%s elapsed=%.2fs)；已用当前引理库刷新 baseline",
+                "Re-proving current goal failed (status=%s elapsed=%.2fs); refreshed baseline with current lemma library",
                 result.status, result.elapsed,
             )
         elif log_event == "root_finish_prove":
@@ -1309,12 +1309,12 @@ def perform_initial_verification(
                 context="root_finish_prove", replace=True,
             )
             logging.info(
-                "根节点收尾再证未通过 (status=%s elapsed=%.2fs)；已用当前引理库刷新 baseline",
+                "Root wrap-up re-prove failed (status=%s elapsed=%.2fs); refreshed baseline with current lemma library",
                 result.status, result.elapsed,
             )
         else:
             logging.info(
-                "再证当前目标未通过 (status=%s elapsed=%.2fs)",
+                "Re-proving current goal failed (status=%s elapsed=%.2fs)",
                 result.status, result.elapsed,
             )
     return False
@@ -1357,7 +1357,7 @@ def maybe_root_finish_prove(
         return False
     goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
     logging.info(
-        "根节点 attempt 用尽，收尾再证 timeout=%ss (cap=%s)",
+        "Root attempts exhausted; wrap-up re-prove timeout=%ss (cap=%s)",
         timeout, cap,
     )
     return perform_initial_verification(
@@ -1370,14 +1370,14 @@ def maybe_root_finish_prove(
 
 
 def extract_original_goal(smt_content: str) -> Tuple[re.Match, str]:
-    """提取原始目标断言和forall表达式"""
+    """Extract the original goal assertion and forall expression."""
     original_assert = re.search(
         r'; proof goal\s*(\(assert.*?\))\s*; proof goal end',
         smt_content,
         flags=re.DOTALL
     )
     original_forall = extract_balanced_forall(original_assert.group(1))
-    logging.info(f"提取到原始目标: {original_assert.group(1)}, forall 表达式: {original_forall}")
+    logging.info(f"Extracted original goal: {original_assert.group(1)}, forall expression: {original_forall}")
     return original_assert, original_forall
 
 def generate_lemmas_with_llm(
@@ -1395,14 +1395,14 @@ def generate_lemmas_with_llm(
     extra_user: Optional[str] = None,
     skip_hint_refresh: bool = False,
 ) -> List[str]:
-    """使用LLM生成引理。diagnosis_only 时只鉴定当前目标是否 invalid。
+    """Generate lemmas with the LLM. When diagnosis_only, only judge whether the current goal is invalid.
 
-    格式解析失败时在同一次 attempt 内按 LLM_PARSE_RETRIES 再请求，不立刻消耗下一轮 attempt。
-    extra_user 追加一轮用户说明（静态筛 kept=0 重生）；skip_hint_refresh 跳过诊断器。
+    On parse failure, re-request within the same attempt up to LLM_PARSE_RETRIES without consuming the next attempt.
+    extra_user appends a user note (static screen kept=0 regen); skip_hint_refresh skips the diagnoser.
     """
     logging.info(
-        "即将使用LLM%s, 目标文件: %s, 提示策略: %s",
-        "鉴定当前目标" if diagnosis_only else "生成引理",
+        "About to use LLM%s, goal file: %s, prompt strategy: %s",
+        "diagnose current goal" if diagnosis_only else "generate lemmas",
         goal_smt_file,
         prompt_strategy,
     )
@@ -1503,7 +1503,7 @@ def generate_lemmas_with_llm(
             remaining = extra_retries - call_i
             if remaining > 0:
                 logging.warning(
-                    "LLM 输出无法解析，同一次 attempt 再请求 (%d 次剩余): %s",
+                    "LLM output unparseable; re-requesting in same attempt (%d left): %s",
                     remaining,
                     parse_error,
                 )
@@ -1516,7 +1516,7 @@ def generate_lemmas_with_llm(
                 )
                 call_messages = with_parse_retry_hint(messages, raw)
                 continue
-            logging.warning("LLM 输出无法解析，重试已用尽: %s", parse_error)
+            logging.warning("LLM output unparseable; retries exhausted: %s", parse_error)
             log_exp(
                 "parse_retry_exhausted",
                 goal=goal_name,
@@ -1548,16 +1548,16 @@ def generate_lemmas_with_llm(
     return extracted_asserts
 
 def normalize_formula(formula: str) -> str:
-    """增强的公式标准化函数"""
-    # 1. 清理空白字符
+    """Enhanced formula normalization."""
+    # 1. Strip whitespace
     formula = re.sub(r'\s+', ' ', formula.strip())
     
-    # 2. 查找forall关键字
+    # 2. Find the forall keyword
     forall_pos = formula.find('forall')
     if forall_pos == -1:
         return formula
     
-    # 3. 手动解析变量定义部分
+    # 3. Manually parse the variable-binding section
     ptr = forall_pos + len('forall')
     while ptr < len(formula) and formula[ptr] in ' \t\n':
         ptr += 1
@@ -1565,7 +1565,7 @@ def normalize_formula(formula: str) -> str:
     if ptr >= len(formula) or formula[ptr] != '(':
         return formula
     
-    # 找到变量定义部分的结束位置
+    # Find the end of the variable-binding section
     balance = 0
     var_def_start = ptr
     for i in range(ptr, len(formula)):
@@ -1579,13 +1579,13 @@ def normalize_formula(formula: str) -> str:
     else:
         return formula
     
-    # 提取变量定义和公式体
+    # Extract variable bindings and formula body
     var_section = formula[var_def_start+1:var_def_end-1]
     body_start = var_def_end
     while body_start < len(formula) and formula[body_start] in ' \t\n':
         body_start += 1
     
-    # 找到公式体
+    # Locate the formula body
     balance = 0
     body_end = len(formula)
     for i in range(body_start, len(formula)):
@@ -1599,31 +1599,31 @@ def normalize_formula(formula: str) -> str:
     
     body = formula[body_start:body_end]
     
-    # 4. 解析变量定义
+    # 4. Parse variable bindings
     var_defs = re.findall(r'\(\s*(\w+)\s+(\w+)\s*\)', var_section)
     if not var_defs:
         return formula
     
-    # 5. 创建变量映射
+    # 5. Build variable mapping
     var_map = {var: f'a{i}' for i, (var, _) in enumerate(var_defs)}
     
-    # 6. 替换变量
+    # 6. Substitute variables
     normalized_body = body
     for old_var, new_var in sorted(var_map.items(), key=lambda x: -len(x[0])):
         normalized_body = re.sub(rf'\b{re.escape(old_var)}\b', new_var, normalized_body)
     
-    # 7. 重构公式
+    # 7. Rebuild the formula
     normalized_vars = ' '.join(f'({var_map[var]} {typ})' for var, typ in var_defs)
     return f'(forall ({normalized_vars}) {normalized_body})'
 
 def extract_equality_parts(formula: str):
-    """提取等式的左右两部分"""
-    # 查找最外层的等式
+    """Extract the left and right sides of an equality."""
+    # Find the outermost equality
     eq_start = formula.rfind('(=')
     if eq_start == -1:
         return None, None
     
-    # 找到等式的结束位置
+    # Find the end of the equality
     balance = 0
     eq_end = len(formula)
     for i in range(eq_start, len(formula)):
@@ -1635,10 +1635,10 @@ def extract_equality_parts(formula: str):
                 eq_end = i + 1
                 break
     
-    # 提取等式内容（去掉 "(= " 和 ")"）
+    # Extract equality content (strip "(= " and ")")
     eq_content = formula[eq_start + 3:eq_end - 1].strip()
     
-    # 手动解析左右两部分
+    # Manually parse left and right sides
     balance = 0
     parts = []
     current_part = ""
@@ -1665,22 +1665,22 @@ def extract_equality_parts(formula: str):
     return None, None
 
 def normalize_equality_order(formula: str) -> str:
-    """标准化等式的左右顺序"""
-    # 提取等式的左右部分
+    """Normalize the left/right order of an equality."""
+    # Extract left and right sides of the equality
     left, right = extract_equality_parts(formula)
     if left is None or right is None:
         return formula
     
-    # 按字典序排序，确保相同的等式有统一的顺序
+    # Sort lexicographically so equivalent equalities share one order
     if left <= right:
-        return formula  # 已经是标准顺序
+        return formula  # Already in canonical order
     else:
-        # 交换左右顺序 - 需要找到并替换完整的等式部分
+        # Swap left/right — locate and replace the full equality
         eq_start = formula.rfind('(=')
         if eq_start == -1:
             return formula
             
-        # 找到等式的结束位置
+        # Find the end of the equality
         balance = 0
         eq_end = len(formula)
         for i in range(eq_start, len(formula)):
@@ -1692,26 +1692,26 @@ def normalize_equality_order(formula: str) -> str:
                     eq_end = i + 1
                     break
         
-        # 构造新的等式
+        # Build the new equality
         new_equality = f'(= {right} {left})'
         return formula[:eq_start] + new_equality + formula[eq_end:]
 
 def are_formulas_equivalent(formula1: str, formula2: str) -> bool:
-    """增强的公式等价性检查"""
+    """Enhanced formula equivalence check."""
     try:
-        # 1. 标准化两个公式
+        # 1. Normalize both formulas
         norm1 = normalize_formula(formula1)
         norm2 = normalize_formula(formula2)
         
-        # 2. 标准化等式顺序
+        # 2. Normalize equality order
         norm1 = normalize_equality_order(norm1)
         norm2 = normalize_equality_order(norm2)
         
-        # 3. 比较标准化后的公式（含 α 换元）
+        # 3. Compare normalized formulas (including alpha renaming)
         return norm1 == norm2 or lemma_same_as_goal(norm1, norm2)
         
     except Exception as e:
-        # print(f"标准化过程出错: {e}，回退到简单比较")
+        # print(f"Normalization failed: {e}; falling back to simple comparison")
         return formula1.strip() == formula2.strip() or lemma_same_as_goal(
             formula1, formula2
         )
@@ -1728,7 +1728,7 @@ def validate_lemmas_against_original(extracted_asserts: List[str], original_fora
         ),
     )
     for i, (assert_stmt, _reason) in enumerate(dropped, 1):
-        logging.error("引理与原目标相同，已排除: %s", assert_stmt[:80])
+        logging.error("Lemma identical to original goal; excluded: %s", assert_stmt[:80])
         add_soft_rejected_lemma(
             base_path, goal_name, assert_stmt, "Same as original goal",
             gate="same_as_goal",
@@ -1746,7 +1746,7 @@ def validate_lemmas_against_original(extracted_asserts: List[str], original_fora
 
 def create_validation_files(extracted_asserts: List[str], smt_content: str, 
                           smt_file_path: Path, goal_smt_name: str) -> List[Path]:
-    """创建引理有效性验证文件"""
+    """Create a lemma validity-check file."""
     valid_check_paths = []
     for i, assert_stmt in enumerate(extracted_asserts, 1):
         valid_content = re.sub(
@@ -1777,12 +1777,12 @@ def _solver_sat_reason(smt_path: Path, *, fallback: str = "solver:sat") -> str:
 
 
 def verify_single_lemma(valid_path: Path) -> Tuple[Path, CvcResult]:
-    """验证单个引理的有效性（assert lemma 若 unsat ⇒ 与公理矛盾 ⇒ invalid）"""
-    logging.info(f"开始检查有效性: {valid_path.name}")
+    """Check validity of one lemma (assert lemma unsat ⇒ contradicts axioms ⇒ invalid)."""
+    logging.info(f"Starting validity check: {valid_path.name}")
     result = run_cvc(valid_path, timeout=1)
     add_solver_time(str(valid_path.parent), result.elapsed)
     logging.info(
-        f"检查有效性: {valid_path.name} 结束，proved={result.proved} status={result.status}"
+        f"Validity check finished for {valid_path.name}: proved={result.proved} status={result.status}"
     )
     return valid_path, result
 
@@ -1793,9 +1793,9 @@ def validate_lemmas_parallel(
     base_path: str,
     goal_name: str,
 ) -> List[str]:
-    """1s 有效性：与公理矛盾记 invalid；parse/type 记 illformed；其余进入有用性。
+    """1s validity: contradicting axioms → invalid; parse/type → illformed; else usefulness.
 
-    ``LEMMA_FILTER_DROP`` 开启时返回其余成员；关闭时任一失败则返回空列表。
+    When ``LEMMA_FILTER_DROP`` is on, return the remaining members; when off, any failure yields [].
     """
     lemma_by_path = {
         path: lemma for path, lemma in zip(valid_check_paths, lemmas)
@@ -1842,7 +1842,7 @@ def validate_lemmas_parallel(
                         )
                 else:
                     logging.info(
-                        f"1s 未证伪，进入有用性: {valid_path.name} (status={result.status})"
+                        f"1s did not refute; entering usefulness: {valid_path.name} (status={result.status})"
                     )
             except Exception as e:
                 path = future_to_path[future]
@@ -1850,7 +1850,7 @@ def validate_lemmas_parallel(
                 lemma_content = lemma_by_path.get(path) or extract_lemma_from_file(path)
                 if lemma_content:
                     add_soft_rejected_lemma(
-                        base_path, goal_name, lemma_content, f"验证异常: {e}",
+                        base_path, goal_name, lemma_content, f"Verification exception: {e}",
                         gate="verify_exception",
                     )
     
@@ -1868,20 +1868,20 @@ def validate_lemmas_parallel(
     return kept
 
 def extract_lemma_from_file(file_path: Path) -> str:
-    """从验证文件中提取引理内容"""
+    """Extract lemma content from a verification file."""
     try:
         content = file_path.read_text()
         match = re.search(r'; proof goal\s*\(assert\s+(.+?)\)\s*; proof goal end', content, re.DOTALL)
         if match:
             return match.group(1).strip()
     except Exception as e:
-        logging.error(f"提取引理内容失败: {e}")
+        logging.error(f"Failed to extract lemma content: {e}")
     return None
 
 
 def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
                         smt_file_path: Path, goal_smt_name: str) -> List[str]:
-    """生成正式验证文件（取反的引理）"""
+    """Generate the formal verification file (negated lemma)."""
     generated_files = []
     for i, assert_stmt in enumerate(extracted_asserts, 1):
         lemma_content = re.sub(
@@ -1893,7 +1893,7 @@ def generate_formal_proof_files(extracted_asserts: List[str], smt_content: str,
         lemma_path = smt_file_path / f"{goal_smt_name}_{i}.smt2"
         lemma_path.write_text(lemma_content)
         generated_files.append(lemma_path.name.split('.')[0])
-        logging.info(f"生成验证文件: {lemma_path.name}")
+        logging.info(f"Generated verification file: {lemma_path.name}")
     return generated_files
 
 
@@ -1990,7 +1990,7 @@ def _finish_usefulness_unsat(
         "skip_initial_diag": skip_initial_diag,
     })
     logging.info(
-        "lemmas有用，保留 %d/%d 条用于子目标生成 (direct_proved=%d recurse=%d)",
+        "Lemmas useful; keeping %d/%d for subgoal generation (direct_proved=%d recurse=%d)",
         len(selected_lemmas), len(extracted_asserts),
         len(pre_proved), len(recurse),
     )
@@ -2025,11 +2025,11 @@ def _finish_usefulness_timeout(
             timeout=harvest_retry_timeout_s(),
         )
         if ok:
-            logging.info("timeout 收获 %d 条 local 后证出当前目标", n_local)
+            logging.info("After harvesting %d local lemmas on timeout, proved current goal", n_local)
             return True, [], extracted_asserts
-        logging.info("timeout 收获 %d 条 local 后仍未证出当前目标", n_local)
+        logging.info("After harvesting %d local lemmas on timeout, still did not prove current goal", n_local)
     else:
-        logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
+        logging.error("Generated lemmas did not help prove the original goal (progress/repair feedback written)")
     return False, [], extracted_asserts
 
 
@@ -2047,7 +2047,7 @@ def quick_run(
     seed_extra_user: Optional[str] = None,
     scheme_nest_budget: int = 1,
 ) -> Tuple[bool, List[str], List[str]]:
-    """快速运行函数, 返回验证结果、子目标文件和生成的引理"""
+    """Quick-run entry: returns verification result, subgoal files, and generated lemmas."""
     smt_file_path = Path(base_path)
     goal_smt_file = smt_file_path / f"{goal_smt_name}.smt2"
     smt_content = goal_smt_file.read_text()
@@ -2060,20 +2060,20 @@ def quick_run(
             base_path, goal_smt_name, len(load_lemma_library(base_path)), "attempt_smt"
         )
 
-    # 步骤1: 初始验证检查
+    # Step 1: initial verification check
     if baseline_only:
-        # 在baseline模式下，使用task_timeout作为超时时间
+        # In baseline mode, use task_timeout as the timeout
         task_timeout = config['TASK_TIMEOUT']
-        logging.info(f"🔍 Baseline模式: 执行初始验证检查，超时时间: {task_timeout}秒")
+        logging.info(f"Baseline mode: running initial verification, timeout: {task_timeout}s")
         result = run_cvc(goal_smt_file, task_timeout)
         add_solver_time(base_path, result.elapsed)
         if result.proved:
-            logging.info("✅ Baseline模式: 初始验证成功!")
+            logging.info("Baseline mode: initial verification succeeded!")
         else:
-            logging.info("❌ Baseline模式: 初始验证失败 (status=%s)", result.status)
+            logging.info("Baseline mode: initial verification failed (status=%s)", result.status)
         return result.proved, [], []
 
-    # 步骤2: 提取原始目标
+    # Step 2: extract original goal
     original_assert, original_forall = extract_original_goal(solver_content)
 
     failed_data = load_failed_lemmas(base_path, goal_smt_name)
@@ -2143,7 +2143,7 @@ def quick_run(
         except Exception:
             return False
     
-    # 步骤3: 使用LLM生成引理；静态筛 kept=0 时同 attempt 最多再生成 LLM_SCREEN_RETRIES 次
+    # Step 3: generate lemmas with LLM; if static screen kept=0, regenerate up to LLM_SCREEN_RETRIES in same attempt
     library_items = load_lemma_library(base_path) if lemma_library_enabled() else []
     extra_user: Optional[str] = seed_extra_user
     skip_hint_refresh = bool(seed_extra_user)
@@ -2163,7 +2163,7 @@ def quick_run(
         )
         if not extracted_asserts:
             if screen_round == 1:
-                logging.info("大模型未返回引理，跳过本 attempt（不加时）")
+                logging.info("Model returned no lemmas; skipping this attempt (no extra time)")
                 _scheme_fin(False)
                 if _scheme_pending_success():
                     return True, [], []
@@ -2210,7 +2210,7 @@ def quick_run(
             if known_n:
                 log_exp("known_invalid", goal=goal_smt_name, n=known_n, kept=len(extracted_asserts))
             logging.info(
-                "筛选排除 %d 条 (gates=%s)，保留 %d 条",
+                "Screening dropped %d (gates=%s), kept %d",
                 len(dropped),
                 [gate for _lemma, _reason, gate in dropped],
                 len(extracted_asserts),
@@ -2236,7 +2236,7 @@ def quick_run(
             gates=",".join(gate for _lemma, _reason, gate in dropped),
         )
         logging.info(
-            "静态筛选全灭，同 attempt 再生成一次 (round=%s, gates=%s)",
+            "Static screening kept 0; regenerating in same attempt (round=%s, gates=%s)",
             screen_round,
             [gate for _lemma, _reason, gate in dropped],
         )
@@ -2251,7 +2251,7 @@ def quick_run(
                     timeout=harvest_retry_timeout_s(),
                 )
                 if ok:
-                    logging.info("筛选后引理已在库中，用当前库证出当前目标")
+                    logging.info("Screened lemmas already in library; proved current goal with current library")
                     _scheme_fin(True)
                     return True, [], generated_asserts
             _scheme_fin(False)
@@ -2267,7 +2267,7 @@ def quick_run(
             return True, [], generated_asserts
         return False, [], generated_asserts
 
-    # 步骤5: 创建验证文件并并行验证引理有效性
+    # Step 5: create verification files and check lemma validity in parallel
     valid_check_paths = create_validation_files(extracted_asserts, solver_content, smt_file_path, goal_smt_name)
     extracted_asserts = validate_lemmas_parallel(
         valid_check_paths, extracted_asserts, base_path, goal_smt_name,
@@ -2279,7 +2279,7 @@ def quick_run(
         return False, [], generated_asserts
 
 
-    # 步骤6: 一次整组有用性检查
+    # Step 6: one whole-group usefulness check
     combined_path = smt_file_path / f"{goal_smt_name}_with_lemmas.smt2"
     harvest_on = local_lemma_harvest_enabled()
     slots = []
@@ -2336,7 +2336,7 @@ def quick_run(
         if _scheme_pending_success():
             return True, [], extracted_asserts
         return result
-    logging.error("生成引理未能帮助证明原目标（已写入进展/repair反馈）")
+    logging.error("Generated lemmas did not help prove the original goal (progress/repair feedback written)")
     _scheme_fin(False)
     if _scheme_pending_success():
         return True, [], extracted_asserts
@@ -2357,11 +2357,11 @@ def prove_subgoals_parallel(
     ancestor_stack: AncestorStack = (),
     parent_formula: Optional[str] = None,
 ) -> Tuple[bool, List[dict]]:
-    """并行验证子目标。已证兄弟写入引理库；取消的标 cancelled。"""
+    """Verify subgoals in parallel. Proved siblings go into the lemma library; cancelled ones are marked cancelled."""
     if not subgoals:
         return True, []
 
-    logging.info(f"🚀 开始并行验证 {len(subgoals)} 个子目标: {subgoals} (递归深度: {depth})")
+    logging.info(f"Starting parallel verification of {len(subgoals)} subgoals: {subgoals} (depth: {depth})")
     parent_lemmas = parent_lemmas or []
     skip_initial_for = skip_initial_for or set()
     skip_initial_diag = skip_initial_diag or {}
@@ -2447,7 +2447,7 @@ def prove_subgoals_parallel(
                 try:
                     result = future.result()
                     if not result:
-                        logging.error(f"💥 子目标 {subgoal} 验证失败，终止所有并行任务")
+                        logging.error(f"Subgoal {subgoal} verification failed; cancelling all parallel tasks")
                         if parent_lemmas and parent_goal_name:
                             _record_subgoal_failure_feedback(
                                 base_path, parent_goal_name, subgoal, parent_lemmas
@@ -2456,9 +2456,9 @@ def prove_subgoals_parallel(
                         _collect_remaining(record_failures=True)
                         return False, _ordered()
                     snapshots[subgoal] = _snap(subgoal, "proved")
-                    logging.info(f"✅ 子目标 {subgoal} 验证成功")
+                    logging.info(f"Subgoal {subgoal} verified successfully")
                 except Exception as e:
-                    logging.error(f"💥 子目标 {subgoal} 执行异常: {e}，终止所有并行任务")
+                    logging.error(f"Subgoal {subgoal} raised exception: {e}; cancelling all parallel tasks")
                     if parent_lemmas and parent_goal_name:
                         blocking = _lemma_for_blocking_subgoal(
                             parent_goal_name, subgoal, parent_lemmas
@@ -2475,11 +2475,11 @@ def prove_subgoals_parallel(
                     _collect_remaining(record_failures=True)
                     return False, _ordered()
 
-            logging.info(f"🌟 所有 {len(subgoals)} 个子目标并行验证通过")
+            logging.info(f"All {len(subgoals)} subgoals verified in parallel")
             return True, _ordered("proved")
 
         except KeyboardInterrupt:
-            logging.warning("收到中断信号，取消所有并行任务")
+            logging.warning("Interrupt received; cancelling all parallel tasks")
             for f in future_to_subgoal:
                 if not f.done():
                     f.cancel()
@@ -2500,7 +2500,7 @@ def prove_run(
     scheme_only: bool = False,
     scheme_nest_budget: int = 1,
 ) -> bool:
-    """提示策略的递归验证函数 主程序入口"""
+    """Prompt-strategy recursive verification (main entry)."""
     outcome = {"proved": False, "reason": "attempts_exhausted"}
 
     def _done(ok: bool, reason: str) -> bool:
@@ -2547,11 +2547,11 @@ def _prove_run_body(
     scheme_only: bool = False,
     scheme_nest_budget: int = 1,
 ) -> bool:
-    """提示策略的递归验证函数 主程序入口"""
-    # 检查递归深度限制
+    """Prompt-strategy recursive verification (main entry)."""
+    # Check recursion-depth limit
     max_depth = config['MAX_RECURSION_DEPTH']
     if depth >= max_depth:
-        logging.warning(f"🚫 达到最大递归深度 {max_depth}，停止处理 {base_name}")
+        logging.warning(f"Hit max recursion depth {max_depth}; stopping {base_name}")
         log_exp("max_depth", goal=base_name, depth=depth, max_depth=max_depth)
         return _done(False, "max_depth")
 
@@ -2571,13 +2571,13 @@ def _prove_run_body(
             },
         )
 
-    # 如果是baseline模式，直接调用quick_run进行初始验证
+    # In baseline mode, call quick_run for initial verification only
     if baseline_only:
-        logging.info(f"🎯 Baseline模式: 开始处理 {base_name}")
+        logging.info(f"Baseline mode: starting {base_name}")
         result, _, _ = quick_run(base_path, base_name, "", "", baseline_only=True)
         return _done(result, "baseline_prove" if result else "baseline_fail")
     
-    logging.info(f"开始处理 Path: {base_path}, Name: {base_name} (递归深度: {depth})")
+    logging.info(f"Processing Path: {base_path}, Name: {base_name} (depth: {depth})")
     log_exp("node_enter", goal=base_name, depth=depth, parent=parent_goal_name)
     _remember_strategy_mode(base_path, base_name, strategy_mode)
 
@@ -2654,7 +2654,7 @@ def _prove_run_body(
             logging.warning("scheme_only node failed: %s", exc)
             return _done(False, "scheme_fail")
 
-    # 执行初始验证检查
+    # Run initial verification check
     if skip_initial:
         log_exp("skip_initial_prove", goal=base_name, because="harvest_exhausted")
         harvested = skip_initial_diag
@@ -2679,7 +2679,7 @@ def _prove_run_body(
             _set_node_outcome(
                 base_path, base_name, kind="invalid", reason=sat_reason, source="solver"
             )
-            logging.info("子目标 %s 为 sat，停止 LLM (%s)", base_name, sat_reason[:120])
+            logging.info("Subgoal %s is sat; stopping LLM (%s)", base_name, sat_reason[:120])
             return _done(False, "refuted")
 
     pack = resolve_prompt_pack(strategy_mode, config["MAX_ATTEMPTS_PER_PROMPT"])
@@ -2705,7 +2705,7 @@ def _prove_run_body(
         )
         prompt_strategy = current_prompt
         logging.info(
-            "[主阶段] 处理 %s - 第%d/%d次尝试(prompt=%s)",
+            "[main] processing %s - attempt %d/%d (prompt=%s)",
             base_name,
             attempt + 1,
             total_attempts,
@@ -2759,12 +2759,12 @@ def _prove_run_body(
                 )
                 if ok:
                     logging.info(
-                        "子目标 %s LLM 判定不可证: %s", base_name, reason,
+                        "Subgoal %s judged unprovable by LLM: %s", base_name, reason,
                     )
                     return _done(False, "llm_invalid")
                 if not reject or ce_rounds >= ce_budget:
                     logging.info(
-                        "子目标 %s LLM INVALID_GOAL 未通过 CE 校验，继续 attempt",
+                        "Subgoal %s LLM INVALID_GOAL failed CE check; continuing attempts",
                         base_name,
                     )
                     break
@@ -2783,7 +2783,7 @@ def _prove_run_body(
                     reason=reject[:160],
                 )
                 logging.info(
-                    "子目标 %s CE 校验失败 (%s)，同 attempt 再生成引理 (%d/%d)",
+                    "Subgoal %s CE check failed (%s); regenerating lemmas in same attempt (%d/%d)",
                     base_name,
                     reject,
                     ce_rounds,
@@ -2855,11 +2855,11 @@ def _prove_run_body(
                             return _done(True, "scheme_nest")
                 except Exception as exc:
                     logging.warning("scheme post-attempt failed: %s", exc)
-            # ret为True代表发现了可能会有用的子目标 不代表证明成功
-            # lemma 被quick filtering了
-            # lemma 是useful的情况下 但是lemma本身没有被验证成功 就给5次
+            # ret=True means a potentially useful subgoal was found, not that the proof succeeded
+            # lemma was quick-filtered
+            # when lemma is useful but not yet proved itself, allow 5 attempts
             if ret:
-                logging.info(f"🎯 策略 {prompt_strategy} 第{attempt+1}次尝试搜寻可能有用的引理成功！")
+                logging.info(f"Strategy {prompt_strategy} attempt {attempt+1}: found potentially useful lemmas!")
                 dispatch = _pop_harvest_dispatch(base_path, base_name)
                 pre_proved = dispatch.get("pre_proved") or {}
                 order = list(dispatch.get("order") or new_subgoals)
@@ -2868,7 +2868,7 @@ def _prove_run_body(
                 if not isinstance(skip_diag, dict):
                     skip_diag = {}
 
-                # 成功证明的情况，没有subgoal了
+                # Proved successfully; no subgoals left
                 if not new_subgoals:
                     if pre_proved:
                         _record_subgoal_split(
@@ -2876,11 +2876,11 @@ def _prove_run_body(
                             order=order, pre_proved=pre_proved, rec_nodes=[],
                             formula=current_formula,
                         )
-                    logging.info(f"🏆 子目标 {base_name} 完成证明！")
+                    logging.info(f"Subgoal {base_name} proved!")
                     return _done(True, "llm_no_subgoals")
 
-                # 处理子目标 - 使用并行执行
-                logging.info(f"🔍 发现子目标: {new_subgoals}")
+                # Handle subgoals in parallel
+                logging.info(f"Found subgoals: {new_subgoals}")
                 current_lemmas = extracted_asserts
                 subgoal_result = prove_subgoals_parallel(
                     base_path, new_subgoals, depth, strategy_mode, baseline_only,
@@ -2900,9 +2900,9 @@ def _prove_run_body(
                     formula=current_formula,
                 )
                 if ok:
-                    logging.info(f"🌟 所有子目标验证通过，{base_name} 最终成功")
+                    logging.info(f"All subgoals verified; {base_name} succeeded")
                     return _done(True, "llm_subgoals")
-                logging.warning(f"💥 子目标验证失败，继续尝试下一次生成")
+                logging.warning(f"Subgoal verification failed; trying another generation")
                 log_exp("subgoals_failed", goal=base_name, attempt=attempt + 1, n=len(new_subgoals))
                 continue
 
@@ -2915,14 +2915,14 @@ def _prove_run_body(
             )
 
         except TimeoutError:
-            logging.warning(f"策略 {prompt_strategy} 第{attempt+1}次尝试超时")
+            logging.warning(f"Strategy {prompt_strategy} attempt {attempt+1} timed out")
             continue
         except Exception as e:
-            logging.error(f"策略 {prompt_strategy} 第{attempt+1}次尝试出错: {e}")
+            logging.error(f"Strategy {prompt_strategy} attempt {attempt+1} error: {e}")
             continue
 
-    # 所有策略和尝试都失败了
-    logging.error(f"🚫 {base_name} 所有策略均失败")
+    # All strategies and attempts failed
+    logging.error(f"{base_name}: all strategies failed")
     # InductionScheme frontier backup: only prove, no nest/LLM.
     if induction_scheme_enabled():
         try:
@@ -2993,9 +2993,9 @@ def _obligation_tree_has_proved_child(node) -> bool:
 #     """After every LLM attempt on this node failed, retry the original goal once."""
 #     goal_smt_file = Path(base_path) / f"{goal_name}.smt2"
 #     retry_timeout = config["RETRY_CVC_TIMEOUT"]
-#     logging.info("全部 LLM attempt 失败，加时一次再证原目标 timeout=%s", retry_timeout)
+#     logging.info("All LLM attempts failed; one extra-time re-prove of original goal timeout=%s", retry_timeout)
 #     retry = run_cvc(goal_smt_file, retry_timeout)
 #     if retry.proved:
-#         logging.info("原目标提高时间到%d秒后验证成功!", retry_timeout)
+#         logging.info("Original goal proved after raising timeout to %d seconds!", retry_timeout)
 #         return True
 #     return False

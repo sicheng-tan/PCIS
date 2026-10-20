@@ -698,7 +698,7 @@ def _run_cvc_parallel(
                 if result.proved:
                     _cleanup_processes(processes, exclude=name)
                     logging.info(
-                        "%s验证成功: unsat (策略: %s, %.2fs)",
+                        "%s proved: unsat (strategy: %s, %.2fs)",
                         specs[spec_by_result[name]]["type"], name, elapsed,
                     )
                     summaries[name] = _compact_cvc(result)
@@ -737,7 +737,7 @@ def _run_cvc_parallel(
                     "elapsed": round(elapsed, 3),
                     "strategy": result_name,
                 }
-        logging.warning("CVC5/CVC4验证超时或失败 (耗时: %.2f秒)", elapsed)
+        logging.warning("CVC5/CVC4 verification timed out or failed (elapsed: %.2fs)", elapsed)
         statuses = [item.get("status") for item in summaries.values()]
         if timed_out:
             final_status = "timeout"
@@ -1697,7 +1697,7 @@ def _stdout_is_unsat(stdout: str) -> bool:
 def _execute_single(cmd: List[str], timeout: int, strategy: str) -> CvcResult:
     result = CvcResult(strategy=strategy)
     try:
-        logging.debug("启动CVC诊断: %s", " ".join(cmd))
+        logging.debug("Starting CVC diagnosis: %s", " ".join(cmd))
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

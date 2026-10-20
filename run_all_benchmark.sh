@@ -1,58 +1,58 @@
 #!/bin/bash
 
-# 配置日志目录路径（可以根据需要修改）
+# Log directory (edit as needed)
 # LOG_DIR="logs_ours_prompt1x6_depth3"
 LOG_DIR="logs_ours_qwen3"
 
-# 创建logs目录（如果不存在）
+# Create logs directory if missing
 mkdir -p "$LOG_DIR"
 
-echo "开始运行所有基准测试 - $(date)"
-echo "日志文件将保存在 $LOG_DIR/ 目录下"
+echo "Starting all benchmark runs - $(date)"
+echo "Log files will be saved under $LOG_DIR/"
 
-# 获取脚本所在目录
+# Directory containing this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 定义数据集
+# Datasets
 # declare -a datasets=("autoproof" "dtt")
 declare -a datasets=("ind-ben" "vmcai15-dt")
 
-# 串行执行每个命令
+# Run each suite serially
 for dataset in "${datasets[@]}"; do
-    # 根据数据集名称构建路径
+    # Build path from dataset name
     path="$SCRIPT_DIR/benchmarks/preprocessed/$dataset"
-    # 为每个数据集生成独立的时间戳
+    # Per-dataset timestamp
     TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
     logfile="$LOG_DIR/${TIMESTAMP}_${dataset}.log"
     
     echo "=========================================="
-    echo "正在运行数据集: $dataset"
-    echo "日志文件: $logfile"
-    echo "开始时间: $(date)"
+    echo "Running dataset: $dataset"
+    echo "Log file: $logfile"
+    echo "Start time: $(date)"
     echo "=========================================="
     
-    # 执行命令并将输出重定向到日志文件
-    # kill all unuse processes
+    # Run and tee output to the log file
+    # kill all unused processes
     sleep 10
     python3 run_exp_folder.py --root-path "$path" 2>&1 | tee "$logfile"
-    # 休眠10秒，等待CVC5进程结束
+    # Wait briefly for CVC5 processes to exit
     sleep 10
     ./kill_cvc_processes.sh
     sleep 10
-    # 检查命令执行状态
+    # Check exit status of the python pipeline stage
     if [ ${PIPESTATUS[0]} -eq 0 ]; then
-        echo "✓ 数据集 $dataset 执行成功"
-        echo "执行成功 - 结束时间: $(date)" >> "$logfile"
+        echo "✓ Dataset $dataset succeeded"
+        echo "Succeeded - end time: $(date)" >> "$logfile"
     else
-        echo "✗ 数据集 $dataset 执行失败"
-        echo "执行失败 - 结束时间: $(date)" >> "$logfile"
-        echo "错误: 数据集 $dataset 执行失败，请检查日志文件 $logfile"
+        echo "✗ Dataset $dataset failed"
+        echo "Failed - end time: $(date)" >> "$logfile"
+        echo "Error: dataset $dataset failed; see log $logfile"
     fi
     
     echo ""
 done
 
 echo "=========================================="
-echo "所有基准测试完成 - $(date)"
-echo "所有日志文件已保存在 $LOG_DIR/ 目录下"
+echo "All benchmark runs finished - $(date)"
+echo "All log files are under $LOG_DIR/"
 echo "=========================================="

@@ -1450,7 +1450,7 @@ def _execute_vampire(
 ) -> VampireResult:
     result = VampireResult(strategy=strategy)
     try:
-        logging.debug("启动Vampire: %s", " ".join(command))
+        logging.debug("Starting Vampire: %s", " ".join(command))
         proc = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -1491,26 +1491,26 @@ def _execute_vampire(
 
         if result.proved:
             logging.info(
-                "Vampire验证成功: unsat (耗时: %.2f秒, status=%s)",
+                "Vampire proved: unsat (elapsed: %.2fs, status=%s)",
                 result.elapsed, result.status,
             )
         else:
             logging.debug(
-                "Vampire未证出 (status=%s, 耗时: %.2f秒, stats_keys=%s)",
+                "Vampire did not prove (status=%s, elapsed: %.2fs, stats_keys=%s)",
                 result.status, result.elapsed, list(result.stats.keys())[:6],
             )
         return result
             
     except FileNotFoundError:
-        logging.error("Vampire可执行文件未找到: %s", command[0] if command else "?")
+        logging.error("Vampire executable not found: %s", command[0] if command else "?")
         return VampireResult(status="error", error="binary not found")
     except Exception as e:
-        logging.error("启动Vampire进程失败: %s", e)
+        logging.error("Failed to start Vampire process: %s", e)
         return VampireResult(status="error", error=str(e))
 
 
 def _cleanup_process(proc):
-    """清理进程，包括其子进程"""
+    """Clean up a process including its children."""
     if proc.poll() is None:
         try:
             try:
@@ -1526,4 +1526,4 @@ def _cleanup_process(proc):
                     proc.kill()
                 proc.wait()
         except Exception as e:
-            logging.error("终止Vampire进程时出错: %s", e)
+            logging.error("Error while terminating Vampire process: %s", e)

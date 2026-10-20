@@ -698,7 +698,7 @@ def test_parse_llm_lemmas_xml_and_legacy() -> None:
         parse_llm_lemmas("no tags here")
     except ValueError as exc:
         raised = True
-        assert "输出标记" in str(exc)
+        assert "output markers" in str(exc)
     assert raised
 
 
@@ -1659,7 +1659,7 @@ def test_generate_unmarked_without_reason_still_raises() -> None:
                 )
             except ValueError as exc:
                 raised = True
-                assert "输出标记" in str(exc)
+                assert "output markers" in str(exc)
             assert raised
 
 
@@ -1718,7 +1718,7 @@ def test_parse_retry_exhausted_still_raises() -> None:
             _run_generate_lemmas(fake_llm, retries="1", mod_name=mod_name)
         except ValueError as exc:
             raised = True
-            assert "输出标记" in str(exc)
+            assert "output markers" in str(exc)
         assert raised, mod_name
         assert fake_llm.invoke.call_count == 2, mod_name
 
@@ -1875,7 +1875,7 @@ def test_generate_cot_reason_without_tag_still_raises() -> None:
                 )
             except ValueError as exc:
                 raised = True
-                assert "输出标记" in str(exc)
+                assert "output markers" in str(exc)
             assert raised
             stored = mate.load_failed_lemmas(tmp, "template").get("last_llm_reason", "")
             assert stored == ""

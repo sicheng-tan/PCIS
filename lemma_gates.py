@@ -103,9 +103,9 @@ CE_RETRY_USER = (
     "COUNTEREXAMPLE CHECK FAILED: your INVALID_GOAL was not accepted because "
     "CE_SMT was missing or did not make axioms ∧ ¬CURRENT satisfiable."
 )
-PARSE_ERR_EMPTY = "空引理输出"
-PARSE_ERR_UNMATCHED = "引理括号不配平"
-PARSE_ERR_MISSING_TAGS = "响应格式错误，缺少输出标记"
+PARSE_ERR_EMPTY = "Empty lemma output"
+PARSE_ERR_UNMATCHED = "Unbalanced parentheses in lemma"
+PARSE_ERR_MISSING_TAGS = "Response format error: missing output markers"
 MAX_FORALL_CLOSE_REPAIR = 2
 MAX_SCREEN_RETRY_DROPS = 6
 SCREEN_RETRY_USER = (
@@ -133,7 +133,7 @@ def wellformed_check_enabled() -> bool:
 def lemma_filter_drop_enabled() -> bool:
     """Drop failing members and continue usefulness on the rest (default on).
 
-    paper.env sets this off: any failing member aborts the whole group.
+    ablation / case configs typically set this off: any failing member aborts the whole group.
     """
     return _flag_enabled("LEMMA_FILTER_DROP")
 
@@ -797,7 +797,7 @@ def infer_soft_reject_gate(reason: str, *, gate: str = "") -> str:
         return "undeclared_scheme_helper"
     if "cvc error" in text or "vampire error" in text:
         return "solver_error"
-    if "验证异常" in str(reason or "") or (
+    if "Verification exception" in str(reason or "") or (
         "verify" in text and "exception" in text
     ):
         return "verify_exception"

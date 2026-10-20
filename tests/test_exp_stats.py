@@ -180,7 +180,7 @@ def test_timeout_summary_from_artifacts(tmp_path: Path) -> None:
         {"exp_attempts": [{"kind": "useless"}], "routing": {}},
     )
     summary = write_task_summary(
-        str(tmp_path), proved=False, exit_reason="timeout", error="任务超时 (1200秒)"
+        str(tmp_path), proved=False, exit_reason="timeout", error="Task timeout (1200s)"
     )
     assert summary["solved_by"] == "timeout"
     assert summary["n_useless"] == 1
@@ -268,13 +268,13 @@ def test_record_llm_generation_writes_plain_prompt_dump(tmp_path: Path) -> None:
         user_text="user2 full prompt",
         lemmas=[],
         elapsed=0.4,
-        parse_error="响应格式错误，缺少输出标记",
+        parse_error="Response format error: missing output markers",
         raw="; INVALID_GOAL: plus is only declared, no defining axioms",
     )
     text = (tmp_path / LLM_PROMPTS_FILENAME).read_text(encoding="utf-8")
     assert "===== LLM CALL 2 =====" in text
     assert "user2 full prompt" in text
-    assert "parse_error: 响应格式错误，缺少输出标记" in text
+    assert "parse_error: Response format error: missing output markers" in text
     assert "; INVALID_GOAL: plus is only declared, no defining axioms" in text
 
 

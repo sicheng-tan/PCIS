@@ -21,8 +21,8 @@ def add_skip_file_argument(parser) -> None:
         "--skip-file",
         type=str,
         default=None,
-        help="每行一个错误定理路径的排除列表（# 开头为注释）。"
-             f"也可用环境变量 {SKIP_FILE_ENV}。未指定则不排除。",
+        help="Exclusion list: one bad theorem path per line (# starts a comment)."
+             f"Also via env {SKIP_FILE_ENV}. No exclusions if unset.",
     )
 
 
@@ -61,7 +61,7 @@ def normalize_skip_parts(raw: str) -> Tuple[str, ...]:
 def load_skip_patterns(skip_file: str) -> List[Tuple[str, ...]]:
     path = Path(skip_file)
     if not path.is_file():
-        raise FileNotFoundError(f"skip-file 不存在: {path}")
+        raise FileNotFoundError(f"skip-file not found: {path}")
     patterns: List[Tuple[str, ...]] = []
     seen = set()
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -120,6 +120,6 @@ def filter_skipped_folders(
 
 def report_skipped_folders(skipped: Sequence[str], skip_file: str) -> None:
     print(f"skip-file: {skip_file}")
-    print(f"排除已知错误定理 {len(skipped)} 题，不进入求解")
+    print(f"Excluded {len(skipped)} known-bad theorems from solving")
     for folder in skipped:
         print(f"  skip {folder}")

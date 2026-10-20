@@ -27,17 +27,17 @@ def load_runtime_env():
 
 
 def setup_environment():
-    """环境变量和代理配置函数"""
+    """Configure environment variables and proxy."""
     load_runtime_env()
     
-    # 统一加载所有需要的环境变量
+    # Load all required environment variables
     openai_api_key = os.getenv('OPENAI_API_KEY')
     deepseek_api_key = os.getenv('DEEPSEEK_API_KEY')
     qwen_api_key = os.getenv('QWEN_API_KEY')
     gemini_api_key = os.getenv('GEMINI_API_KEY')
     http_proxy = os.getenv('HTTP_PROXY')
     https_proxy = os.getenv('HTTPS_PROXY')
-    model_type = os.getenv('MODEL_TYPE', 'gpt-4o')  # 默认为 gpt-4o
+    model_type = os.getenv('MODEL_TYPE', 'gpt-4o')  # default gpt-4o
     openai_api_base = os.getenv('OPENAI_API_BASE', DEFAULT_OPENAI_API_BASE)
     openai_model = os.getenv('OPENAI_MODEL')
     if not openai_model:
@@ -45,17 +45,17 @@ def setup_environment():
             openai_model = model_type
         else:
             openai_model = DEFAULT_OPENAI_MODEL
-    cvc5_binary = os.getenv('CVC5_BINARY', './cvc/cvc5-Linux-x86_64-static/bin/cvc5')  # CVC5二进制文件路径
-    cvc4_binary = os.getenv('CVC4_BINARY', './cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt')  # CVC4二进制文件路径
-    vampire_binary = os.getenv('VAMPIRE_BINARY', './vampire/vampire')  # Vampire二进制文件路径
-    max_attempts_per_prompt = int(os.getenv('MAX_ATTEMPTS_PER_PROMPT', '3'))  # 每个prompt策略的最大尝试次数
-    default_cvc_timeout = int(os.getenv('DEFAULT_CVC_TIMEOUT', '60'))  # 默认CVC5超时时间(初始验证检查)
+    cvc5_binary = os.getenv('CVC5_BINARY', './cvc/cvc5-Linux-x86_64-static/bin/cvc5')  # CVC5 binary path
+    cvc4_binary = os.getenv('CVC4_BINARY', './cvc/cvc4_binary/cvc4-1.6-x86_64-linux-opt')  # CVC4 binary path
+    vampire_binary = os.getenv('VAMPIRE_BINARY', './vampire/vampire')  # Vampire binary path
+    max_attempts_per_prompt = int(os.getenv('MAX_ATTEMPTS_PER_PROMPT', '3'))  # max attempts per prompt strategy
+    default_cvc_timeout = int(os.getenv('DEFAULT_CVC_TIMEOUT', '60'))  # default CVC5 timeout (initial verification)
     # Unused while post-LLM 100s retry is commented out in Mate_new*.py.
-    retry_cvc_timeout = int(os.getenv('RETRY_CVC_TIMEOUT', '100'))  # 原实现：加时再证原目标；论文无此步
-    combined_cvc_timeout = int(os.getenv('COMBINED_CVC_TIMEOUT', '60'))  # 带引理的CVC5超时时间
-    max_recursion_depth = int(os.getenv('MAX_RECURSION_DEPTH', '3'))  # 最大递归深度限制
-    task_timeout = int(os.getenv('TASK_TIMEOUT', '1200'))  # 单个任务的超时时间（秒）
-    max_parallel_tasks = int(os.getenv('MAX_PARALLEL_TASKS', '20'))  # 最大并行任务数
+    retry_cvc_timeout = int(os.getenv('RETRY_CVC_TIMEOUT', '100'))  # legacy: extra-time re-prove of original goal; unused in the paper
+    combined_cvc_timeout = int(os.getenv('COMBINED_CVC_TIMEOUT', '60'))  # CVC5 timeout with lemmas
+    max_recursion_depth = int(os.getenv('MAX_RECURSION_DEPTH', '3'))  # max recursion depth
+    task_timeout = int(os.getenv('TASK_TIMEOUT', '1200'))  # per-task timeout (seconds)
+    max_parallel_tasks = int(os.getenv('MAX_PARALLEL_TASKS', '20'))  # max parallel tasks
     lemma_library = os.getenv('LEMMA_LIBRARY', 'on')
     obligation_tree = os.getenv('OBLIGATION_TREE', 'on')
     # off | on (hard+soft) | paper (LLM4Ind hard invalid + all useless groups).
@@ -94,16 +94,16 @@ def setup_environment():
     )
     max_tokens = _parse_optional_int(os.getenv('MAX_TOKENS'), 'MAX_TOKENS')
 
-    # 代理配置
+    # Proxy configuration
     if http_proxy and https_proxy:
         os.environ['http_proxy'] = http_proxy
         os.environ['https_proxy'] = https_proxy
-        logging.info("代理已启用：%s", http_proxy)
+        logging.info("Proxy enabled: %s", http_proxy)
     else:
-        logging.info("没有找到代理配置，跳过代理设置。")
-    # logging.info("跳过代理设置。")
+        logging.info("No proxy configuration found; skipping proxy setup.")
+    # logging.info("Skipping proxy setup.")
 
-    # 检查必需的 API 密钥是否存在
+    # Check that required API keys exist
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY is not set in .env file.")
     if model_type == 'deepseek' and not deepseek_api_key:
@@ -274,7 +274,7 @@ def _llm_call_kwargs(config):
     return kwargs
 
 def setup_model(config):
-    """根据配置初始化模型"""
+    """Initialize the model from configuration."""
     call_kwargs = _llm_call_kwargs(config)
     if "max_tokens" in call_kwargs or "extra_body" in call_kwargs:
         extra = call_kwargs.get("extra_body") or {}
@@ -293,31 +293,31 @@ def setup_model(config):
             model='deepseek-chat',
             openai_api_key=config['DEEPSEEK_API_KEY'],
             openai_api_base='https://api.deepseek.com',
-            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            temperature=0.9,  # temperature=0.9 for more diversity
+            top_p=0.9,  # top_p=0.9 for more creativity
             **call_kwargs,
         )
-        logging.info("使用 DeepSeek-chat 模型进行推理")
+        logging.info("Using DeepSeek-chat for inference")
     elif config['MODEL_TYPE'] == 'qwen':
         llm = ChatOpenAI(
             model='qwen/qwen3-235b-a22b-2507',
             openai_api_key=config['QWEN_API_KEY'],
             openai_api_base='https://openrouter.ai/api/v1',
-            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            temperature=0.9,  # temperature=0.9 for more diversity
+            top_p=0.9,  # top_p=0.9 for more creativity
             **call_kwargs,
         )
-        logging.info("使用 Qwen 模型进行推理")
+        logging.info("Using Qwen for inference")
     elif config['MODEL_TYPE'] == 'gemini':
         llm = ChatOpenAI(
             model='google/gemini-2.5-flash',
             openai_api_key=config['GEMINI_API_KEY'],
             openai_api_base='https://openrouter.ai/api/v1',
-            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            temperature=0.9,  # temperature=0.9 for more diversity
+            top_p=0.9,  # top_p=0.9 for more creativity
             **call_kwargs,
         )
-        logging.info("使用 Gemini 模型进行推理")
+        logging.info("Using Gemini for inference")
     else:
         model_name = config.get('OPENAI_MODEL') or DEFAULT_OPENAI_MODEL
         api_base = config.get('OPENAI_API_BASE') or DEFAULT_OPENAI_API_BASE
@@ -325,10 +325,10 @@ def setup_model(config):
             model=model_name,
             openai_api_key=config['OPENAI_API_KEY'],
             openai_api_base=api_base,
-            temperature=0.9,  # 设置 temperature 为 0.9，增加多样性
-            top_p=0.9,  # 设置 top_p 为 0.9，增加创意
+            temperature=0.9,  # temperature=0.9 for more diversity
+            top_p=0.9,  # top_p=0.9 for more creativity
             **call_kwargs,
         )
-        logging.info("使用 %s 模型进行推理 (base=%s).", model_name, api_base)
+        logging.info("Using %s for inference (base=%s).", model_name, api_base)
     
     return llm

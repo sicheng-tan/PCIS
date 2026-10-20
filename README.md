@@ -34,7 +34,7 @@ Prompt templates under `prompts_ours/`, `prompts_ours_compact/`, `prompts_naive/
 - Dual templates × N attempts (`MAX_ATTEMPTS_PER_PROMPT`, default 3 → **2N** LLM calls per node)
 - Usefulness check + recursive subgoals (`MAX_RECURSION_DEPTH`)
 - Entry: `Mate_new.py` (CVC) / `Mate_new_vampire.py` (Vampire)
-- Prompts: `prompts_ours/` (`default` / `zero_shot`, paper main); `prompts_naive/` (`naive`); `prompts_ours_compact/` (`default_simple` — **极简提示词，仅用于简单测试**，非论文主设定)
+- Prompts: `prompts_ours/` (`default` / `zero_shot`, paper main); `prompts_naive/` (`naive`); `prompts_ours_compact/` (`default_simple` — **minimal prompts for simple tests only**, not the paper main setting)
 
 ### PCR — proof context retrieval
 
@@ -76,9 +76,11 @@ DOTENV_PATH=experiments/configs/<name>.env \
 
 | Paper name | Template | Meaning |
 |------------|----------|---------|
-| **PCIS** (Full) | `paper.env.example` / `ablation_pcis.env.example` | PCR on + GSE on |
+| **PCIS** (Full) | `ablation_pcis.env.example` | PCR on + GSE on |
 | **PCR** | `ablation_pcr.env.example` | Module-2 memory only (profiler/scheme off) |
 | **GSE** | `ablation_gse.env.example` | Profiler+scheme; Module-2 off; `INVALID_LEMMAS=paper` |
+
+Simple / case-study template: `case.env.example` → `case.env` (serial `MAX_PARALLEL_TASKS=1`; default fallback in `env_config.py`).
 
 Vampire: same env + `run_exp_folder_vampire.py` / `Mate_new_vampire.py`.
 
@@ -93,13 +95,15 @@ Evaluation size: **706 − 20 = 686** (see `docs/excluded_instances.md`).
 
 ```bash
 pip install langchain_openai python-dotenv colorlog psutil tqdm
-cp .env_template .env          # or copy experiments/configs/paper.env.example → paper.env
+cp .env_template .env
+# or: cp experiments/configs/case.env.example experiments/configs/case.env
+# or: cp experiments/configs/ablation_pcis.env.example experiments/configs/ablation_pcis.env
 # set OPENAI_API_KEY / OPENAI_API_BASE / OPENAI_MODEL / MODEL_TYPE and solver binaries
 ```
 
 Solvers expected under `./cvc/...` and `./vampire/vampire` (paths overridable in env).
 
-Optional: `DOTENV_PATH=experiments/configs/paper.env` overrides the default dotenv load order (`env_config.py`).
+Optional: `DOTENV_PATH=experiments/configs/ablation_pcis.env` (or `case.env`) overrides the default dotenv load order (`env_config.py`).
 
 ---
 
@@ -129,7 +133,7 @@ python3 run_exp_folder_vampire.py \
 | `--result-dir` | Parent for per-run copies, logs, CSV/JSONL |
 | `--skip-file` | Paths to skip (non-theorems) |
 | `--baseline` | Solver-only, no LLM |
-| `--strategy-mode` | `default` / `zero_shot`（`prompts_ours`，论文主模板）；`naive`；`default_simple`（`prompts_ours_compact`，极简提示词，仅简单测试） |
+| `--strategy-mode` | `default` / `zero_shot` (`prompts_ours`, paper main templates); `naive`; `default_simple` (`prompts_ours_compact`, minimal prompts for simple tests only) |
 
 Shell wrappers `run_all_benchmark.sh` / `run_all_benchmark_vampire.sh` loop suites; edit dataset list / log dir inside the script.
 
@@ -162,9 +166,9 @@ PCIS/
 ├── problem_profiler/ / induction_scheme/
 ├── cvc5_runner.py / vampire_runner.py / solver_profiles.py
 ├── prompts_ours/                       # paper main templates
-├── prompts_ours_compact/               # 极简提示词，仅简单测试（default_simple）
+├── prompts_ours_compact/               # minimal prompts for simple tests (default_simple)
 ├── prompts_naive/
-├── experiments/configs/                # paper + ablation env templates
+├── experiments/configs/                # ablation + case env templates
 ├── docs/excluded_instances.md
 ├── benchmarks/preprocessed/            # evaluation suites
 └── tests/

@@ -30,44 +30,44 @@ from skip_problems import (
 )
 prove_run = mate_solver.prove_run
 
-# 加载配置
+# Load configuration
 config = setup_environment()
 
-# 移除了setup_task_logger函数，因为在多进程环境中每个进程会独立处理日志
+# setup_task_logger removed; each process configures logging independently
 
 class TaskTimeoutError(Exception):
-    """任务超时异常"""
+    """Task timeout exception."""
     pass
 
 def timeout_handler(signum, frame):
-    """超时信号处理函数"""
-    raise TaskTimeoutError("任务执行超时")
+    """Timeout signal handler."""
+    raise TaskTimeoutError("Task execution timed out")
 
 def cleanup_process_tree(pid):
-    """清理进程及其所有子进程"""
+    """Terminate a process and all of its children."""
     try:
         if psutil.pid_exists(pid):
             parent = psutil.Process(pid)
             children = parent.children(recursive=True)
             
-            # 首先尝试优雅地终止所有子进程
+            # First try to terminate all children gracefully
             for child in children:
                 try:
                     child.terminate()
                 except psutil.NoSuchProcess:
                     pass
             
-            # 等待一段时间让进程优雅退出
+            # Wait briefly for graceful exit
             gone, alive = psutil.wait_procs(children, timeout=3)
             
-            # 强制杀死仍然存活的进程
+            # Force-kill processes still alive
             for proc in alive:
                 try:
                     proc.kill()
                 except psutil.NoSuchProcess:
                     pass
             
-            # 最后终止父进程
+            # Finally terminate the parent process
             try:
                 parent.terminate()
                 parent.wait(timeout=3)
@@ -77,49 +77,49 @@ def cleanup_process_tree(pid):
                 except psutil.NoSuchProcess:
                     pass
                     
-            logging.debug(f"已清理进程树 PID: {pid}")
+            logging.debug(f"Cleaned process tree PID: {pid}")
     except Exception as e:
-        logging.error(f"清理进程树失败 PID: {pid}, 错误: {e}")
+        logging.error(f"Failed to clean process tree PID: {pid}, error: {e}")
 
 def run_task_with_timeout(folder, template_name, task_timeout, result_queue, strategy_mode, baseline_mode=None):
-    """在独立进程中运行任务的函数"""
+    """Run a task inside an isolated process."""
     try:
-        # 生成日志文件名（以开始时间命名）
+        # Build log filename (named by start time)
         start_datetime = datetime.now()
         log_filename = start_datetime.strftime("%Y%m%d_%H%M%S.log")
         log_filepath = os.path.join(folder, log_filename)
         
-        # 配置日志记录器：同时输出到控制台和文件
+        # Configure logger: console and file
         import logging
         
-        # 配置根日志记录器，因为Mate_new.py使用的是根logger
+        # Configure the root logger because Mate_new.py uses the root logger
         root_logger = logging.getLogger()
-        root_logger.handlers.clear()  # 清除现有处理器
+        root_logger.handlers.clear()  # Clear existing handlers
         root_logger.setLevel(logging.INFO)
         
-        # 添加文件处理器到根logger
+        # Add file handler to root logger
         file_handler = logging.FileHandler(log_filepath, mode='w', encoding='utf-8')
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', 
                                          datefmt='%Y-%m-%d %H:%M:%S')
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
         
-        # 添加控制台处理器到根logger
+        # Add console handler to root logger
         console_handler = logging.StreamHandler()
         console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', 
                                             datefmt='%Y-%m-%d %H:%M:%S')
         console_handler.setFormatter(console_formatter)
         root_logger.addHandler(console_handler)
         
-        # 执行prove_run
+        # Run prove_run
         start_time = time.time()
-        # 只使用命令行参数控制baseline模式
+        # Baseline mode is controlled only by CLI args
         actual_baseline_mode = baseline_mode if baseline_mode is not None else False
         
         if actual_baseline_mode:
-            logging.info(f"🎯 Baseline模式: 开始执行任务: {os.path.basename(folder)}, 超时时间: {task_timeout}秒")
+            logging.info(f"Baseline mode: starting task: {os.path.basename(folder)}, timeout: {task_timeout}s")
         else:
-            logging.info(f"开始执行任务: {os.path.basename(folder)}, 策略模式: {strategy_mode}, 超时时间: {task_timeout}秒")
+            logging.info(f"Starting task: {os.path.basename(folder)}, strategy: {strategy_mode}, timeout: {task_timeout}s")
         log_run_config(
             backend="vampire",
             strategy_mode=strategy_mode,
@@ -130,28 +130,28 @@ def run_task_with_timeout(folder, template_name, task_timeout, result_queue, str
         final_status = prove_run(folder, template_name, 0, strategy_mode=strategy_mode, baseline_only=actual_baseline_mode)
         end_time = time.time()
         
-        # 关闭处理器
+        # Close handlers
         file_handler.close()
         root_logger.removeHandler(file_handler)
         root_logger.removeHandler(console_handler)
         
-        # 将结果放入队列
+        # Put result on the queue
         result_queue.put((folder, final_status, end_time - start_time, None))
         
     except Exception as e:
         elapsed_time = time.time() - start_time if 'start_time' in locals() else 0
-        # 将错误结果放入队列
+        # Put error result on the queue
         result_queue.put((folder, False, elapsed_time, str(e)))
 
 def process_single_task(task_info):
-    """处理单个任务的函数，用于多进程执行，使用进程级超时控制"""
+    """Handle one task under multiprocessing with process-level timeout."""
     folder, template_name, strategy_mode, baseline_mode = task_info
     task_timeout = config['TASK_TIMEOUT']
     
-    # 创建进程间通信队列
+    # Create IPC queue
     result_queue = multiprocessing.Queue()
     
-    # 创建子进程执行任务
+    # Spawn child process for the task
     process = multiprocessing.Process(
         target=run_task_with_timeout,
         args=(folder, template_name, task_timeout, result_queue, strategy_mode, baseline_mode)
@@ -161,33 +161,33 @@ def process_single_task(task_info):
     process.start()
     
     try:
-        # 等待进程完成或超时
+        # Wait for process completion or timeout
         process.join(timeout=task_timeout)
         
         if process.is_alive():
-            # 进程超时，强制终止整个进程树
-            logging.warning(f"任务超时，强制终止进程树: {os.path.basename(folder)}")
+            # Process timed out; force-kill the whole process tree
+            logging.warning(f"Task timed out; force-killing process tree: {os.path.basename(folder)}")
             cleanup_process_tree(process.pid)
-            process.join(timeout=5)  # 给进程5秒时间优雅退出
+            process.join(timeout=5)  # Give the process 5s to exit gracefully
             
             if process.is_alive():
-                # 如果还没退出，强制杀死
+                # If still alive, force-kill
                 process.kill()
                 process.join()
             
             elapsed_time = time.time() - start_time
-            return folder, False, elapsed_time, f"任务超时 ({task_timeout}秒)"
+            return folder, False, elapsed_time, f"Task timeout ({task_timeout}s)"
         
-        # 进程正常完成，获取结果
+        # Process finished normally; fetch result
         if not result_queue.empty():
             return result_queue.get()
         else:
-            # 进程完成但没有结果，可能是异常退出
+            # Process finished with no result; likely abnormal exit
             elapsed_time = time.time() - start_time
-            return folder, False, elapsed_time, "进程异常退出，无返回结果"
+            return folder, False, elapsed_time, "Process exited abnormally with no return value"
             
     except Exception as e:
-        # 处理异常
+        # Handle exceptions
         if process.is_alive():
             cleanup_process_tree(process.pid)
             process.join(timeout=5)
@@ -196,10 +196,10 @@ def process_single_task(task_info):
                 process.join()
         
         elapsed_time = time.time() - start_time
-        return folder, False, elapsed_time, f"进程管理异常: {str(e)}"
+        return folder, False, elapsed_time, f"Process management error: {str(e)}"
 
 def find_template_folders(root_path, template_name="template.smt2"):
-    """递归查找包含template.smt2文件的文件夹"""
+    """Recursively find folders that contain template.smt2."""
     template_folders = []
     
     for root, dirs, files in os.walk(root_path):
@@ -210,9 +210,9 @@ def find_template_folders(root_path, template_name="template.smt2"):
 
 def copy_folder_for_experiment(original_path, dest_parent=None):
     """
-    复制原始文件夹到结果目录下的时间戳命名文件夹。
-    dest_parent 默认为项目根下的 result_files。
-    返回新文件夹的路径。
+    Copy the original folder into a timestamped directory under the results parent.
+    dest_parent defaults to result_files under the project root.
+    Returns the new folder path.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     result_files_dir = dest_parent or os.path.join(script_dir, "result_files")
@@ -223,53 +223,40 @@ def copy_folder_for_experiment(original_path, dest_parent=None):
     new_folder_name = f"{timestamp}_{original_folder_name}"
     new_folder_path = os.path.join(result_files_dir, new_folder_name)
 
-    print(f"正在复制文件夹: {original_path} -> {new_folder_path}")
+    print(f"Copying folder: {original_path} -> {new_folder_path}")
     shutil.copytree(original_path, new_folder_path)
-    print(f"文件夹复制完成: {new_folder_path}")
+    print(f"Folder copy complete: {new_folder_path}")
 
     return new_folder_path
 
 if __name__ == "__main__":
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description='ProofMate实验运行器')
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='ProofMate experiment runner')
     parser.add_argument('--baseline', action='store_true', 
-                       help='启用baseline模式（仅运行初始验证）')
-    parser.add_argument('--root-path', type=str, 
-                       default="/home/ssdllm/ProofMate/preprocessed/all-int",
-                       help='原始文件夹路径')
+                       help='Enable baseline mode (initial verification only)')
+    parser.add_argument('--root-path', type=str,
+                       default="./benchmarks/preprocessed/autoproof",
+                       help='Path to the original problem folder '
+                            '(default: ./benchmarks/preprocessed/autoproof)')
     parser.add_argument('--strategy-mode', type=str, 
                        choices=['default', 'default_simple', 'zero_shot', 'naive'],
                        default='default',
-                       help='提示词包: default 用 prompts_ours（等式+重写各 N 次）; '
-                            'default_simple 用 prompts_ours_compact（同两模板、精简 system）; '
-                            'zero_shot 同 default; '
-                            'naive 只用 prompt_naive 重复 2N 次')
+                       help='Prompt pack: default uses prompts_ours (equality+rewrite, N each); '
+                            'default_simple uses prompts_ours_compact (same two templates, compact system); '
+                            'zero_shot same as default; '
+                            'naive uses only prompt_naive repeated 2N times')
     parser.add_argument('--result-dir', type=str, default=None,
-                       help='本次运行的结果父目录（复制后的题目、日志、CSV）。'
-                            '未指定时副本在 result_files/，CSV 在 result_csv/')
+                       help='Results parent for this run (copied problems, logs, CSV). '
+                            'If omitted, copies go under result_files/ and CSV under result_csv/')
     add_skip_file_argument(parser)
     args = parser.parse_args()
 
-    
-    # 设置多进程启动方法（在某些系统上需要）
+    # Set multiprocessing start method (required on some systems)
     multiprocessing.set_start_method('spawn', force=True)
-    # 使用命令行参数设置原始文件夹路径
-    # original_root_path = "/home/ssdllm/ProofMate/int-ben-llm/0911-10mins-llm-vmcai15dt/vmcai15-dt/hipspec/nosg"
-    # original_root_path = "/home/ssdllm/ProofMate/int-ben-llm/0911-10mins-llm-vmcai15dt/vmcai15-dt/"
-    # original_root_path = "/home/ssdllm/ProofMate/int-ben-llm/0911-10mins-llm-vmcai15dt/ssd_debug_test2"
-    # original_root_path = "/home/ssdllm/ProofMate/preprocessed/autoproof"
-    # original_root_path = "/home/ssdllm/ProofMate/preprocessed/dtt"
-    # original_root_path = "/home/ssdllm/ProofMate/preprocessed/ind-ben"
-    # original_root_path = "/home/ssdllm/ProofMate/preprocessed/vmcai15-dt"
-    # 原始文件夹路径
-    # original_root_path = "/home/ssdllm/ProofMate/int-ben-llm/0922dtt/dtt_quick"
-    # original_root_path = "/home/ssdllm/ProofMate/int-ben-llm/0911-10mins-llm-vmcai15dt/ssd_debug_test2"
-    # original_root_path = "/home/ssdllm/ProofMate/preprocessed/autoproof"
-    # original_root_path = "/home/ssdllm/ProofMate/preprocessed/debug_test"
     original_root_path = args.root_path
     result_parent = os.path.abspath(args.result_dir) if args.result_dir else None
 
-    # 复制文件夹，避免污染原始文件
+    # Copy folder to avoid modifying originals
     root_path = copy_folder_for_experiment(original_root_path, dest_parent=result_parent)
 
     template_name = "template"
@@ -277,83 +264,83 @@ if __name__ == "__main__":
     found = len(folders)
     skip_file = resolve_skip_file(args.skip_file)
     folders, skipped, _patterns = filter_skipped_folders(folders, skip_file)
-    print(f"找到 {found} 个待求解任务")
+    print(f"Found {found} tasks to solve")
     if skip_file:
         report_skipped_folders(skipped, skip_file)
-        print(f"排除后剩余 {len(folders)} 个任务")
+        print(f"{len(folders)} tasks remaining after exclusions")
     
-    # 显示运行模式
+    # Show run mode
     if args.baseline:
-        print("🎯 运行模式: Baseline模式 (仅执行初始验证)")
+        print("Run mode: Baseline (initial verification only)")
     else:
-        print(f"🚀 运行模式: 完整模式 (包含LLM引理生成)")
-        print(f"📝 策略模式: {args.strategy_mode}")
+        print(f"Run mode: Full (includes LLM lemma generation)")
+        print(f"Strategy mode: {args.strategy_mode}")
         if args.strategy_mode == "naive":
-            print("   naive: 只用 prompt_naive，重复 2×MAX_ATTEMPTS_PER_PROMPT 次（关闭模板选择）")
+            print("   naive: only prompt_naive, repeated 2×MAX_ATTEMPTS_PER_PROMPT (no template selection)")
         elif args.strategy_mode == "default_simple":
-            print("   default_simple: 与 default 相同两模板，system 用 prompts_ours_compact")
+            print("   default_simple: same two templates as default; system from prompts_ours_compact")
     
-    # 存储所有结果
+    # Store all results
     results = []
     total_start_time = time.time()
     
-    # 准备任务列表，包含baseline模式和策略模式参数
+    # Build task list including baseline and strategy-mode args
     task_list = [(folder, template_name, args.strategy_mode, args.baseline) for folder in folders]
     
-    # 使用进程池并行执行，最多MAX_PARALLEL_TASKS个并行进程
+    # Run with a process pool, up to MAX_PARALLEL_TASKS workers
     max_parallel_tasks = config['MAX_PARALLEL_TASKS']
     unsat_count = 0
     total_tasks = len(folders)
     if folders:
         max_workers = min(max_parallel_tasks, len(folders), multiprocessing.cpu_count())
-        print(f"使用 {max_workers} 个并行进程处理 {len(folders)} 个任务")
-        with tqdm(total=len(folders), desc=f"处理任务 (unsat: {unsat_count}/{total_tasks})", unit="task") as pbar:
+        print(f"Using {max_workers} parallel processes for {len(folders)} tasks")
+        with tqdm(total=len(folders), desc=f"Processing tasks (unsat: {unsat_count}/{total_tasks})", unit="task") as pbar:
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                # 提交所有任务
+                # Submit all tasks
                 future_to_folder = {executor.submit(process_single_task, task): task[0] 
                                   for task in task_list}
                 
-                # 收集结果
+                # Collect results
                 for future in as_completed(future_to_folder):
                     folder_path = future_to_folder[future]
                     try:
                         folder, final_status, duration, error = future.result()
                         
                         if error:
-                            print(f"\n任务执行出错: {os.path.basename(folder)} - 错误: {error}")
+                            print(f"\nTask error: {os.path.basename(folder)} - error: {error}")
                             ensure_task_summary(folder, proved=False, error=str(error))
                             results.append((folder, False, duration, error))
                         else:
                             results.append((folder, final_status, duration, None))
                             
-                            # 如果是unsat结果，更新计数器
+                            # If result is unsat, update the counter
                             if final_status:
                                 unsat_count += 1
                             
-                            # 显示任务完成反馈
-                            result_text = "unsat" if final_status else "失败"
-                            print(f"\n任务完成: {os.path.basename(folder)} - {result_text} - 用时: {duration:.2f}秒")
+                            # Print task completion feedback
+                            result_text = "unsat" if final_status else "failed"
+                            print(f"\nTask done: {os.path.basename(folder)} - {result_text} - time: {duration:.2f}s")
                             
                     except Exception as e:
-                        print(f"\n任务执行出错: {os.path.basename(folder_path)} - 错误: {str(e)}")
+                        print(f"\nTask error: {os.path.basename(folder_path)} - error: {str(e)}")
                         try:
                             ensure_task_summary(folder_path, proved=False, error=str(e))
                         except Exception:
                             pass
                         results.append((folder_path, False, -1, str(e)))
                     
-                    # 更新进度条描述和进度
-                    pbar.set_description(f"处理任务 (unsat: {unsat_count}/{total_tasks})")
+                    # Update progress-bar description
+                    pbar.set_description(f"Processing tasks (unsat: {unsat_count}/{total_tasks})")
                     pbar.update(1)
     else:
-        print("没有待求解任务（可能全部被 skip-file 排除）")
+        print("No tasks to solve (possibly all excluded by skip-file)")
     
     total_end_time = time.time()
     total_duration = total_end_time - total_start_time
     
-    # 生成CSV报告
+    # Generate CSV report
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 提取数据集名称（root-path的最后一级文件夹名称）
+    # Extract dataset name (last component of root-path)
     dataset_name = os.path.basename(os.path.normpath(original_root_path))
     if args.baseline:
         csv_filename = f"results_{timestamp}_{dataset_name}_baseline.csv"
@@ -370,5 +357,5 @@ if __name__ == "__main__":
     jsonl_filepath = write_results_csv(results, csv_filepath, original_root_path)
     
     print_batch_stats(results, total_duration)
-    print(f"结果已保存到: {csv_filepath}")
-    print(f"详细摘要已保存到: {jsonl_filepath}")
+    print(f"Results saved to: {csv_filepath}")
+    print(f"Detailed summary saved to: {jsonl_filepath}")

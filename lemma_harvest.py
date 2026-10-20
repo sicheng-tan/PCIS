@@ -168,7 +168,7 @@ def run_usefulness_with_delayed_harvest(
                 and elapsed + 1e-9 >= delay
             ):
                 logging.info(
-                    "有用性 %s 时投机尚未启动，补跑 A⊢c_i", status or "timeout",
+                    "Usefulness %s and speculative run not started; backfilling A⊢c_i", status or "timeout",
                 )
                 _start_slots(
                     slots, prove_fn, pool, goal=goal, delay_s=delay, profiles=profiles,
