@@ -64,7 +64,6 @@ from exp_flags import (
     resolve_prompt_pack,
     unproved_not_invalid_enabled,
 )
-from solver_profiles import VAMPIRE_FALLBACK_PROFILE
 from proof_context_reuse.ancestor_stack import (
     AncestorStack,
     empty_ancestor_stack,
@@ -829,7 +828,6 @@ def format_solver_feedback_for_prompt(
     attempt_txt = format_attempt_feedback_for_prompt(
         failed_data,
         backend="vampire",
-        include_stuck=False,
         current_goal=current_formula,
     )
     if attempt_txt:
@@ -1114,14 +1112,6 @@ def _is_trivial_equational_lemma(lemma: str) -> bool:
     ))
 
 
-def _cached_diag_for_profile(cached, profile: Optional[str], *, resolver) -> Optional[object]:
-    """Reuse a 3s cache only when it was produced by the same diagnostic strategy."""
-    want = resolver(profile)
-    if cached is None or (cached.strategy or "") != want:
-        return None
-    return cached
-
-
 def verify_combined_lemmas(
     original_assert: re.Match,
     asserts: List[str],
@@ -1131,11 +1121,8 @@ def verify_combined_lemmas(
     base_path: str = None,
     goal_name: str = None,
     prompt_strategy: Optional[str] = None,
-    solver_profile: Optional[str] = None,
-    decision_source: Optional[str] = None,
 ) -> Tuple[bool, List[str], Optional[VampireResult]]:
     """Usefulness check: one portfolio prove of A∧C→P. No subset search."""
-    del solver_profile, decision_source
     combined_timeout = usefulness_timeout_s(
         int(config['COMBINED_CVC_TIMEOUT']),
         serial_policy=bool(config.get("LLM_SERIAL_PROVE_BUDGET")),
@@ -1956,7 +1943,7 @@ def _finish_usefulness_timeout(
             return True, [], extracted_asserts
         logging.info("After harvesting %d local lemmas on timeout, still did not prove current goal", n_local)
     else:
-        logging.error("Generated lemmas did not help prove the original goal (progress/repair feedback written)")
+        logging.error("Generated lemmas did not help prove the original goal (PCR feedback written)")
     return False, [], extracted_asserts
 
 
@@ -1967,8 +1954,6 @@ def quick_run(
     folder_path: str,
     baseline_only: bool = False,
     *,
-    solver_profile: Optional[str] = None,
-    decision_source: Optional[str] = None,
     depth: int = 0,
     ancestor_stack: AncestorStack = (),
     seed_extra_user: Optional[str] = None,
@@ -2226,8 +2211,6 @@ def quick_run(
             base_path=base_path,
             goal_name=goal_smt_name,
             prompt_strategy=prompt_strategy,
-            solver_profile=solver_profile,
-            decision_source=decision_source,
         )
 
     useful, selected_lemmas, vres = run_usefulness_with_delayed_harvest(
@@ -2267,7 +2250,7 @@ def quick_run(
         if _scheme_pending_success():
             return True, [], extracted_asserts
         return result
-    logging.error("Generated lemmas did not help prove the original goal (progress/repair feedback written)")
+    logging.error("Generated lemmas did not help prove the original goal (PCR feedback written)")
     _scheme_fin(False)
     if _scheme_pending_success():
         return True, [], extracted_asserts
@@ -2625,8 +2608,6 @@ def _prove_run_body(
             strategies, attempt, max_attempts_per_prompt
         )
         prompt_strategy = current_prompt
-        solver_profile = None
-        decision_source = None
         logging.info(
             "[main] processing %s - attempt %d/%d (prompt=%s)",
             base_name,
@@ -2661,8 +2642,6 @@ def _prove_run_body(
                     prompt_strategy,
                     pack["folder_path"],
                     baseline_only=False,
-                    solver_profile=solver_profile,
-                    decision_source=decision_source,
                     depth=depth,
                     ancestor_stack=ancestor_stack,
                     seed_extra_user=seed_extra,

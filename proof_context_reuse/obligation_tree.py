@@ -26,15 +26,6 @@ LIBRARY_END = "; proved lemma library end"
 
 NORMAL_KIND = "obligation_tree"
 
-# Optional ATP guidance kinds that may appear on historical JSON nodes.
-GUIDANCE_HINT_KINDS = (
-    "need_rewrite",
-    "need_directed_rewrite",
-    "induction_stuck",
-    "need_arithmetic_lemma",
-    "high_difficulty_assertions",
-)
-
 HARVEST_CVC_PROFILES = ("cvc5_inductive", "cvc4_default")
 # Same single schedule as usefulness / node prove / scheme short-prove.
 HARVEST_VAMPIRE_PROFILES = (
@@ -44,8 +35,6 @@ HARVEST_DISPATCH_KEY = "harvest_dispatch"
 MAX_FORMULA_CHARS = 200
 MAX_FOCUS_CHARS = 80
 MAX_ATTEMPTS_KEPT = 12
-MAX_HINT_KINDS = 3
-MAX_FOCUS_TERMS = 2
 
 CHILD_INVALID_JUDGE_LINE = (
     "Child invalid: use its reason to judge whether the CURRENT goal is also invalid."
@@ -707,7 +696,6 @@ def make_child_node(
     formula: Optional[str],
     status: str,
     lib: Optional[str] = None,
-    atp: Optional[dict] = None,
     reason: Optional[str] = None,
     children: Optional[List[dict]] = None,
 ) -> dict:
@@ -719,7 +707,6 @@ def make_child_node(
         "lib": lib,
         "children": list(children or []),
     }
-    # Solver stuck/advice lines stay on the node prompt, not the tree.
     if reason and status == "invalid":
         node["reason"] = compact_formula(str(reason), MAX_FOCUS_CHARS * 2)
     return node
@@ -740,24 +727,6 @@ def make_goal_tree(
         "lib": None,
         "children": list(children),
     }
-
-
-def compact_atp_from_failed_data(failed_data: Optional[dict]) -> dict:
-    hints: List[str] = []
-    focus: List[str] = []
-    for hint in (failed_data or {}).get("repair_hints") or []:
-        kind = str(hint.get("kind") or "")
-        if kind in GUIDANCE_HINT_KINDS and kind not in hints:
-            hints.append(kind)
-        for term in hint.get("induction_focus") or []:
-            compact = compact_formula(str(term), MAX_FOCUS_CHARS)
-            if compact and compact not in focus:
-                focus.append(compact)
-            if len(focus) >= MAX_FOCUS_TERMS:
-                break
-        if len(hints) >= MAX_HINT_KINDS and len(focus) >= MAX_FOCUS_TERMS:
-            break
-    return {"hints": hints[:MAX_HINT_KINDS], "focus": focus[:MAX_FOCUS_TERMS]}
 
 
 def short_label(node: dict) -> str:

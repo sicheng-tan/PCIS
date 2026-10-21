@@ -17,19 +17,15 @@ os.environ.setdefault("MODEL_TYPE", "gpt-4o")
 
 from exp_flags import resolve_prompt_pack
 from proof_context_reuse.lemma_gates import (
-    HD_AXIOM_GOAL_HINT,
-    HD_DIFFICULTY_EXPLAIN,
     PARSE_ERR_EMPTY,
     PARSE_ERR_UNMATCHED,
     allow_unmarked_lemma_output,
     apply_static_lemma_screen,
-    attach_source_lemmas,
     dedupe_lemmas_in_group,
     drop_failing_members,
     format_attempt_feedback_for_prompt,
     format_diagnosis_invalid_prompt,
     format_dropped_line,
-    format_repair_header,
     drop_equivalent_unproved,
     is_invalid_diagnosis_reason,
     lemma_known_invalid,
@@ -49,7 +45,6 @@ from proof_context_reuse.lemma_gates import (
     parse_llm_reason,
     parse_llm_counterexample_smt,
     llm_invalid_ce_verify_enabled,
-    repair_hint_for_prompt,
     should_accept_in_loop_invalid_goal,
     undefined_symbols_in_lemma,
     tree_status_from_child_data,
@@ -728,37 +723,7 @@ def test_parse_llm_lemmas_salvage_and_paren_repair() -> None:
     assert unmatched_raised
 
 
-def test_repair_header_lists_usefulness_lemmas() -> None:
-    lemma = "(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))"
-    initial = format_repair_header("Vampire", [{
-        "kind": "need_rewrite",
-        "context": "initial_goal",
-        "detail": "rewriting scarce",
-    }])
-    assert len(initial) == 1
-    assert "Use these hints to choose the NEXT lemmas:" in initial[0]
-    assert "C1:" not in "\n".join(initial)
-    assert "Failed to prove the goal using the above lemmas" not in "\n".join(initial)
-
-    hints = attach_source_lemmas(
-        [{"kind": "need_rewrite", "detail": "rewriting scarce"}],
-        [lemma],
-        context="usefulness_check",
-    )
-    header = "\n".join(format_repair_header("Vampire", hints))
-    assert header.startswith("\nSOLVER-GUIDED REPAIR (from Vampire failure analysis).")
-    assert "C1:" in header
-    assert "plus" in header
-    bridge = (
-        "Failed to prove the goal using the above lemmas and produced hints. "
-        "Use these hints to choose the NEXT lemmas:"
-    )
-    assert bridge in header
-    assert header.index("SOLVER-GUIDED REPAIR") < header.index("C1:")
-    assert header.index("C1:") < header.index(bridge)
-
-
-def test_last_attempt_omits_lemma_difficulty_tags() -> None:
+def test_last_attempt_lists_kept_without_repair_hints() -> None:
     used = "(forall ((x Nat)) (= (plus x zero) x))"
     unused = "(forall ((x Nat)) true)"
     axiom = "(forall ((n Nat)) (= (plus zero n) n))"
@@ -776,19 +741,15 @@ def test_last_attempt_omits_lemma_difficulty_tags() -> None:
         },
         backend="cvc5",
     )
+    assert "LAST ATTEMPT" in txt
+    assert used in txt
+    assert unused in txt
     assert "[used" not in txt
     assert "[unused]" not in txt
     assert "[attributed" not in txt
-    assert "high-difficulty axiom:" in txt
-    assert "plus zero n" in txt or "plus zero" in txt
-    assert used not in "\n".join(
-        line for line in txt.splitlines() if "high-difficulty axiom:" in line
-    )
-    assert HD_DIFFICULTY_EXPLAIN in txt
-    assert HD_AXIOM_GOAL_HINT in txt
-    assert "Prefer a constructor/rewrite lemma" not in txt
-    assert "Do not restate the goal" not in txt
-    assert "inductive generalization" not in txt
+    assert "repair hints:" not in txt
+    assert "high-difficulty axiom:" not in txt
+    assert "INITIAL SOLVE" not in txt
 
 
 def test_stale_lemma_usage_json_is_not_prompted() -> None:
@@ -813,13 +774,13 @@ def test_stale_lemma_usage_json_is_not_prompted() -> None:
     assert "[used" not in txt
     assert "[unused]" not in txt
     assert "[attributed" not in txt
+    assert "repair hints:" not in txt
 
 
 def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
     kept = "(forall ((x Nat)) (= (plus x zero) x))"
     older = "(forall ((x Nat)) true)"
     lib_dup = "(forall ((y Nat)) (= (plus y zero) y))"
-    axiom = "(forall ((n Nat)) (= (plus n zero) n))"
     txt = format_attempt_feedback_for_prompt(
         {
             "useless_lemma_groups": [
@@ -828,12 +789,8 @@ def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
                     "lemmas": [kept],
                     "status": "timeout",
                     "repair_hints": [{
-                        "kind": "high_difficulty_assertions",
-                        "hard_axioms": [axiom],
-                        "rarely_instantiated": [axiom],
-                    }, {
                         "kind": "need_rewrite",
-                        "detail": "should become matching_weak",
+                        "detail": "should not appear",
                     }],
                 },
             ],
@@ -855,42 +812,23 @@ def test_last_attempt_prompt_keeps_latest_group_and_drops() -> None:
     assert "L3" not in txt.split("already in lemma library", 1)[-1].split("\n", 1)[0]
     assert "known_invalid" not in txt
     assert "(bad)" not in txt
-    assert "repair hints:" in txt
-    assert "high-difficulty axiom:" in txt
-    assert HD_DIFFICULTY_EXPLAIN in txt
-    assert "advice:" not in txt
-    assert HD_AXIOM_GOAL_HINT in txt
-    assert "rarely instantiated:" in txt
-    assert "matching_weak:" not in txt
+    assert "repair hints:" not in txt
     assert "need_rewrite" not in txt
-    assert "should become matching_weak" not in txt
+    assert "should not appear" not in txt
     assert "stale global" not in txt
     assert "You may refine kept lemmas or propose a different set." in txt
 
-    initial = format_attempt_feedback_for_prompt(
+    empty = format_attempt_feedback_for_prompt(
         {
             "repair_hints": [{
                 "kind": "high_difficulty_assertions",
-                "hard_axioms": [axiom],
+                "hard_axioms": ["(forall ((n Nat)) (= (plus n zero) n))"],
             }],
         },
         backend="cvc5",
     )
-    assert "INITIAL SOLVE" in initial
-    assert "high-difficulty axiom:" in initial
-    assert HD_DIFFICULTY_EXPLAIN in initial
-    assert HD_AXIOM_GOAL_HINT in initial
-    hidden = format_attempt_feedback_for_prompt(
-        {
-            "useless_lemma_groups": [{"lemmas": [kept], "status": "timeout"}],
-            "repair_hints": [{"kind": "need_rewrite", "detail": "hidden"}],
-        },
-        backend="cvc5",
-        include_stuck=False,
-    )
-    assert "LAST ATTEMPT" in hidden
-    assert "matching_weak" not in hidden
-    assert "hidden" not in hidden
+    assert empty == ""
+    assert "INITIAL SOLVE" not in empty
 
 
 def test_node_attempt_plan_child_cap() -> None:
@@ -1044,19 +982,6 @@ def test_tree_status_nested_invalid_does_not_mark_parent() -> None:
     })
     assert status == "failed"
     assert reason == ""
-
-
-def test_repair_hint_for_prompt_drops_subgoal_atp() -> None:
-    assert not repair_hint_for_prompt({"kind": "need_rewrite", "context": "initial_goal"})
-    assert not repair_hint_for_prompt({"kind": "no_progress", "context": "usefulness_check"})
-    assert not repair_hint_for_prompt({"kind": "partial_progress", "context": "usefulness_check"})
-    assert not repair_hint_for_prompt({"kind": "subgoal_failed", "context": "subgoal:template_1"})
-    assert not repair_hint_for_prompt({
-        "kind": "need_rewrite", "context": "subgoal:template_1",
-    })
-    assert not repair_hint_for_prompt({
-        "kind": "induction_stuck", "context": "subgoal:template_1",
-    })
 
 
 def test_quick_run_rejects_undefined_plus() -> None:
@@ -2148,8 +2073,7 @@ def main() -> int:
     test_soft_vs_hard_rejected_lists()
     test_parse_llm_lemmas_xml_and_legacy()
     test_parse_llm_lemmas_salvage_and_paren_repair()
-    test_repair_header_lists_usefulness_lemmas()
-    test_last_attempt_omits_lemma_difficulty_tags()
+    test_last_attempt_lists_kept_without_repair_hints()
     test_stale_lemma_usage_json_is_not_prompted()
     test_last_attempt_prompt_keeps_latest_group_and_drops()
     test_node_attempt_plan_child_cap()
@@ -2158,7 +2082,6 @@ def main() -> int:
     test_quick_run_screen_retry_regenerates_once()
     test_tree_status_sat_is_invalid()
     test_tree_status_nested_invalid_does_not_mark_parent()
-    test_repair_hint_for_prompt_drops_subgoal_atp()
     test_quick_run_rejects_undefined_plus()
     test_quick_run_drops_undefined_keeps_snoc()
     test_quick_run_library_duplicate_retries_goal_not_invalid()

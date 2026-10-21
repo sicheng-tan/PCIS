@@ -15,10 +15,6 @@ from cvc5_runner import (
     run_cvc,
     difficulty_dump_complete,
     counterexample_reason_for_smt,
-    canonical_smt_term,
-    classify_difficulty_term,
-    attributed_ids_from_portfolio,
-    pick_advice_witness,
     cvc_output_wellformed_failure,
     verify_llm_goal_counterexample,
     CvcResult,
@@ -695,16 +691,6 @@ def _compact_harvest_diag(result: Any) -> Optional[dict]:
     return _compact_cvc_diag(result)
 
 
-def _goal_difficulty_score(result: Optional[CvcResult]) -> Optional[int]:
-    if result is None:
-        return None
-    goal_term = result.goal_term
-    for term, score in result.difficulty or []:
-        if int(score or 0) > 0 and classify_difficulty_term(term, goal_term) == "goal":
-            return int(score)
-    return None
-
-
 def _cvc_diag_from_compact(data: Optional[dict]) -> Optional[CvcResult]:
     if not isinstance(data, dict) or "status" not in data:
         return None
@@ -767,16 +753,11 @@ def _set_goal_only_baseline(
     """
     if result is None or result.proved:
         return
+    del context  # retained for call-site clarity
     existing = _load_cached_diag(base_path, goal_name, "baseline_diag")
     if existing is not None and not replace:
         return
     _store_cached_diag(base_path, goal_name, "baseline_diag", result)
-    if result.difficulty:
-        logging.info(
-            "cvc5 hard assertion (%s): %s",
-            context,
-            [t[:80] for t, _s in result.difficulty[:3]],
-        )
 
 
 def _record_subgoal_failure_feedback(
@@ -852,7 +833,6 @@ def format_solver_feedback_for_prompt(
     attempt_txt = format_attempt_feedback_for_prompt(
         failed_data,
         backend="cvc5",
-        include_stuck=False,
         current_goal=current_formula,
     )
     if attempt_txt:
@@ -1138,14 +1118,6 @@ def _is_trivial_equational_lemma(lemma: str) -> bool:
     ))
 
 
-def _cached_diag_for_profile(cached, profile: Optional[str], *, resolver) -> Optional[object]:
-    """Reuse a 3s cache only when it was produced by the same diagnostic strategy."""
-    want = resolver(profile)
-    if cached is None or (cached.strategy or "") != want:
-        return None
-    return cached
-
-
 def verify_combined_lemmas(
     original_assert: re.Match,
     asserts: List[str],
@@ -1155,11 +1127,9 @@ def verify_combined_lemmas(
     base_path: str = None,
     goal_name: str = None,
     prompt_strategy: Optional[str] = None,
-    solver_profile: Optional[str] = None,
-    decision_source: Optional[str] = None,
 ) -> Tuple[bool, List[str], Optional[CvcResult]]:
     """Usefulness check: one portfolio prove of A∧C→P. No subset search."""
-    del original_assert, solver_profile, decision_source
+    del original_assert
     combined_timeout = usefulness_timeout_s(int(config['COMBINED_CVC_TIMEOUT']))
     gname = goal_name or output_path.stem
 
@@ -1201,30 +1171,11 @@ def verify_combined_lemmas(
         return True, list(asserts), full
 
     if base_path and goal_name:
-        meta: Dict[str, Any] = {"status": full.status}
-        per_profile = dict(full.portfolio_results or {})
-        meta["per_profile"] = per_profile
-        meta["candidate_ids"] = dict(candidate_ids)
-        attributed_ids = attributed_ids_from_portfolio(full, candidate_ids)
-        meta["attributed_ids"] = attributed_ids
-        meta["difficulty_attributed"] = bool(attributed_ids)
-        ind = per_profile.get("cvc5_inductive") if isinstance(per_profile.get("cvc5_inductive"), dict) else {}
-        ind_stats = ind.get("stats") if isinstance(ind.get("stats"), dict) else {}
-        meta["mix_stats"] = {
-            "CONJ_TOTAL": int((ind_stats.get("CONJ_TOTAL") if ind_stats else (full.stats or {}).get("CONJ_TOTAL")) or 0),
-            "INST_TOTAL": int((ind_stats.get("INST_TOTAL") if ind_stats else (full.stats or {}).get("INST_TOTAL")) or 0),
-            "QUANTIFIERS_SKOLEMIZE": int(
-                (ind_stats.get("QUANTIFIERS_SKOLEMIZE") if ind_stats else (full.stats or {}).get("QUANTIFIERS_SKOLEMIZE")) or 0
-            ),
+        meta: Dict[str, Any] = {
+            "status": full.status,
+            "per_profile": dict(full.portfolio_results or {}),
+            "candidate_ids": dict(candidate_ids),
         }
-        witness = pick_advice_witness(full)
-        meta["difficulty_dump_complete"] = difficulty_dump_complete(witness.difficulty)
-        meta["goal_difficulty_mix"] = _goal_difficulty_score(witness)
-        baseline_mix = _load_cached_diag(base_path, gname, "baseline_diag")
-        if baseline_mix is not None:
-            meta["goal_difficulty_baseline"] = _goal_difficulty_score(
-                pick_advice_witness(baseline_mix),
-            )
         add_useless_lemma_group(
             base_path,
             goal_name,
@@ -2029,7 +1980,7 @@ def _finish_usefulness_timeout(
             return True, [], extracted_asserts
         logging.info("After harvesting %d local lemmas on timeout, still did not prove current goal", n_local)
     else:
-        logging.error("Generated lemmas did not help prove the original goal (progress/repair feedback written)")
+        logging.error("Generated lemmas did not help prove the original goal (PCR feedback written)")
     return False, [], extracted_asserts
 
 
@@ -2040,8 +1991,6 @@ def quick_run(
     folder_path: str,
     baseline_only: bool = False,
     *,
-    solver_profile: Optional[str] = None,
-    decision_source: Optional[str] = None,
     depth: int = 0,
     ancestor_stack: AncestorStack = (),
     seed_extra_user: Optional[str] = None,
@@ -2077,7 +2026,6 @@ def quick_run(
     original_assert, original_forall = extract_original_goal(solver_content)
 
     failed_data = load_failed_lemmas(base_path, goal_smt_name)
-    del solver_profile, decision_source
 
     # InductionScheme: overlap short prove with this attempt's LLM/usefulness.
     scheme_session = None
@@ -2336,7 +2284,7 @@ def quick_run(
         if _scheme_pending_success():
             return True, [], extracted_asserts
         return result
-    logging.error("Generated lemmas did not help prove the original goal (progress/repair feedback written)")
+    logging.error("Generated lemmas did not help prove the original goal (PCR feedback written)")
     _scheme_fin(False)
     if _scheme_pending_success():
         return True, [], extracted_asserts

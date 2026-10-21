@@ -77,15 +77,6 @@ _VERDICT_LINE = re.compile(
 )
 
 MAX_REASON_CHARS = 200
-MAX_MIX_SOURCE_LEMMAS = 6
-HD_DIFFICULTY_EXPLAIN = (
-    "difficulty: search hotspot intensity from the last solver run; "
-    "d= is that intensity, not proof necessity. "
-)
-HD_AXIOM_GOAL_HINT = (
-    "hint: listed axioms are possible starting points; propose lemmas that "
-    "help prove the CURRENT goal (a hotspot need not be used)."
-)
 MAX_PARSE_RETRY_SNIPPET = 1500
 PARSE_RETRY_USER = (
     "FORMAT ERROR: no usable lemma (missing tags, empty <output>, or unmatched "
@@ -1269,17 +1260,6 @@ def apply_static_lemma_screen(
     return current, dropped
 
 
-def repair_hint_for_prompt(hint: dict) -> bool:
-    """Keep current-goal / usefulness ATP hints; drop subgoal copies and subgoal_failed."""
-    kind = str((hint or {}).get("kind") or "")
-    context = str((hint or {}).get("context") or "")
-    if kind == "subgoal_failed" or context.startswith("subgoal:"):
-        return False
-    if kind in ("no_progress", "partial_progress", "need_rewrite"):
-        return False
-    return True
-
-
 _SCREEN_GATE_LABEL = {
     "same_as_library": "already in lemma library",
     "duplicate_in_group": "same as earlier lemma in this group",
@@ -1295,13 +1275,6 @@ _SCREEN_GATE_LABEL = {
     "type_error": "type_error (argument or return sort mismatch)",
 }
 
-_STUCK_SKIP_KINDS = frozenset({
-    "subgoal_failed",
-    "no_progress",
-    "partial_progress",
-    "need_rewrite",
-})
-
 
 def last_screen_records(
     dropped: Sequence[Tuple[str, str, str]],
@@ -1315,36 +1288,6 @@ def last_screen_records(
             "gate": str(gate or ""),
         })
     return records
-
-
-def compact_repair_snapshot(hints: Sequence[dict]) -> List[dict]:
-    """Subset of repair hints stored on a failed combination for the next prompt."""
-    snapshot: List[dict] = []
-    keep_keys = (
-        "kind",
-        "context",
-        "detail",
-        "hard_axioms",
-        "hard_axiom_scores",
-        "rarely_instantiated",
-        "goal_fragments",
-        "induction_focus",
-        "induction_formulas",
-        "induction_schemas",
-        "induction_vars",
-        "induction_kinds",
-        "induction_obligations",
-        "source_lemmas",
-        "attempt_id",
-        "samples",
-    )
-    for hint in hints or []:
-        if not isinstance(hint, dict) or not repair_hint_for_prompt(hint):
-            continue
-        rec = {key: hint.get(key) for key in keep_keys if hint.get(key) not in (None, "", [])}
-        if rec.get("kind"):
-            snapshot.append(rec)
-    return snapshot
 
 
 def last_useless_group(failed_data: Optional[dict]) -> Any:
@@ -1373,26 +1316,6 @@ def _group_lemmas(group: Any) -> List[str]:
     return []
 
 
-def _exclude_source_lemmas(
-    formulas: Sequence[str],
-    source_lemmas: Sequence[str],
-    *,
-    limit: int = 4,
-) -> List[str]:
-    """Drop current-round candidate lemmas from a hotspot axiom list."""
-    sources = [str(item) for item in source_lemmas if item]
-    out: List[str] = []
-    for formula in formulas:
-        if not formula:
-            continue
-        if any(lemmas_equivalent(formula, src) for src in sources):
-            continue
-        out.append(formula)
-        if len(out) >= limit:
-            break
-    return out
-
-
 def format_dropped_line(item: dict) -> Optional[str]:
     """One dropped-lemma line; skip hard/soft lists already shown above."""
     gate = str((item or {}).get("gate") or "")
@@ -1403,116 +1326,6 @@ def format_dropped_line(item: dict) -> Optional[str]:
         return None
     reason = str((item or {}).get("reason") or "").strip()
     return f"    {lemma}  [{screen_drop_label(gate, reason)}]"
-
-
-def format_stuck_lines(
-    hints: Sequence[dict],
-    backend: str = "cvc5",
-    *,
-    omit_axiom_goal_hint: bool = False,
-) -> List[str]:
-    """Compact solver-stuck lines. ``need_rewrite`` is not shown (disabled)."""
-    del backend
-    lines: List[str] = []
-    for hint in hints or []:
-        if not isinstance(hint, dict) or not repair_hint_for_prompt(hint):
-            continue
-        kind = str(hint.get("kind") or "")
-        if kind in _STUCK_SKIP_KINDS:
-            continue
-        if kind == "high_difficulty_assertions":
-            sources = [
-                str(item) for item in (hint.get("source_lemmas") or []) if item
-            ]
-            shown_hd = _exclude_source_lemmas(
-                hint.get("hard_axioms") or [], sources,
-            )
-            scores = hint.get("hard_axiom_scores") or {}
-            if not isinstance(scores, dict):
-                scores = {}
-            for ax in shown_hd:
-                score = scores.get(str(ax))
-                if score is None:
-                    # Parallel list form: same order as hard_axioms before exclude.
-                    raw_hd = [str(x) for x in (hint.get("hard_axioms") or []) if x]
-                    raw_sc = hint.get("hard_axiom_score_list") or []
-                    if (
-                        isinstance(raw_sc, list)
-                        and len(raw_sc) == len(raw_hd)
-                        and str(ax) in raw_hd
-                    ):
-                        score = raw_sc[raw_hd.index(str(ax))]
-                if score is not None:
-                    lines.append(
-                        f"    high-difficulty axiom (d={int(score)}): "
-                        f"{compact_formula(ax)}"
-                    )
-                else:
-                    lines.append(f"    high-difficulty axiom: {compact_formula(ax)}")
-            for ax in (hint.get("rarely_instantiated") or [])[:2]:
-                if any(lemmas_equivalent(ax, src) for src in sources):
-                    continue
-                lines.append(f"    rarely instantiated: {compact_formula(ax)}")
-            for frag in (hint.get("goal_fragments") or [])[:2]:
-                lines.append(f"    goal fragment: {compact_formula(frag)}")
-            if not (
-                shown_hd
-                or hint.get("rarely_instantiated")
-                or hint.get("goal_fragments")
-            ):
-                lines.append("    high-difficulty assertions (no compact terms)")
-            if shown_hd:
-                lines.append(f"    {HD_DIFFICULTY_EXPLAIN}")
-                if not omit_axiom_goal_hint:
-                    lines.append(f"    {HD_AXIOM_GOAL_HINT}")
-            continue
-        detail = str(hint.get("detail") or "").strip()
-        lines.append(f"    {kind}: {detail}" if detail else f"    {kind}")
-        focus = hint.get("induction_focus") or []
-        if focus:
-            lines.append(f"    induction focus: {'; '.join(str(x) for x in focus[:4])}")
-        vars_ = [str(v) for v in (hint.get("induction_vars") or []) if v]
-        kinds = [str(k) for k in (hint.get("induction_kinds") or []) if k and k != "unknown"]
-        if vars_ or kinds:
-            bits = []
-            if vars_:
-                bits.append("vars " + ", ".join(vars_[:4]))
-            if kinds:
-                bits.append("kinds " + ", ".join(kinds[:3]))
-            lines.append(f"    induction meta: {'; '.join(bits)}")
-        schema_recs = [
-            item for item in (hint.get("induction_schemas") or [])
-            if isinstance(item, dict)
-        ]
-        if schema_recs:
-            for sch in schema_recs[:2]:
-                var = str(sch.get("induct_var") or "").strip()
-                sort = str(sch.get("induct_sort") or "").strip()
-                skind = str(sch.get("kind") or "").strip()
-                head_bits = []
-                if var and sort:
-                    head_bits.append(f"{var}:{sort}")
-                elif var:
-                    head_bits.append(var)
-                if skind and skind != "unknown":
-                    head_bits.append(skind)
-                head = f"[{', '.join(head_bits)}] " if head_bits else ""
-                if sch.get("base"):
-                    lines.append(f"    induction base: {head}{sch['base']}")
-                if sch.get("step"):
-                    lines.append(f"    induction step: {head}{sch['step']}")
-                if sch.get("conclusion"):
-                    lines.append(f"    induction concl: {head}{sch['conclusion']}")
-                if not (sch.get("base") or sch.get("step") or sch.get("conclusion")):
-                    summary = str(sch.get("raw") or "").strip()
-                    if summary:
-                        lines.append(f"    induction schema: {head}{summary}")
-        else:
-            for schema in (hint.get("induction_formulas") or [])[:2]:
-                lines.append(f"    induction schema: {schema}")
-        for obl in (hint.get("induction_obligations") or [])[:3]:
-            lines.append(f"    induction obligation: {compact_formula(str(obl))}")
-    return lines
 
 
 def format_paper_useless_groups_for_prompt(failed_data: Optional[dict]) -> str:
@@ -1541,15 +1354,15 @@ def format_attempt_feedback_for_prompt(
     failed_data: Optional[dict],
     *,
     backend: str = "cvc5",
-    include_stuck: bool = True,
     current_goal: Optional[str] = None,
 ) -> str:
-    """LAST ATTEMPT (latest failed C + screen drops + stuck) or INITIAL SOLVE.
+    """LAST ATTEMPT (latest failed C + screen drops) or paper-mode useless groups.
 
     History of older useless groups stays in json; only the last group is shown
     unless ``INVALID_LEMMAS=paper`` (then all useless groups, LLM4Ind style).
+    Does not surface repair hints / INITIAL SOLVE stuck blocks.
     """
-    del current_goal  # reserved for callers
+    del backend, current_goal  # reserved for callers / API stability
     data = failed_data if isinstance(failed_data, dict) else {}
     try:
         from .obligation_tree import invalid_lemmas_paper_mode
@@ -1564,107 +1377,26 @@ def format_attempt_feedback_for_prompt(
         if isinstance(item, dict)
     ]
     status = ""
-    hints: Sequence[dict] = ()
     if isinstance(group, dict):
         status = str(group.get("status") or "").strip()
-        raw = group.get("repair_hints") or []
-        if isinstance(raw, list):
-            hints = [item for item in raw if isinstance(item, dict)]
-    if not hints:
-        raw = data.get("repair_hints") or []
-        if isinstance(raw, list):
-            hints = [item for item in raw if isinstance(item, dict)]
-    stuck_lines = format_stuck_lines(hints, backend) if include_stuck else []
     drop_lines = [line for line in (format_dropped_line(item) for item in dropped) if line]
-    has_attempt = bool(kept or drop_lines)
-    if not has_attempt and not stuck_lines:
+    if not kept and not drop_lines:
         return ""
 
     parts: List[str] = []
-    if has_attempt:
-        status_bit = f", status={status}" if status else ""
-        parts.append(f"\nLAST ATTEMPT (did not prove the CURRENT goal{status_bit}):")
-        if kept:
-            parts.append("  kept:")
-            for i, lemma in enumerate(kept, 1):
-                parts.append(f"    {i}. {lemma}")
-        else:
-            parts.append("  kept: (none; all candidates were filtered)")
-        if drop_lines:
-            parts.append("  dropped:")
-            parts.extend(drop_lines)
-        if stuck_lines:
-            parts.append("  repair hints:")
-            parts.extend(stuck_lines)
-        parts.append("  You may refine kept lemmas or propose a different set.")
-        return "\n".join(parts)
-
-    parts.append(
-        "\nINITIAL SOLVE (no candidate lemmas yet; did not prove CURRENT goal):"
-    )
-    parts.append("  repair hints:")
-    parts.extend(stuck_lines)
-    parts.append("  Propose auxiliary lemmas that help the solver prove the goal.")
+    status_bit = f", status={status}" if status else ""
+    parts.append(f"\nLAST ATTEMPT (did not prove the CURRENT goal{status_bit}):")
+    if kept:
+        parts.append("  kept:")
+        for i, lemma in enumerate(kept, 1):
+            parts.append(f"    {i}. {lemma}")
+    else:
+        parts.append("  kept: (none; all candidates were filtered)")
+    if drop_lines:
+        parts.append("  dropped:")
+        parts.extend(drop_lines)
+    parts.append("  You may refine kept lemmas or propose a different set.")
     return "\n".join(parts)
-
-
-
-def attach_source_lemmas(
-    hints: Sequence[dict],
-    lemmas: Optional[Sequence[str]] = None,
-    *,
-    context: Optional[str] = None,
-) -> List[dict]:
-    """Copy hints and record which candidate lemmas the mix run used."""
-    formulas = [
-        normalize_lemma_formula(str(item))
-        for item in (lemmas or [])
-        if normalize_lemma_formula(str(item))
-    ]
-    attached: List[dict] = []
-    for hint in hints or []:
-        rec = dict(hint)
-        rec["source_lemmas"] = list(formulas)
-        if context:
-            rec["context"] = context
-        attached.append(rec)
-    return attached
-
-
-def usefulness_source_lemmas(hints: Sequence[dict]) -> List[str]:
-    """Candidate lemmas from the latest usefulness-check mix among these hints."""
-    found: List[str] = []
-    for hint in hints or []:
-        if str(hint.get("context") or "") != "usefulness_check":
-            continue
-        formulas = [
-            normalize_lemma_formula(str(item))
-            for item in (hint.get("source_lemmas") or [])
-            if normalize_lemma_formula(str(item))
-        ]
-        if formulas:
-            found = formulas
-    return found
-
-
-def format_repair_header(backend: str, hints: Sequence[dict]) -> List[str]:
-    """Header for the repair block. Usefulness-failed C is listed before the hints."""
-    title = f"\nSOLVER-GUIDED REPAIR (from {backend} failure analysis)."
-    lemmas = usefulness_source_lemmas(hints)
-    if not lemmas:
-        return [title + " Use these hints to choose the NEXT lemmas:"]
-    lines = [title]
-    shown = lemmas[:MAX_MIX_SOURCE_LEMMAS]
-    for i, formula in enumerate(shown, 1):
-        lines.append(f"  C{i}: {compact_formula(formula)}")
-    extra = len(lemmas) - len(shown)
-    if extra > 0:
-        lines.append(f"  ... and {extra} more")
-    lines.append(
-        "Failed to prove the goal using the above lemmas and produced hints. "
-        "Use these hints to choose the NEXT lemmas:"
-    )
-    return lines
 
 
 def tree_status_from_child_data(failed_data: Optional[dict]) -> Tuple[str, str]:

@@ -373,9 +373,9 @@ def log_prompt_blocks(
     inv = {
         "has_invalid": "INVALID or CANNOT" in text,
         "has_useless": "LAST ATTEMPT" in text,
-        "has_progress": "SOLVER PROGRESS SIGNALS" in text,
+        "has_progress": False,
         "has_unproved": "USEFUL BUT UNPROVED" in text,
-        "has_hints": "  repair hints:" in text or "INITIAL SOLVE" in text,
+        "has_hints": False,
         "has_lib": "already proved" in text or "LEMMA LIBRARY" in text,
         "has_tree": "Last obligation tree" in text,
     }
@@ -386,8 +386,8 @@ def log_prompt_blocks(
             n_prompts=1,
             n_prompt_with_tree=int(inv["has_tree"]),
             n_prompt_with_lib=int(inv["has_lib"]),
-            n_prompt_with_hints=int(inv["has_hints"]),
-            n_prompt_with_progress=int(inv["has_progress"]),
+            n_prompt_with_hints=0,
+            n_prompt_with_progress=0,
             n_prompt_with_unproved=int(inv["has_unproved"]),
         )
     return inv
@@ -524,12 +524,6 @@ def _depth_from_goal_name(goal_name: str) -> int:
     if not rest:
         return 0
     return len([part for part in rest.split("_") if part])
-
-
-def _hint_kinds(failed_data: dict) -> List[str]:
-    """Legacy repair-hint kinds; PCIS no longer writes ``repair_hints``."""
-    del failed_data
-    return []
 
 
 def _attempt_kinds(failed_data: dict) -> List[str]:
@@ -724,18 +718,12 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
     n_useless_groups = 0
     n_unproved = 0
     n_invalid = 0
-    all_hints: List[str] = []
-    hint_seen = set()
     for data in records.values():
         n_progress += len(data.get("progress_lemmas") or [])
         n_invalid_lemmas += len(data.get("invalid_lemmas") or [])
         n_useless_groups += len(data.get("useless_lemma_groups") or [])
         n_unproved += len(data.get("unproved_lemmas") or [])
         n_invalid += _node_invalid_attempts(data)
-        for kind in _hint_kinds(data):
-            if kind not in hint_seen:
-                hint_seen.add(kind)
-                all_hints.append(kind)
     split_counts = _split_child_counts(records)
     n_fallback = sum(1 for item in pair_history if item.get("fallback_used"))
     counters = load_counters(folder)
@@ -751,7 +739,8 @@ def summarize_artifacts(folder: str) -> Dict[str, Any]:
         "n_invalid_lemmas": n_invalid_lemmas,
         "n_useless_groups": n_useless_groups,
         "n_unproved": n_unproved,
-        "hint_kinds": all_hints,
+        # CSV-stable empty stubs (routing / repair-hint writers removed).
+        "hint_kinds": [],
         "prompts_used": prompts,
         "active_profile": "",
         "winner_profile": winner,

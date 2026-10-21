@@ -211,8 +211,8 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
     assert inv["has_tree"] is True
     assert "has_advice" not in inv
     assert inv["has_lib"] is True
-    assert inv["has_hints"] is True
-    assert inv["has_progress"] is True
+    assert inv["has_hints"] is False
+    assert inv["has_progress"] is False
     add_llm_time(folder, 1.5)
     add_solver_time(folder, 12.0, fallback=True)
     log_library_inject(folder, "template", 2, "initial_prove")
@@ -225,7 +225,7 @@ def test_prompt_blocks_and_timing_counters(tmp_path: Path) -> None:
     summary = summarize_artifacts(folder)
     assert summary["llm_s"] == 1.5
     assert summary["solver_s"] == 12.0
-    assert summary["n_prompt_with_hints"] == 1
+    assert summary["n_prompt_with_hints"] == 0
 
 
 def test_record_llm_generation_writes_plain_prompt_dump(tmp_path: Path) -> None:

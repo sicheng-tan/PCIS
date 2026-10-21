@@ -26,7 +26,6 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from llm_time_budget import remaining_task_s
 from solver_profiles import CVC5_FALLBACK_PROFILES
-from solver_relative_metrics import in_problem_hard_cutoff
 
 try:
     from dotenv import load_dotenv
@@ -252,92 +251,6 @@ def named_difficulty_hits(
     return out
 
 
-def expand_named_difficulty(
-    difficulty: Optional[List[Tuple[str, int]]],
-    name_map: Optional[Dict[str, str]] = None,
-) -> List[Tuple[str, int]]:
-    """Replace dump names / bang-named terms with the original candidate formula."""
-    mapping = {
-        str(k).strip(): str(v).strip()
-        for k, v in (name_map or {}).items()
-        if str(k).strip() and str(v).strip()
-    }
-    out: List[Tuple[str, int]] = []
-    for term, score in difficulty or []:
-        tok = str(term or "").strip()
-        label = tok if tok and not tok.startswith("(") else (named_attr_id(tok) or "")
-        formula = mapping.get(label) if label else None
-        if formula:
-            out.append((formula, int(score)))
-            continue
-        inner = strip_named_annotation(tok) if tok.startswith("(") else tok
-        out.append((inner or tok, int(score)))
-    return out
-
-
-def attributed_candidate_ids(
-    difficulty: Optional[List[Tuple[str, int]]],
-    name_map: Optional[Dict[str, str]] = None,
-) -> List[str]:
-    """Exact ``:named`` hits, else canonical/α match of dump term to a candidate."""
-    mapping = {
-        str(k).strip(): str(v).strip()
-        for k, v in (name_map or {}).items()
-        if str(k).strip() and str(v).strip()
-    }
-    found: List[str] = []
-    seen = set()
-
-    def _add(cid: str) -> None:
-        if cid and cid not in seen:
-            seen.add(cid)
-            found.append(cid)
-
-    for cid in named_difficulty_hits(difficulty):
-        if not mapping or cid in mapping:
-            _add(cid)
-    if not mapping:
-        return found
-    cans = {cid: canonical_smt_term(formula) for cid, formula in mapping.items()}
-    for term, score in difficulty or []:
-        if int(score or 0) <= 0:
-            continue
-        tok = str(term or "").strip()
-        if not tok.startswith("("):
-            continue
-        can = canonical_smt_term(strip_named_annotation(tok))
-        for cid, want in cans.items():
-            if can == want:
-                _add(cid)
-    return found
-
-
-def attributed_ids_from_portfolio(
-    result: Optional[CvcResult],
-    name_map: Optional[Dict[str, str]] = None,
-) -> List[str]:
-    """Exists-attribution across CVC5 portfolio dumps (not CVC4)."""
-    if result is None:
-        return []
-    found: List[str] = []
-    seen = set()
-    blobs: List[Optional[List[Tuple[str, int]]]] = [list(result.difficulty or [])]
-    for name, blob in (result.portfolio_results or {}).items():
-        if name == "cvc4_default" or not isinstance(blob, dict):
-            continue
-        diff: List[Tuple[str, int]] = []
-        for item in blob.get("difficulty") or []:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                diff.append((str(item[0]), int(item[1])))
-        blobs.append(diff)
-    for diff in blobs:
-        for cid in attributed_candidate_ids(diff, name_map):
-            if cid not in seen:
-                seen.add(cid)
-                found.append(cid)
-    return found
-
-
 def _goal_score_from_difficulty(
     difficulty: Optional[List[Tuple[str, int]]],
     goal_term: Optional[str] = None,
@@ -371,44 +284,6 @@ def _compact_cvc(result: CvcResult) -> dict:
         "instantiations": [[t, n] for t, n in (result.instantiations or [])],
         "goal_term": result.goal_term,
     }
-
-
-def profile_as_result(parent: CvcResult, name: str) -> Optional[CvcResult]:
-    """Rebuild one portfolio arm as a ``CvcResult`` from compact summaries."""
-    blob = (parent.portfolio_results or {}).get(name)
-    if not isinstance(blob, dict):
-        if parent.strategy == name:
-            return parent
-        return None
-    difficulty: List[Tuple[str, int]] = []
-    for item in blob.get("difficulty") or []:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            difficulty.append((str(item[0]), int(item[1])))
-    instantiations: List[Tuple[str, int]] = []
-    for item in blob.get("instantiations") or []:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            instantiations.append((str(item[0]), int(item[1])))
-    stats = blob.get("stats") if isinstance(blob.get("stats"), dict) else {}
-    return CvcResult(
-        proved=bool(blob.get("proved", False)),
-        status=str(blob.get("status") or parent.status),
-        elapsed=float(blob.get("elapsed") or parent.elapsed or 0.0),
-        strategy=name,
-        stats=dict(stats or {}),
-        difficulty=difficulty,
-        instantiations=instantiations,
-        goal_term=blob.get("goal_term") or parent.goal_term,
-        portfolio_results=parent.portfolio_results,
-    )
-
-
-def pick_advice_witness(result: CvcResult) -> CvcResult:
-    """HD / TRIGGER shape: prefer a complete ``cvc5_simple`` dump, not richest CONJ."""
-    for name in ("cvc5_simple", "cvc5_inductive", "cvc5_inductive_no_ematching"):
-        sub = profile_as_result(result, name)
-        if sub is not None and difficulty_dump_complete(sub.difficulty):
-            return sub
-    return result
 
 
 def run_cvc(
@@ -767,61 +642,6 @@ def _run_cvc_parallel(
     finally:
         _cleanup_processes(processes)
         _close_capture_files(captures)
-
-
-def cvc_diagnostic_profile(profile: Optional[str]) -> str:
-    """Sidecar 3s strategy. CVC4 cannot produce-difficulty, so it maps to cvc5_inductive.
-
-    Probes use `_run_named_cvc_profile` and do not go through this remap.
-    """
-    specs = cvc_profile_specs()
-    if profile in specs and specs[profile]["type"] == "CVC5":
-        return profile
-    return "cvc5_inductive"
-
-
-def run_cvc_diagnostic(
-    smt2_path,
-    timeout: int = 3,
-    *,
-    collect_difficulty: bool = True,
-    profile: Optional[str] = None,
-) -> CvcResult:
-    """
-    Single-strategy cvc5 run with --stats (+ optional difficulty on the same process).
-    Used for progress comparison / repair hints, not as portfolio prover.
-    """
-    smt2_path = Path(smt2_path)
-    name = cvc_diagnostic_profile(profile)
-    cfg = cvc_profile_specs()[name]
-    tlimit_s, wall_s = cvc_time_budget(timeout, collect_difficulty=collect_difficulty)
-    try:
-        content = smt2_path.read_text(encoding="utf-8")
-    except OSError:
-        content = ""
-    goal_term = extract_proof_goal_term(content) if content else None
-    cmd = _cvc_prove_cmd(
-        cfg,
-        smt2_path,
-        timeout,
-        collect_stats=True,
-        collect_difficulty=collect_difficulty,
-        tlimit_s=tlimit_s,
-    )
-    result = _execute_single(cmd, int(math.ceil(wall_s)), strategy=name)
-    result.goal_term = goal_term
-    if collect_difficulty:
-        result.difficulty = parse_cvc_difficulty(result.stdout + "\n" + result.stderr)
-    return result
-
-
-def run_cvc_difficulty(smt2_path, timeout: int = 3, *, profile: Optional[str] = None) -> CvcResult:
-    """
-    Run cvc5 with ``--produce-difficulty --dump-difficulty`` (same process as prove).
-    """
-    return run_cvc_diagnostic(
-        smt2_path, timeout=timeout, collect_difficulty=True, profile=profile,
-    )
 
 
 def parse_cvc_stats(text: str) -> Dict[str, int]:
@@ -1594,88 +1414,6 @@ def difficulty_dump_complete(difficulty: Optional[List[Tuple[str, int]]]) -> boo
     the dump is missing (timeout/no flush), not that everything is 0.
     """
     return bool(difficulty)
-
-
-def rarely_instantiated_axioms(
-    hard_axioms: List[str],
-    instantiations: Optional[List[Tuple[str, int]]],
-    *,
-    limit: int = 3,
-) -> List[str]:
-    """Hard axioms with formula-shaped inst traces but zero matching counts.
-
-    If `-o inst` only printed qids (no formulas), return empty — we cannot tell.
-    """
-    if not hard_axioms or not instantiations:
-        return []
-    formula_shaped = [t for t, _ in instantiations if str(t).startswith("(")]
-    if not formula_shaped:
-        return []
-    rare: List[str] = []
-    for axiom in hard_axioms:
-        count = _inst_count_for_axiom(axiom, instantiations)
-        if count == 0:
-            rare.append(axiom)
-        if len(rare) >= limit:
-            break
-    return rare
-
-
-def _inst_count_for_axiom(
-    axiom: str,
-    instantiations: List[Tuple[str, int]],
-) -> Optional[int]:
-    """Attributed inst count, or 0 if formulas were dumped but this axiom never matched."""
-    can = canonical_smt_term(axiom)
-    best: Optional[int] = None
-    for term, n in instantiations:
-        if not str(term).startswith("("):
-            continue
-        if canonical_smt_term(term) == can:
-            best = n if best is None else max(best, n)
-    return 0 if best is None else best
-
-
-def hard_axioms_from_difficulty(
-    difficulty: Optional[List[Tuple[str, int]]],
-    goal_term: Optional[str] = None,
-    *,
-    limit: int = 4,
-) -> List[str]:
-    """Hard axioms for LLM prompts: in-problem cutoff, then difficulty desc.
-
-    Returns formula strings only; use ``hard_axiom_entries_from_difficulty``
-    when scores are needed for the prompt. No goal-symbol overlap reordering:
-    surface token overlap is an unreliable relevance signal (bound vars, shared
-    ctors) and truncating on it can drop indirect hotspots from feedback/advice.
-    """
-    return [t for t, _s in hard_axiom_entries_from_difficulty(
-        difficulty, goal_term, limit=limit
-    )]
-
-
-def hard_axiom_entries_from_difficulty(
-    difficulty: Optional[List[Tuple[str, int]]],
-    goal_term: Optional[str] = None,
-    *,
-    limit: int = 4,
-) -> List[Tuple[str, int]]:
-    """Like ``hard_axioms_from_difficulty``, but keep ``(formula, score)`` pairs."""
-    axiom_scores = [
-        s
-        for t, s in (difficulty or [])
-        if s > 0 and classify_difficulty_term(t, goal_term) == "axiom"
-    ]
-    cutoff = in_problem_hard_cutoff(axiom_scores)
-    entries = [
-        (t, int(s))
-        for t, s in (difficulty or [])
-        if s > 0
-        and classify_difficulty_term(t, goal_term) == "axiom"
-        and s >= cutoff
-    ]
-    entries.sort(key=lambda pair: -pair[1])
-    return entries[:limit]
 
 
 # ---------------------------------------------------------------------------

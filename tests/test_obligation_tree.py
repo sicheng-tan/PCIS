@@ -16,7 +16,6 @@ from proof_context_reuse.obligation_tree import (
     add_proved_lemma,
     append_attempt,
     classify_failed_attempt,
-    compact_atp_from_failed_data,
     format_diagnosis_tree_prompt,
     format_obligation_prompt,
     inject_library_axioms,
@@ -162,7 +161,6 @@ def test_last_normal_tree_skips_empty_invalid_useless() -> None:
                 node_id="template_2",
                 formula="(forall ((x Nat) (y Nat)) (= (plus x y) (plus y x)))",
                 status="failed",
-                atp={"hints": ["need_rewrite"], "focus": ["(plus x y)"]},
                 children=[
                     make_child_node(
                         node_id="template_2_1",
@@ -397,7 +395,6 @@ def test_compressed_prompt_matches_expected_shape() -> None:
                 node_id="template_2",
                 formula="(forall ((x Nat) (y Nat)) (= (plus x y) (plus y x)))",
                 status="failed",
-                atp={"hints": ["need_rewrite"], "focus": ["(plus x y)"]},
                 children=[
                     make_child_node(
                         node_id="template_2_1",
@@ -471,7 +468,6 @@ def test_invalid_node_shows_reason_not_atp_hints() -> None:
                 formula="(forall ((a Lst) (b Lst)) (= (len (append a b)) (plus (len a) (len b))))",
                 status="invalid",
                 reason="undefined_symbol:plus",
-                atp={"hints": ["need_rewrite"], "focus": ["(plus x y)"]},
             ),
         ],
         proved=False,
@@ -517,30 +513,6 @@ def test_diagnosis_tree_prompt_omits_library_and_generation_legend() -> None:
     assert "Library (already proved, in axioms):" not in text
     assert "lib_1" not in mixed
     assert "Library (already proved, in axioms):" not in mixed
-
-
-def test_compact_atp_keeps_actionable_hints() -> None:
-    atp = compact_atp_from_failed_data({
-        "repair_hints": [
-            {
-                "kind": "timeout",
-                "detail": "timeout",
-                "induction_focus": [],
-            },
-            {
-                "kind": "need_rewrite",
-                "detail": "need rewrite",
-                "induction_focus": ["(plus x y)", "(plus y x)"],
-            },
-            {
-                "kind": "induction_stuck",
-                "detail": "stuck",
-                "induction_focus": ["(plus x y)"],
-            },
-        ]
-    })
-    assert atp["hints"] == ["need_rewrite", "induction_stuck"]
-    assert atp["focus"] == ["(plus x y)", "(plus y x)"]
 
 
 def _patch_flags(library: str, tree: str):
@@ -643,7 +615,6 @@ def _sample_obligation():
                 node_id="template_2",
                 formula="(forall ((x Nat) (y Nat)) (= (plus x y) (plus y x)))",
                 status="failed",
-                atp={"hints": ["need_rewrite"], "focus": ["(plus x y)"]},
             ),
         ],
         proved=False,
@@ -986,7 +957,6 @@ def main() -> int:
     test_first_invalid_reason_walks_nested()
     test_invalid_node_shows_reason_not_atp_hints()
     test_diagnosis_tree_prompt_omits_library_and_generation_legend()
-    test_compact_atp_keeps_actionable_hints()
     test_harvest_retry_timeout_s_default_and_override()
     test_flags_default_and_off_synonyms()
     test_invalid_lemmas_paper_mode_hard_only_and_all_useless()
