@@ -4,10 +4,14 @@
 
 This repository is the paper pipeline for evaluating PCIS on inductive SMT-LIB tasks (CVC5/CVC4 portfolio or Vampire). Non-paper experiment modules (solver routing, LLM feedback hints, `PROMPT_ADVICE`, lemma diagnosis, etc.) have been removed.
 
+**Anonymous artifact (review):** https://anonymous.4open.science/r/PCIS-1231/
+
 Base search idea follows:
 
 > *Can LLM Aid in Solving Constraints with Inductive Definitions?*  
 > Full version: https://doi.org/10.48550/arXiv.2603.03668
+
+**License:** MIT (`LICENSE`) for PCIS source, prompts, scripts, docs, and summary CSVs. Bundled solver binaries under `cvc/` and `vampire/` keep their upstream licenses.
 
 ---
 
@@ -16,6 +20,7 @@ Base search idea follows:
 | Path | Role |
 |------|------|
 | `README.md` | This file — setup, modules, how to run, result CSVs |
+| `LICENSE` | MIT license for this artifact’s authored materials |
 | `requirements.txt` | Pinned Python dependencies (LLM4Ind package set + versions) |
 | `docs/excluded_instances.md` | Appendix A: why 20 of 706 goals are excluded (→ **686**) |
 | `experiments/configs/skip_nontheorems.txt` | Machine-readable skip list (paired with the doc above) |
@@ -173,6 +178,7 @@ Do **not** evaluate `benchmarks/do-not-supported-yet/` (outside the paper suites
 
 ```
 PCIS/
+├── LICENSE                             # MIT (PCIS-authored materials)
 ├── Mate_new.py / Mate_new_vampire.py   # recursive prove + LLM loop
 ├── run_exp_folder*.py                  # multiprocess batch runners
 ├── main.py                             # single-task entry
